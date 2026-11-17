@@ -312,7 +312,7 @@ jobs:
           [ "${#apps[@]}" -eq 1 ]
           app_path="${apps[0]}"
           executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app_path/Info.plist")"
-          xcrun lipo -verify_arch arm64 "$app_path/$executable"
+          xcrun lipo "$app_path/$executable" -verify_arch arm64
           mkdir -p "$ST2D_BUNDLE/Payload" "$PWD/dist"
           ditto "$app_path" "$ST2D_BUNDLE/Payload/ST2DRemastered.app"
           cp logs/Noto-OFL.txt "$ST2D_BUNDLE/Payload/ST2DRemastered.app/Noto-OFL.txt"
