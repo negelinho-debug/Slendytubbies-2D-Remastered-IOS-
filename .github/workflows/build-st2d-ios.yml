@@ -236,6 +236,70 @@ jobs:
           }
           CS
 
+      - name: Enable the built-in iPhone joysticks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          scripts = Path("game/Assets/Scripts/Assembly-CSharp")
+          controller = scripts / "ControllerType.cs"
+          text = controller.read_text(encoding="utf-8-sig")
+          awake = "private void Awake()\n\t{\n\t}"
+          if text.count(awake) != 1:
+              raise RuntimeError("Expected the original ControllerType.Awake method")
+          controller.write_text(text.replace(awake, """private void Awake()
+          {
+              if (Application.platform == RuntimePlatform.IPhonePlayer)
+              {
+                  isMobile = true;
+                  Input.multiTouchEnabled = true;
+              }
+          }"""), encoding="utf-8")
+
+          joystick = scripts / "CNJoystick.cs"
+          text = joystick.read_text(encoding="utf-8-sig")
+          original = "if (remoteTesting)"
+          if text.count(original) != 1:
+              raise RuntimeError("Expected the original joystick input selector")
+          text = text.replace(original, "if (remoteTesting || Application.platform == RuntimePlatform.IPhonePlayer)")
+          start = text.index("\tprivate void TouchInputHandler()")
+          end = text.index("\tprivate void MouseInputHandler()", start)
+          touch_handler = """
+              private void TouchInputHandler()
+              {
+                  if (isTweaking)
+                  {
+                      int touchIndex = FindMyFingerId();
+                      if (touchIndex >= 0)
+                      {
+                          Touch touch = Input.GetTouch(touchIndex);
+                          if (touch.phase != TouchPhase.Ended && touch.phase != TouchPhase.Canceled)
+                          {
+                              TweakJoystick(touch.position);
+                              return;
+                          }
+                      }
+                      ResetJoystickPosition();
+                      if (FingerLiftedEvent != null) FingerLiftedEvent();
+                      return;
+                  }
+
+                  for (int i = 0; i < Input.touchCount; i++)
+                  {
+                      Touch touch = Input.GetTouch(i);
+                      if (touch.phase != TouchPhase.Began || !TouchOccured(touch.position)) continue;
+                      myFingerId = touch.fingerId;
+                      if (FingerTouchedEvent != null) FingerTouchedEvent();
+                      break;
+                  }
+              }
+
+          """.lstrip("\n")
+          joystick.write_text(text[:start] + touch_handler + text[end:], encoding="utf-8")
+          PY
+
       - name: Exclude unused native ad clients
         shell: bash
         run: |
