@@ -1,0 +1,59 @@
+name: Prepare ST2D Remastered
+
+on: workflow_dispatch
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Get BlueTubi's Unity project
+        uses: actions/checkout@v4
+        with:
+          repository: BlueTubi/Slendytubbies-2D-Remastered
+          ref: af1c55cccfc9b6b567887f23e816fbaad73bdf3c
+          path: game
+          persist-credentials: false
+
+      - name: Fix scene paths and check project
+        working-directory: game
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          config = Path("ProjectSettings/EditorBuildSettings.asset")
+          source = config.read_text(encoding="utf-8")
+          for name in ("MainMenu", "Lobby"):
+              source = source.replace(
+                  f"path: Assets/Levels/{name}.unity",
+                  f"path: Assets/{name}.unity",
+              )
+
+          scenes = re.findall(r"^[ \t]*path: (.+\.unity)[ \t]*$", source, re.M)
+          if not scenes or scenes[0] != "Assets/MainMenu.unity":
+              raise SystemExit("MainMenu is missing from the scene list.")
+          missing = [scene for scene in scenes if not Path(scene).is_file()]
+          if missing:
+              raise SystemExit("Missing scenes:\n" + "\n".join(missing))
+
+          config.write_text(source, encoding="utf-8")
+          print(Path("ProjectSettings/ProjectVersion.txt").read_text().strip())
+          print(f"Scene files checked: {len(set(scenes))}")
+          print(f"Legacy UnityScript files: {len(list(Path('Assets').rglob('*.js')))}")
+          PY
+
+      - name: Upload prepared Unity project
+        uses: actions/upload-artifact@v4
+        with:
+          name: ST2D-Remastered-Unity-Project
+          if-no-files-found: error
+          path: |
+            game/Assets
+            game/ProjectSettings
+            game/Packages
+            game/UnityPackageManager
