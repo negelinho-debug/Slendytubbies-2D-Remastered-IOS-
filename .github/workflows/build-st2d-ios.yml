@@ -1,0 +1,324 @@
+name: Build ST2D Remastered IPA
+
+on: workflow_dispatch
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 75
+    env:
+      UNITY: /Applications/Unity/Unity.app/Contents/MacOS/Unity
+    steps:
+      - name: Get the original Unity project
+        uses: actions/checkout@v4
+        with:
+          repository: BlueTubi/Slendytubbies-2D-Remastered
+          ref: af1c55cccfc9b6b567887f23e816fbaad73bdf3c
+          path: game
+          persist-credentials: false
+
+      - name: Prepare scenes and languages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p logs game/Assets/Editor game/Assets/Resources
+          rm -rf game/Library
+          cd game
+          noto=https://raw.githubusercontent.com/notofonts/noto-fonts/main
+          curl -fLSs --retry 3 "$noto/hinted/ttf/NotoSans/NotoSans-Regular.ttf" \
+            -o Assets/Resources/ST2DPortNoto.ttf
+          test "$(git hash-object Assets/Resources/ST2DPortNoto.ttf)" = d55220958aa51eeeb85048d746eabe43d2cd9f14
+          curl -fLSs --retry 3 "$noto/LICENSE" -o ../logs/Noto-OFL.txt
+
+          cat > Assets/Scripts/Assembly-CSharp/ST2DPortLanguage.cs <<'CS'
+          using System.Collections.Generic;
+          using UnityEngine;
+
+          internal static class ST2DPortLanguage
+          {
+              private const string Preference = "st2d.port.language";
+              private static readonly string[] Languages = { "English", "Русский", "Українська" };
+              private static readonly Dictionary<GUISkin, GUISkin> Skins = new Dictionary<GUISkin, GUISkin>();
+
+              private static int Current
+              {
+                  get { return Mathf.Clamp(PlayerPrefs.GetInt(Preference), 0, 2); }
+              }
+
+              internal static Font Font
+              {
+                  get { return Resources.Load<Font>("ST2DPortNoto"); }
+              }
+
+              internal static string Text(string english, string russian, string ukrainian)
+              {
+                  return Current == 1 ? russian : Current == 2 ? ukrainian : english;
+              }
+
+              internal static void ApplyFont()
+              {
+                  if (Current != 0)
+                      GUI.skin = WithFont(GUI.skin);
+              }
+
+              private static GUISkin WithFont(GUISkin source)
+              {
+                  GUISkin localized;
+                  if (!Skins.TryGetValue(source, out localized))
+                  {
+                      localized = Object.Instantiate(source);
+                      localized.font = Font;
+                      localized.button.font = Font;
+                      localized.box.font = Font;
+                      localized.label.font = Font;
+                      localized.textField.font = Font;
+                      Skins.Add(source, localized);
+                  }
+                  return localized;
+              }
+
+              internal static void DrawSelector()
+              {
+                  GUISkin original = GUI.skin;
+                  GUI.skin = WithFont(original);
+                  float width = Mathf.Clamp(Screen.width * 0.105f, 92f, 225f);
+                  float height = Mathf.Clamp(Screen.height * 0.055f, 32f, 70f);
+                  var style = new GUIStyle(GUI.skin.button);
+                  style.fontSize = Mathf.RoundToInt(height * 0.47f);
+                  float left = (Screen.width - width * Languages.Length) / 2f;
+                  float top = Screen.height - height * 1.65f;
+                  for (int i = 0; i < Languages.Length; i++)
+                  {
+                      string caption = i == Current ? "[" + Languages[i] + "]" : Languages[i];
+                      if (GUI.Button(new Rect(left + width * i, top, width - 3f, height), caption))
+                      {
+                          PlayerPrefs.SetInt(Preference, i);
+                          PlayerPrefs.Save();
+                      }
+                  }
+                  GUI.skin = original;
+              }
+          }
+          CS
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          import re
+
+          def text(en, ru, uk):
+              strings = ", ".join(json.dumps(value, ensure_ascii=False) for value in (en, ru, uk))
+              return f"ST2DPortLanguage.Text({strings})"
+
+          def replace_once(source, old, new):
+              if source.count(old) != 1:
+                  raise RuntimeError(f"Expected one occurrence of {old!r}")
+              return source.replace(old, new, 1)
+
+          def edit(name, transform):
+              path = Path("Assets/Scripts/Assembly-CSharp") / name
+              path.write_text(transform(path.read_text(encoding="utf-8-sig")), encoding="utf-8")
+
+          config = Path("ProjectSettings/EditorBuildSettings.asset")
+          scenes = config.read_text(encoding="utf-8")
+          for name in ("MainMenu", "Lobby"):
+              scenes = replace_once(scenes, f"Assets/Levels/{name}.unity", f"Assets/{name}.unity")
+          paths = re.findall(r"^[ \t]*path: (Assets/.+\.unity)[ \t]*$", scenes, re.M)
+          if not paths or paths[0] != "Assets/MainMenu.unity" or any(not Path(p).is_file() for p in paths):
+              raise RuntimeError("Unity's scene list is incomplete")
+          config.write_text(scenes, encoding="utf-8")
+
+          def menu(source):
+              translations = {
+                  "singleplayer": ("Одиночная игра", "Одиночна гра"),
+                  "multiplayer": ("Мультиплеер", "Мультиплеєр"),
+                  "charactercustomization": ("Внешность персонажа", "Зовнішність персонажа"),
+                  "settings": ("Настройки", "Налаштування"),
+                  "credits": ("Авторы", "Автори"),
+                  "quit": ("Выход", "Вихід"),
+                  "map": ("Карта", "Мапа"),
+                  "totalcustards": ("Всего порций крема", "Усього порцій крему"),
+                  "startgame": ("Начать игру", "Почати гру"),
+                  "originalmaps": ("Оригинальные карты", "Оригінальні мапи"),
+                  "back": ("Назад", "Назад"),
+                  "mainmenu": ("Главное меню", "Головне меню"),
+                  "custards": ("порций", "порцій"),
+                  "quality": ("Качество", "Якість"),
+                  "createdby": ("Автор: ", "Автор: "),
+                  "mappers": ("Авторы карт: ", "Автори мап: "),
+                  "assistantmappers": ("Помощники: ", "Помічники: "),
+                  "website": ("Сайт: ", "Сайт: "),
+                  "high": ("Высокое", "Висока"),
+                  "medium": ("Среднее", "Середня"),
+                  "low": ("Низкое", "Низька"),
+                  "translation": ("Испанский перевод: ", "Іспанський переклад: "),
+                  "thanks": ("Особая благодарность: ", "Особлива подяка: "),
+                  "specialthanks": (
+                      "Спасибо сообществу Slendytubbies за поддержку и вдохновение!",
+                      "Дякуємо спільноті Slendytubbies за підтримку й натхнення!",
+                  ),
+              }
+              lines = ["GUI.skin = menuskin;",
+                       "if (!spmenu && !isSettings && !isCredits)",
+                       "\tST2DPortLanguage.DrawSelector();",
+                       "ST2DPortLanguage.ApplyFont();"]
+              for field, (ru, uk) in translations.items():
+                  match = re.search(r'private string ' + field + r' = "([^"]+)";', source)
+                  if match is None:
+                      raise RuntimeError(f"Missing UI field {field}")
+                  lines.append(f"{field} = {text(match[1], ru, uk)};")
+              source = replace_once(source, "GUI.skin = menuskin;", "\n\t\t".join(lines))
+              source = replace_once(source, "GUI.skin = null;", "GUI.skin = null;\n\t\t\tST2DPortLanguage.ApplyFont();")
+              source = replace_once(source, '"Change username"', text("Change username", "Сменить имя", "Змінити ім’я"))
+              return source
+
+          def counter(source):
+              start = source.index('\t\t\tif (PlayerPrefs.GetInt("language") == 1)')
+              end = source.index('\t\t\tif (!isshowing)', start)
+              label = text("Custards remaining: ", "Осталось порций крема: ", "Залишилося порцій крему: ")
+              return source[:start] + (
+                  "\t\t\tGUIText counter = GetComponent<GUIText>();\n"
+                  "\t\t\tcounter.font = ST2DPortLanguage.Font;\n"
+                  f"\t\t\tcounter.text = {label} + remainingamount;\n"
+              ) + source[end:]
+
+          def victory(source):
+              lines = ["GUI.skin = guiskin1;", "ST2DPortLanguage.ApplyFont();"]
+              for field, en, ru, uk in (
+                  ("congradulations", "Congratulations!", "Поздравляем!", "Вітаємо!"),
+                  ("youcollected", "You collected all teletubby custards!", "Ты собрал весь крем!", "Ти зібрав увесь крем!"),
+                  ("mainmenu", "Main Menu", "Главное меню", "Головне меню"),
+              ):
+                  lines.append(f"{field} = {text(en, ru, uk)};")
+              return replace_once(source, "GUI.skin = guiskin1;", "\n\t\t".join(lines))
+
+          def mobile(source):
+              source = replace_once(source, "private void OnGUI()\n\t{",
+                                    "private void OnGUI()\n\t{\n\t\tGUI.skin = null;\n\t\tST2DPortLanguage.ApplyFont();")
+              source = replace_once(source, '"Run Mode: Off"', text("Run Mode: Off", "Бег: выкл.", "Біг: вимк."))
+              return replace_once(source, '"Run Mode: On"', text("Run Mode: On", "Бег: вкл.", "Біг: увімк."))
+
+          edit("MainMenu.cs", menu)
+          edit("VictoryScreen.cs", victory)
+          edit("CustardCounter.cs", counter)
+          edit("PlayerMovementMobile.cs", mobile)
+          PY
+
+          cat > Assets/Editor/ST2DBuild.cs <<'CS'
+          using System;
+          using System.Linq;
+          using UnityEditor;
+          using UnityEngine;
+
+          public static class ST2DBuild
+          {
+              public static void Export()
+              {
+                  PlayerSettings.SetApplicationIdentifier(BuildTargetGroup.iOS, "com.st2dremastered.fanport");
+                  PlayerSettings.SetScriptingBackend(BuildTargetGroup.iOS, ScriptingImplementation.IL2CPP);
+                  PlayerSettings.iOS.targetOSVersionString = "15.0";
+                  PlayerSettings.defaultInterfaceOrientation = UIOrientation.LandscapeLeft;
+                  PlayerSettings.SetUseDefaultGraphicsAPIs(BuildTarget.iOS, false);
+                  PlayerSettings.SetGraphicsAPIs(BuildTarget.iOS,
+                      new[] { UnityEngine.Rendering.GraphicsDeviceType.Metal });
+                  string[] scenes = EditorBuildSettings.scenes.Where(scene => scene.enabled)
+                      .Select(scene => scene.path).Distinct().ToArray();
+                  if (scenes.Length == 0 || scenes[0] != "Assets/MainMenu.unity")
+                      throw new InvalidOperationException("MainMenu must be the first enabled scene.");
+                  string error = BuildPipeline.BuildPlayer(scenes, Environment.GetEnvironmentVariable("ST2D_XCODE"),
+                      BuildTarget.iOS, BuildOptions.None);
+                  if (!string.IsNullOrEmpty(error))
+                      throw new InvalidOperationException(error);
+              }
+          }
+          CS
+
+      - name: Set up the Unity license CLI
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Unity 2017.4.40f1 and iOS support
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=https://download.unity3d.com/download_unity/6e14067f8a9a
+          curl -fLSs --retry 3 "$base/MacEditorInstaller/Unity-2017.4.40f1.pkg" \
+            -o "$RUNNER_TEMP/st2d-editor.pkg"
+          sudo installer -pkg "$RUNNER_TEMP/st2d-editor.pkg" -target /
+          rm "$RUNNER_TEMP/st2d-editor.pkg"
+          curl -fLSs --retry 3 "$base/MacEditorTargetInstaller/UnitySetup-iOS-Support-for-Editor-2017.4.40f1.pkg" \
+            -o "$RUNNER_TEMP/st2d-ios.pkg"
+          sudo installer -pkg "$RUNNER_TEMP/st2d-ios.pkg" -target /
+          rm "$RUNNER_TEMP/st2d-ios.pkg"
+          test -x "$UNITY"
+
+      - name: Activate Unity Personal
+        id: activate
+        env:
+          UNITY_USERNAME: ${{ secrets.UNITY_USERNAME }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$UNITY_USERNAME" ] || [ -z "$UNITY_PASSWORD" ]; then
+            echo "::error::Set UNITY_USERNAME and UNITY_PASSWORD in this repository's Actions secrets."
+            exit 1
+          fi
+          npm install -g @rage-against-the-pixel/unity-cli
+          unity-cli hub-install --json
+          unity-cli activate-license --license personal --email "$UNITY_USERNAME" --password "$UNITY_PASSWORD"
+
+      - name: Export the Xcode project
+        shell: bash
+        run: |
+          set -euo pipefail
+          export ST2D_XCODE="$RUNNER_TEMP/st2d-xcode"
+          "$UNITY" -batchmode -nographics -quit -projectPath "$PWD/game" \
+            -buildTarget iOS -executeMethod ST2DBuild.Export -logFile "$PWD/logs/unity.log"
+          test -d "$ST2D_XCODE/Unity-iPhone.xcodeproj"
+
+      - name: Compile and package the unsigned arm64 IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          export ST2D_BUNDLE="$RUNNER_TEMP/st2d-package"
+          derived="$RUNNER_TEMP/st2d-derived"
+          xcodebuild -project "$RUNNER_TEMP/st2d-xcode/Unity-iPhone.xcodeproj" \
+            -scheme Unity-iPhone -configuration Release -sdk iphoneos \
+            -derivedDataPath "$derived" ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            IPHONEOS_DEPLOYMENT_TARGET=15.0 | tee logs/xcode.log
+          shopt -s nullglob
+          apps=("$derived/Build/Products/Release-iphoneos/"*.app)
+          [ "${#apps[@]}" -eq 1 ]
+          app_path="${apps[0]}"
+          executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app_path/Info.plist")"
+          xcrun lipo -verify_arch arm64 "$app_path/$executable"
+          mkdir -p "$ST2D_BUNDLE/Payload" "$PWD/dist"
+          ditto "$app_path" "$ST2D_BUNDLE/Payload/ST2DRemastered.app"
+          cp logs/Noto-OFL.txt "$ST2D_BUNDLE/Payload/ST2DRemastered.app/Noto-OFL.txt"
+          ditto -c -k --keepParent "$ST2D_BUNDLE/Payload" "$PWD/dist/ST2D-Remastered.ipa"
+          unzip -tq "$PWD/dist/ST2D-Remastered.ipa"
+
+      - name: Upload the IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ST2D-Remastered-iOS
+          path: dist/ST2D-Remastered.ipa
+          if-no-files-found: error
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ST2D-Build-Logs
+          path: logs
+          if-no-files-found: ignore
+
+      - name: Return the Unity license
+        if: always() && steps.activate.outcome == 'success'
+        run: unity-cli return-license --license personal
