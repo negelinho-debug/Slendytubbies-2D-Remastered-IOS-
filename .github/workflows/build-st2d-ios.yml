@@ -236,6 +236,21 @@ jobs:
           }
           CS
 
+      - name: Exclude unused native ad clients
+        shell: bash
+        run: |
+          set -euo pipefail
+          ads=game/Assets/Scripts/Assembly-CSharp/GoogleMobileAds/iOS
+          for source in "$ads"/{Externs,IOSBannerClient,IOSInterstitialClient}.cs; do
+            test -f "$source"
+            {
+              printf '%s\n' '#if !UNITY_IOS && !UNITY_IPHONE'
+              cat "$source"
+              printf '\n%s\n' '#endif'
+            } > "$source.port"
+            mv "$source.port" "$source"
+          done
+
       - name: Set up the Unity license CLI
         uses: actions/setup-node@v4
         with:
@@ -291,7 +306,7 @@ jobs:
             -scheme Unity-iPhone -configuration Release -sdk iphoneos \
             -derivedDataPath "$derived" ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
-            IPHONEOS_DEPLOYMENT_TARGET=15.0 | tee logs/xcode.log
+            IPHONEOS_DEPLOYMENT_TARGET=15.0 2>&1 | tee logs/xcode.log
           shopt -s nullglob
           apps=("$derived/Build/Products/Release-iphoneos/"*.app)
           [ "${#apps[@]}" -eq 1 ]
