@@ -239,7 +239,7 @@ jobs:
       - name: Set up the Unity license CLI
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
 
       - name: Install Unity 2017.4.40f1 and iOS support
         shell: bash
@@ -268,9 +268,9 @@ jobs:
             echo "::error::Set UNITY_USERNAME and UNITY_PASSWORD in this repository's Actions secrets."
             exit 1
           fi
-          npm install -g @rage-against-the-pixel/unity-cli
-          unity-cli hub-install --json
-          unity-cli activate-license --license personal --email "$UNITY_USERNAME" --password "$UNITY_PASSWORD"
+          npm install -g @rage-against-the-pixel/unity-cli@4.2.2
+          export UNITY_EDITOR_PATH="$UNITY"
+          unity-cli activate-license --license personal
 
       - name: Export the Xcode project
         shell: bash
