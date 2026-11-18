@@ -300,6 +300,107 @@ jobs:
           joystick.write_text(text[:start] + touch_handler + text[end:], encoding="utf-8")
           PY
 
+      - name: Render iPhone controls without the legacy joystick camera
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          from textwrap import dedent
+
+          scripts = Path("game/Assets/Scripts/Assembly-CSharp")
+
+          def replace_once(source, old, new):
+              if source.count(old) != 1:
+                  raise RuntimeError("Expected one occurrence of " + old)
+              return source.replace(old, new, 1)
+
+          controller = scripts / "CheckController.cs"
+          text = controller.read_text(encoding="utf-8-sig")
+          activation = dedent("""
+              Transform controls = transform.Find("GUI Camera 1");
+              if (Application.platform == RuntimePlatform.IPhonePlayer)
+              {
+                  controls.GetComponent<Camera>().enabled = false;
+              }
+              controls.gameObject.SetActive(true);
+          """).strip()
+          controller.write_text(replace_once(text,
+              'base.transform.Find("GUI Camera 1").gameObject.active = true;',
+              activation.replace("\n", "\n\t\t\t")), encoding="utf-8")
+
+          joystick = scripts / "CNJoystick.cs"
+          text = joystick.read_text(encoding="utf-8-sig")
+          text = replace_once(text, "\tprivate float joystickBaseRadius;",
+              "\tprivate float joystickBaseRadius;\n\n\tprivate static Texture2D iosStickCircle;")
+          text = replace_once(text, "halfScreenWidth = halfScreenHeight * CurrentCamera.aspect;",
+              "halfScreenWidth = halfScreenHeight * (Application.platform == RuntimePlatform.IPhonePlayer\n"
+              "\t\t\t? (float)Screen.width / Mathf.Max(1, Screen.height) : CurrentCamera.aspect);")
+          text = replace_once(text,
+              "SpriteRenderer spriteRenderer = joystickBase.GetComponent<Renderer>() as SpriteRenderer;\n"
+              "\t\tjoystickBaseRadius = spriteRenderer.bounds.extents.x;",
+              "if (Application.platform == RuntimePlatform.IPhonePlayer)\n"
+              "\t\t{\n\t\t\tjoystickBaseRadius = Mathf.Max(0.01f, screenHeight * 0.09f);\n\t\t}\n"
+              "\t\telse\n\t\t{\n"
+              "\t\t\tRenderer spriteRenderer = joystickBase.GetComponent<Renderer>();\n"
+              "\t\t\tjoystickBaseRadius = spriteRenderer == null ? 0.01f : Mathf.Max(0.01f, spriteRenderer.bounds.extents.x);\n"
+              "\t\t}")
+          drawing = dedent("""
+              private void OnGUI()
+              {
+                  if (Application.platform != RuntimePlatform.IPhonePlayer || Event.current.type != EventType.Repaint)
+                  {
+                      return;
+                  }
+                  if (iosStickCircle == null)
+                  {
+                      const int size = 64;
+                      iosStickCircle = new Texture2D(size, size, TextureFormat.RGBA32, false);
+                      Color[] pixels = new Color[size * size];
+                      for (int y = 0; y < size; y++)
+                      {
+                          for (int x = 0; x < size; x++)
+                          {
+                              Vector2 offset = new Vector2(x + 0.5f - size / 2, y + 0.5f - size / 2);
+                              pixels[y * size + x] = new Color(1f, 1f, 1f, Mathf.Clamp01(size / 2 - offset.magnitude));
+                          }
+                      }
+                      iosStickCircle.SetPixels(pixels);
+                      iosStickCircle.Apply(false, true);
+                  }
+
+                  Vector3 center = isTweaking ? invokeTouchPosition : snapPosition - cleanPosition;
+                  Vector3 handle = isTweaking ? joystickTransform.localPosition : center;
+                  float radius = joystickBaseRadius * Screen.height / screenHeight;
+                  Color original = GUI.color;
+                  DrawCircle(center, radius, new Color(0.85f, 0.89f, 0.85f, 0.55f));
+                  DrawCircle(center, radius * 0.91f, new Color(0.07f, 0.1f, 0.09f, 0.88f));
+                  DrawCircle(handle, radius * 0.37f, new Color(0.82f, 0.87f, 0.8f, 0.86f));
+                  GUI.color = original;
+              }
+
+              private void DrawCircle(Vector3 point, float radius, Color color)
+              {
+                  float x = point.x * Screen.width / screenWidth;
+                  float y = Screen.height - point.y * Screen.height / screenHeight;
+                  GUI.color = color;
+                  GUI.DrawTexture(new Rect(x - radius, y - radius, radius * 2f, radius * 2f), iosStickCircle);
+              }
+          """).strip()
+          text = replace_once(text, "\tprivate void OnDrawGizmos()",
+              "\t" + drawing.replace("\n", "\n\t") + "\n\n\tprivate void OnDrawGizmos()")
+          joystick.write_text(text, encoding="utf-8")
+
+          flashlight = scripts / "PlayerFlashlightMobile.cs"
+          text = flashlight.read_text(encoding="utf-8-sig")
+          text = replace_once(text, "flashlight.LookAt(tempvalues);",
+              "if ((tempvalues.position - flashlight.position).sqrMagnitude > 0.0001f)\n"
+              "\t\t{\n\t\t\tflashlight.LookAt(tempvalues);\n\t\t}")
+          text = replace_once(text, "dragVector.z = dragVector.y;",
+              "if (dragVector.sqrMagnitude < 0.01f) return;\n\t\tdragVector.z = dragVector.y;")
+          flashlight.write_text(text, encoding="utf-8")
+          PY
+
       - name: Exclude unused native ad clients
         shell: bash
         run: |
