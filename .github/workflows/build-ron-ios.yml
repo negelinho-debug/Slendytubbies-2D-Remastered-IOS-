@@ -1,0 +1,580 @@
+name: Build Ron Night Shift IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ron-night-shift-ios
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 50
+    env:
+      UNITY_VERSION: 6000.0.65f1
+      UNITY_REVISION: a18e2220bd50
+      RON_PROJECT: ${{ runner.temp }}/ron-project
+      RON_XCODE: ${{ runner.temp }}/ron-xcode
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Generate the Unity project
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          mkdir -p "$RON_PROJECT/Assets/Editor" "$RON_PROJECT/Packages" "$RON_PROJECT/ProjectSettings"
+          printf 'm_EditorVersion: %s\nm_EditorVersionWithRevision: %s (%s)\n' \
+            "$UNITY_VERSION" "$UNITY_VERSION" "$UNITY_REVISION" > "$RON_PROJECT/ProjectSettings/ProjectVersion.txt"
+
+          cat > "$RON_PROJECT/Packages/manifest.json" <<'JSON'
+          {
+            "dependencies": {
+              "com.unity.modules.audio": "1.0.0",
+              "com.unity.modules.imgui": "1.0.0",
+              "com.unity.modules.inputlegacy": "1.0.0",
+              "com.unity.modules.jsonserialize": "1.0.0",
+              "com.unity.modules.physics": "1.0.0"
+            }
+          }
+          JSON
+
+          cat > "$RON_PROJECT/Assets/link.xml" <<'XML'
+          <linker>
+            <assembly fullname="UnityEngine.CoreModule">
+              <type fullname="UnityEngine.MeshFilter" preserve="all"/>
+              <type fullname="UnityEngine.MeshRenderer" preserve="all"/>
+            </assembly>
+            <assembly fullname="UnityEngine.PhysicsModule">
+              <type fullname="UnityEngine.BoxCollider" preserve="all"/>
+              <type fullname="UnityEngine.CapsuleCollider" preserve="all"/>
+            </assembly>
+          </linker>
+          XML
+
+          cat > "$RON_PROJECT/Assets/RonStation.cs" <<'CS'
+          using UnityEngine;
+          using UnityEngine.SceneManagement;
+
+          public sealed class RonStation : MonoBehaviour
+          {
+              public Material floorMaterial;
+              public Material wallMaterial;
+              public Material metalMaterial;
+              public Material panelMaterial;
+              public Material creatureMaterial;
+
+              private enum Phase { Power, Terminal, Watch, Escape, Won, Lost }
+              private Phase phase;
+
+              private static readonly Vector3 Generator = new Vector3(5.6f, 0, -2);
+              private static readonly Vector3 Terminal = new Vector3(-5.6f, 0, 5);
+              private static readonly Vector3 Exit = new Vector3(0, 0, -12);
+
+              private CharacterController ron;
+              private Camera view;
+              private Transform eye;
+              private Transform enemy;
+              private Light lamp;
+              private BoxCollider exitDoor;
+              private readonly Light[] ceilingLights = new Light[5];
+
+              private int moveFinger = -1;
+              private int lookFinger = -1;
+              private Vector2 moveOrigin;
+              private Vector2 movement;
+              private float pitch;
+              private float gravity;
+              private float alarmTime;
+              private bool usePressed;
+              private bool lampPressed;
+
+              private void Awake()
+              {
+                  Input.multiTouchEnabled = true;
+                  Application.targetFrameRate = 60;
+                  RenderSettings.ambientMode = UnityEngine.Rendering.AmbientMode.Flat;
+                  RenderSettings.ambientLight = new Color(0.20f, 0.20f, 0.24f);
+                  RenderSettings.fog = true;
+                  RenderSettings.fogColor = new Color(0.034f, 0.043f, 0.055f);
+                  RenderSettings.fogMode = FogMode.Linear;
+                  RenderSettings.fogStartDistance = 9;
+                  RenderSettings.fogEndDistance = 29;
+                  CreateStation();
+                  CreatePlayer();
+                  CreateEnemy();
+              }
+
+              private void CreateStation()
+              {
+                  Block("Floor", new Vector3(0, -0.18f, 0), new Vector3(14, 0.36f, 28), floorMaterial);
+                  Block("Ceiling", new Vector3(0, 3.4f, 0), new Vector3(14, 0.25f, 28), wallMaterial);
+                  Block("East wall", new Vector3(7, 1.6f, 0), new Vector3(0.4f, 3.3f, 28), wallMaterial);
+                  Block("West wall", new Vector3(-7, 1.6f, 0), new Vector3(0.4f, 3.3f, 28), wallMaterial);
+                  Block("North wall", new Vector3(0, 1.6f, 14), new Vector3(14, 3.3f, 0.4f), wallMaterial);
+                  Block("South wall", new Vector3(0, 1.6f, -14), new Vector3(14, 3.3f, 0.4f), wallMaterial);
+                  Block("East partition south", new Vector3(3, 1.6f, -9), new Vector3(0.35f, 3.3f, 10), wallMaterial);
+                  Block("East partition north", new Vector3(3, 1.6f, 6), new Vector3(0.35f, 3.3f, 16), wallMaterial);
+                  Block("West partition south", new Vector3(-3, 1.6f, -5.5f), new Vector3(0.35f, 3.3f, 17), wallMaterial);
+                  Block("West partition north", new Vector3(-3, 1.6f, 10.5f), new Vector3(0.35f, 3.3f, 7), wallMaterial);
+
+                  Block("Generator cabinet", Generator + Vector3.up * 0.8f, new Vector3(1.2f, 1.6f, 1.1f), metalMaterial);
+                  Block("Generator indicator", Generator + new Vector3(-0.61f, 1.24f, 0), new Vector3(0.04f, 0.26f, 0.45f), panelMaterial);
+                  Block("CCTV console", Terminal + Vector3.up * 0.58f, new Vector3(1, 1.16f, 1.4f), metalMaterial);
+                  Block("CCTV monitor", Terminal + Vector3.up * 1.43f, new Vector3(0.34f, 0.5f, 0.76f), panelMaterial);
+
+                  Block("Exit frame left", Exit + new Vector3(-2.04f, 1.6f, 0), new Vector3(1.94f, 3.3f, 0.45f), metalMaterial);
+                  Block("Exit frame right", Exit + new Vector3(2.04f, 1.6f, 0), new Vector3(1.94f, 3.3f, 0.45f), metalMaterial);
+                  exitDoor = Block("Exit door", Exit + Vector3.up * 1.45f, new Vector3(2.15f, 2.9f, 0.25f), metalMaterial)
+                      .GetComponent<BoxCollider>();
+
+                  for (int i = 0; i < ceilingLights.Length; i++)
+                  {
+                      var position = new Vector3(0, 3.05f, -10 + 5 * i);
+                      Block("Light fixture", position + Vector3.up * 0.15f, new Vector3(1.1f, 0.13f, 0.37f), metalMaterial);
+                      ceilingLights[i] = AddLight("Ceiling light", position, new Color(0.61f, 0.75f, 0.85f), 0, 8);
+                  }
+
+                  AddLight("Entry marker", Exit + new Vector3(0, 2.4f, 1), new Color(0.8f, 0.23f, 0.12f), 1.1f, 4);
+                  AddLight("Generator marker", Generator + new Vector3(-0.6f, 2.2f, 0), new Color(0.9f, 0.57f, 0.20f), 1.4f, 4);
+                  AddLight("Console marker", Terminal + new Vector3(0.55f, 2.2f, 0), new Color(0.20f, 0.71f, 0.79f), 1.4f, 4);
+              }
+
+              private static GameObject Block(string name, Vector3 position, Vector3 scale, Material material)
+              {
+                  var block = GameObject.CreatePrimitive(PrimitiveType.Cube);
+                  block.name = name;
+                  block.transform.position = position;
+                  block.transform.localScale = scale;
+                  block.GetComponent<Renderer>().sharedMaterial = material;
+                  return block;
+              }
+
+              private static Light AddLight(string name, Vector3 position, Color color, float intensity, float range)
+              {
+                  var source = new GameObject(name).AddComponent<Light>();
+                  source.transform.position = position;
+                  source.type = LightType.Point;
+                  source.color = color;
+                  source.intensity = intensity;
+                  source.range = range;
+                  return source;
+              }
+
+              private void CreatePlayer()
+              {
+                  var player = new GameObject("Ron");
+                  player.transform.position = new Vector3(0, 0.06f, -9.5f);
+                  ron = player.AddComponent<CharacterController>();
+                  ron.height = 1.7f;
+                  ron.radius = 0.31f;
+                  ron.center = Vector3.up * 0.86f;
+                  ron.minMoveDistance = 0;
+
+                  eye = new GameObject("First person").transform;
+                  eye.SetParent(player.transform, false);
+                  eye.localPosition = Vector3.up * 1.55f;
+                  view = eye.gameObject.AddComponent<Camera>();
+                  view.clearFlags = CameraClearFlags.SolidColor;
+                  view.backgroundColor = RenderSettings.fogColor;
+                  view.nearClipPlane = 0.05f;
+                  view.farClipPlane = 45;
+                  view.fieldOfView = 64;
+
+                  lamp = AddLight("Flashlight", Vector3.zero, new Color(1, 0.94f, 0.81f), 4.0f, 14);
+                  lamp.transform.SetParent(eye, false);
+                  lamp.transform.localPosition = new Vector3(0.18f, -0.13f, 0.1f);
+                  lamp.type = LightType.Spot;
+                  lamp.spotAngle = 59;
+                  lamp.renderMode = LightRenderMode.ForcePixel;
+              }
+
+              private void CreateEnemy()
+              {
+                  enemy = new GameObject("Dipsy silhouette").transform;
+                  enemy.position = new Vector3(0, 0, 12.1f);
+                  var body = GameObject.CreatePrimitive(PrimitiveType.Capsule);
+                  body.name = "Body";
+                  body.transform.SetParent(enemy, false);
+                  body.transform.localPosition = Vector3.up * 0.78f;
+                  body.transform.localScale = new Vector3(0.78f, 0.79f, 0.57f);
+                  body.GetComponent<Renderer>().sharedMaterial = creatureMaterial;
+                  Destroy(body.GetComponent<Collider>());
+                  enemy.gameObject.SetActive(false);
+              }
+
+              private void Update()
+              {
+                  if (phase == Phase.Won || phase == Phase.Lost)
+                      return;
+
+                  if (lampPressed || Input.GetKeyDown(KeyCode.F))
+                      lamp.enabled = !lamp.enabled;
+                  lampPressed = false;
+
+                  if (phase == Phase.Watch)
+                  {
+                      alarmTime -= Time.deltaTime;
+                      if (alarmTime <= 0 || usePressed || Input.GetKeyDown(KeyCode.E))
+                          StartEscape();
+                      usePressed = false;
+                      return;
+                  }
+
+                  ReadControls();
+                  var forward = ron.transform.forward * movement.y + ron.transform.right * movement.x;
+                  gravity = ron.isGrounded ? -2 : Mathf.Max(gravity - 18 * Time.deltaTime, -20);
+                  ron.Move((forward * 3.7f + Vector3.up * gravity) * Time.deltaTime);
+
+                  if (usePressed || Input.GetKeyDown(KeyCode.E))
+                      Interact();
+                  usePressed = false;
+
+                  if (phase == Phase.Escape)
+                      AdvanceChase();
+              }
+
+              private void ReadControls()
+              {
+                  movement = Vector2.zero;
+          #if UNITY_EDITOR || UNITY_STANDALONE
+                  if (Input.GetKey(KeyCode.W)) movement.y += 1;
+                  if (Input.GetKey(KeyCode.S)) movement.y -= 1;
+                  if (Input.GetKey(KeyCode.D)) movement.x += 1;
+                  if (Input.GetKey(KeyCode.A)) movement.x -= 1;
+                  movement = Vector2.ClampMagnitude(movement, 1);
+          #endif
+                  var safe = Screen.safeArea;
+                  foreach (var touch in Input.touches)
+                  {
+                      var point = touch.position;
+                      if (touch.phase == TouchPhase.Began)
+                      {
+                          if (moveFinger < 0 && LeftZone(safe).Contains(ToGui(point)))
+                          {
+                              moveFinger = touch.fingerId;
+                              moveOrigin = point;
+                          }
+                          else if (lookFinger < 0 && point.x > safe.center.x && !ButtonArea(safe).Contains(ToGui(point)))
+                              lookFinger = touch.fingerId;
+                      }
+
+                      bool released = touch.phase == TouchPhase.Canceled || touch.phase == TouchPhase.Ended;
+                      if (touch.fingerId == moveFinger)
+                      {
+                          if (released) moveFinger = -1;
+                          else movement = Vector2.ClampMagnitude((point - moveOrigin) / (safe.height * 0.12f), 1);
+                      }
+                      if (touch.fingerId == lookFinger)
+                      {
+                          if (released) lookFinger = -1;
+                          else Rotate(touch.deltaPosition * (120f / safe.height));
+                      }
+                  }
+
+          #if UNITY_EDITOR || UNITY_STANDALONE
+                  if (Input.GetMouseButton(1))
+                      Rotate(new Vector2(Input.GetAxisRaw("Mouse X"), Input.GetAxisRaw("Mouse Y")) * 3);
+          #endif
+              }
+
+              private void Rotate(Vector2 delta)
+              {
+                  ron.transform.Rotate(Vector3.up, delta.x, Space.World);
+                  pitch = Mathf.Clamp(pitch - delta.y, -75, 75);
+                  eye.localRotation = Quaternion.Euler(pitch, 0, 0);
+              }
+
+              private bool Near(Vector3 target)
+              {
+                  var player = ron.transform.position;
+                  return Vector2.Distance(new Vector2(player.x, player.z), new Vector2(target.x, target.z)) <= 1.85f;
+              }
+
+              private void Interact()
+              {
+                  if (phase == Phase.Power && Near(Generator))
+                  {
+                      foreach (var lightSource in ceilingLights)
+                          lightSource.intensity = 1.6f;
+                      phase = Phase.Terminal;
+                  }
+                  else if (phase == Phase.Terminal && Near(Terminal))
+                  {
+                      phase = Phase.Watch;
+                      alarmTime = 3;
+                      view.transform.SetParent(null);
+                      view.transform.SetPositionAndRotation(new Vector3(1.9f, 2.85f, 7.8f),
+                          Quaternion.LookRotation(new Vector3(-1.9f, -1.95f, 4.3f)));
+                      enemy.gameObject.SetActive(true);
+                  }
+              }
+
+              private void StartEscape()
+              {
+                  view.transform.SetParent(ron.transform, false);
+                  view.transform.localPosition = Vector3.up * 1.55f;
+                  view.transform.localRotation = Quaternion.Euler(pitch, 0, 0);
+                  exitDoor.enabled = false;
+                  exitDoor.transform.localPosition += Vector3.up * 3f;
+                  moveFinger = -1;
+                  lookFinger = -1;
+                  phase = Phase.Escape;
+              }
+
+              private void AdvanceChase()
+              {
+                  var player = ron.transform.position;
+                  var target = new Vector3(player.x, 0, player.z);
+                  if (player.z < -12.3f && Mathf.Abs(player.x) < 1.1f)
+                  {
+                      phase = Phase.Won;
+                      return;
+                  }
+
+                  // Approach the console through the west doorway while Ron is in that room.
+                  if (player.x < -3.5f && enemy.position.x >= -2.6f)
+                      target = new Vector3(-3.1f, 0, 5);
+                  else if (player.x >= -3.5f && enemy.position.x < -3.5f)
+                      target = new Vector3(-2.8f, 0, 5);
+                  // The east room also has a single doorway in the main corridor.
+                  else if (player.x > 3.5f && enemy.position.x <= 2.6f)
+                      target = new Vector3(3.1f, 0, -2);
+                  else if (player.x <= 3.5f && enemy.position.x > 3.5f)
+                      target = new Vector3(2.8f, 0, -2);
+
+                  enemy.position = Vector3.MoveTowards(enemy.position, target, 2.9f * Time.deltaTime);
+                  if (Vector3.Distance(enemy.position, new Vector3(player.x, 0, player.z)) < 0.78f)
+                      phase = Phase.Lost;
+              }
+
+              private static Vector2 ToGui(Vector2 point) => new Vector2(point.x, Screen.height - point.y);
+              private static Rect LeftZone(Rect safe) =>
+                  new Rect(safe.xMin, Screen.height - safe.yMin - safe.height * 0.48f,
+                      safe.width * 0.43f, safe.height * 0.48f);
+              private static Rect ButtonArea(Rect safe) =>
+                  new Rect(safe.xMax - safe.height * 0.56f, Screen.height - safe.yMin - safe.height * 0.20f,
+                      safe.height * 0.56f, safe.height * 0.20f);
+
+              private void OnApplicationFocus(bool focused)
+              {
+                  if (!focused)
+                  {
+                      moveFinger = -1;
+                      lookFinger = -1;
+                  }
+              }
+
+              private void OnGUI()
+              {
+                  var safe = Screen.safeArea;
+                  var pad = safe.height * 0.035f;
+                  GUI.skin.label.fontSize = Mathf.RoundToInt(safe.height * 0.042f);
+                  GUI.skin.button.fontSize = Mathf.RoundToInt(safe.height * 0.038f);
+
+                  if (phase == Phase.Won || phase == Phase.Lost)
+                  {
+                      var center = ToGui(safe.center);
+                      GUI.Box(new Rect(center.x - safe.height * 0.45f, center.y - safe.height * 0.18f,
+                          safe.height * 0.9f, safe.height * 0.36f), "");
+                      GUI.Label(new Rect(center.x - safe.height * 0.38f, center.y - safe.height * 0.13f,
+                          safe.height * 0.76f, safe.height * 0.10f), phase == Phase.Won ? "Рон покинул станцию" : "Дипси настиг Рона");
+                      if (GUI.Button(new Rect(center.x - safe.height * 0.25f, center.y + pad,
+                          safe.height * 0.50f, safe.height * 0.11f), "Заново"))
+                          SceneManager.LoadScene(SceneManager.GetActiveScene().buildIndex);
+                      return;
+                  }
+
+                  string objective = phase switch
+                  {
+                      Phase.Power => "Включи генератор · дверь справа по коридору",
+                      Phase.Terminal => "Проверь камеры · комната слева дальше по коридору",
+                      Phase.Watch => "КАМЕРА 01 · СЕВЕРНЫЙ КОРИДОР",
+                      _ => "Дипси на станции. Беги к двери, через которую вошёл."
+                  };
+                  GUI.Label(new Rect(safe.xMin + pad, Screen.height - safe.yMax + pad,
+                      safe.width - 2 * pad, safe.height * 0.10f), objective);
+
+                  if (phase != Phase.Watch)
+                  {
+                      var left = LeftZone(safe);
+                      var size = safe.height * 0.23f;
+                      var center = moveFinger >= 0 ? ToGui(moveOrigin) : new Vector2(left.xMin + pad + size * 0.5f, left.yMax - pad - size * 0.5f);
+                      GUI.Box(new Rect(center.x - size * 0.5f, center.y - size * 0.5f, size, size), "");
+                      center += new Vector2(movement.x, -movement.y) * (size * 0.25f);
+                      GUI.Box(new Rect(center.x - size * 0.17f, center.y - size * 0.17f, size * 0.34f, size * 0.34f), "");
+                  }
+
+                  var buttons = ButtonArea(safe);
+                  float w = buttons.width * 0.45f;
+                  var lampButton = new Rect(buttons.xMax - w - pad, buttons.y + pad, w, buttons.height * 0.57f);
+                  var useButton = new Rect(lampButton.x - w - pad * 0.5f, lampButton.y, w, lampButton.height);
+                  if (phase != Phase.Watch && GUI.Button(lampButton, "Фонарик"))
+                      lampPressed = true;
+                  if (phase == Phase.Watch || (phase == Phase.Power && Near(Generator)) || (phase == Phase.Terminal && Near(Terminal)))
+                  {
+                      if (GUI.Button(useButton, phase == Phase.Watch ? "Назад" : "Действие"))
+                          usePressed = true;
+                  }
+              }
+          }
+          CS
+
+          cat > "$RON_PROJECT/Assets/Editor/RonBuild.cs" <<'CS'
+          using System;
+          using UnityEditor;
+          using UnityEditor.Build.Reporting;
+          using UnityEditor.SceneManagement;
+          using UnityEngine;
+
+          public static class RonBuild
+          {
+              public static void ExportIOS()
+              {
+                  var scene = EditorSceneManager.NewScene(NewSceneSetup.EmptyScene, NewSceneMode.Single);
+                  var station = new GameObject("Satellite Station").AddComponent<RonStation>();
+                  station.floorMaterial = CreateMaterial("Floor", new Color(0.21f, 0.23f, 0.26f), 0.05f);
+                  station.wallMaterial = CreateMaterial("Wall", new Color(0.37f, 0.41f, 0.43f), 0.18f);
+                  station.metalMaterial = CreateMaterial("Metal", new Color(0.19f, 0.26f, 0.30f), 0.3f);
+                  station.panelMaterial = CreateMaterial("Panel", new Color(0.19f, 0.62f, 0.67f), 0.12f);
+                  station.creatureMaterial = CreateMaterial("Dipsy", new Color(0.26f, 0.46f, 0.16f), 0.06f);
+                  RenderSettings.fog = true;
+                  RenderSettings.fogMode = FogMode.Linear;
+                  const string scenePath = "Assets/RonStation.unity";
+                  if (!EditorSceneManager.SaveScene(scene, scenePath))
+                      throw new InvalidOperationException("Could not save the satellite station scene.");
+
+                  PlayerSettings.companyName = "Fan Projects";
+                  PlayerSettings.productName = "Ron Night Shift";
+                  PlayerSettings.bundleVersion = "0.1.0";
+                  PlayerSettings.SetApplicationIdentifier(UnityEditor.Build.NamedBuildTarget.iOS, "com.fanprojects.ronnightshift");
+                  PlayerSettings.defaultInterfaceOrientation = UIOrientation.LandscapeLeft;
+                  PlayerSettings.iOS.targetOSVersionString = "15.0";
+                  PlayerSettings.iOS.sdkVersion = iOSSdkVersion.DeviceSDK;
+                  QualitySettings.pixelLightCount = 4;
+                  AssetDatabase.SaveAssets();
+
+                  string output = Environment.GetEnvironmentVariable("RON_XCODE");
+                  if (string.IsNullOrWhiteSpace(output))
+                      throw new InvalidOperationException("RON_XCODE is missing.");
+                  var report = BuildPipeline.BuildPlayer(new BuildPlayerOptions
+                  {
+                      scenes = new[] { scenePath },
+                      locationPathName = output,
+                      target = BuildTarget.iOS,
+                      options = BuildOptions.None
+                  });
+                  if (report.summary.result != BuildResult.Succeeded)
+                      throw new InvalidOperationException("iOS export failed: " + report.summary.result);
+              }
+
+              private static Material CreateMaterial(string name, Color color, float smoothness)
+              {
+                  var material = new Material(Shader.Find("Standard")) { name = name, color = color };
+                  material.SetFloat("_Glossiness", smoothness);
+                  AssetDatabase.CreateAsset(material, "Assets/" + name + ".mat");
+                  return material;
+              }
+          }
+          CS
+
+      - name: Set up the Unity license CLI
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install Unity and iOS Build Support
+        run: |
+          set -euo pipefail
+          base="https://download.unity3d.com/download_unity/$UNITY_REVISION"
+          curl -fLSs --retry 3 --connect-timeout 30 \
+            "$base/MacEditorInstaller/Unity-$UNITY_VERSION.pkg" -o "$RUNNER_TEMP/ron-editor.pkg"
+          sudo installer -pkg "$RUNNER_TEMP/ron-editor.pkg" -target /
+          rm "$RUNNER_TEMP/ron-editor.pkg"
+
+          curl -fLSs --retry 3 --connect-timeout 30 \
+            "$base/MacEditorTargetInstaller/UnitySetup-iOS-Support-for-Editor-$UNITY_VERSION.pkg" \
+            -o "$RUNNER_TEMP/ron-ios.pkg"
+          sudo installer -pkg "$RUNNER_TEMP/ron-ios.pkg" -target /
+          rm "$RUNNER_TEMP/ron-ios.pkg"
+
+          unity="/Applications/Unity/Unity.app/Contents/MacOS/Unity"
+          if [[ ! -x "$unity" ]]; then
+            unity="/Applications/Unity/Hub/Editor/$UNITY_VERSION/Unity.app/Contents/MacOS/Unity"
+          fi
+          if [[ ! -x "$unity" ]]; then
+            echo "::error::Unity executable is missing after installation."
+            exit 1
+          fi
+          printf 'UNITY_EDITOR_PATH=%s\n' "$unity" >> "$GITHUB_ENV"
+
+      - name: Activate Unity Personal
+        id: activate
+        env:
+          UNITY_USERNAME: ${{ secrets.UNITY_USERNAME }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$UNITY_USERNAME" || -z "$UNITY_PASSWORD" ]]; then
+            echo "::error::Use the same UNITY_USERNAME and UNITY_PASSWORD Actions secrets as the ST2D build."
+            exit 1
+          fi
+          npm install --global @rage-against-the-pixel/unity-cli@4.2.2
+          unity-cli activate-license --license personal
+
+      - name: Export the iOS project from Unity
+        run: |
+          set -euo pipefail
+          mkdir -p logs
+          "$UNITY_EDITOR_PATH" -batchmode -nographics -quit -projectPath "$RON_PROJECT" \
+            -buildTarget iOS -executeMethod RonBuild.ExportIOS -logFile "$PWD/logs/unity.log" || {
+              tail -n 80 logs/unity.log || true
+              exit 1
+            }
+          test -d "$RON_XCODE/Unity-iPhone.xcodeproj"
+
+      - name: Compile and package the IPA
+        run: |
+          set -euo pipefail
+          derived="$RUNNER_TEMP/ron-derived"
+          package="$RUNNER_TEMP/ron-package"
+          mkdir -p logs dist "$package/Payload"
+
+          xcodebuild -project "$RON_XCODE/Unity-iPhone.xcodeproj" \
+            -scheme Unity-iPhone -configuration Release -sdk iphoneos \
+            -derivedDataPath "$derived" -destination 'generic/platform=iOS' \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            2>&1 | tee logs/xcode.log
+
+          shopt -s nullglob
+          apps=("$derived/Build/Products/Release-iphoneos/"*.app)
+          [[ "${#apps[@]}" -eq 1 ]]
+          app_path="${apps[0]}"
+          executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app_path/Info.plist")"
+          xcrun lipo "$app_path/$executable" -verify_arch arm64
+          ditto "$app_path" "$package/Payload/RonNightShift.app"
+          ditto -c -k --keepParent "$package/Payload" "$PWD/dist/Ron-Night-Shift.ipa"
+          unzip -tq dist/Ron-Night-Shift.ipa
+
+      - name: Upload the IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ron-Night-Shift-iOS
+          path: dist/Ron-Night-Shift.ipa
+          if-no-files-found: error
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ron-Night-Shift-Logs
+          path: logs
+          if-no-files-found: ignore
+
+      - name: Return the Unity license
+        if: always() && steps.activate.outcome == 'success'
+        run: unity-cli return-license --license personal
