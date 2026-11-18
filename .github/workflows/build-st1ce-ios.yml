@@ -52,17 +52,27 @@ jobs:
             --proto '=https' --proto-redir '=https' "$url" -o "$archive"
           test "$(stat -f %z "$archive")" = 2520987739
 
-          if ! command -v 7zz >/dev/null && ! command -v 7z >/dev/null; then
-            brew install sevenzip
-          fi
-          unpack="$(command -v 7zz || command -v 7z)"
+          tools_dir="$RUNNER_TEMP/st1ce-unrar"
+          extract_to="$RUNNER_TEMP/st1ce-source"
+          mkdir -p "$tools_dir" "$extract_to"
+          curl -fLSs --retry 3 --connect-timeout 25 \
+            https://www.rarlab.com/rar/rarmacos-x64-723.tar.gz -o "$tools_dir/unrar.tar.gz"
+          printf '%s  %s\n' \
+            da1fb3c3d7748136c9b369b683d574b372cb1ed049a634a81f85d93918346d8f \
+            "$tools_dir/unrar.tar.gz" | shasum -a 256 -c -
+          tar -xzf "$tools_dir/unrar.tar.gz" -C "$tools_dir" rar/unrar
+          test -x "$tools_dir/rar/unrar"
+
           folder='Slendytubbies 1 Community Edition Updated'
-          "$unpack" x -y "-o$RUNNER_TEMP/st1ce-source" "$archive" \
-            "$folder/Assets/*" "$folder/Packages/*" "$folder/ProjectSettings/*" \
+          "$tools_dir/rar/unrar" x -o+ -p- -idq "$archive" \
+            "$folder/Assets/*" "$folder/Packages/*" "$folder/ProjectSettings/*" "$extract_to/" \
             > logs/extraction.log 2>&1 || {
               tail -n 80 logs/extraction.log
               exit 1
             }
+          test -s "$ST1CE_PROJECT/ProjectSettings/ProjectVersion.txt"
+          test -s "$ST1CE_PROJECT/Packages/manifest.json"
+          test -s "$ST1CE_PROJECT/Assets/NewScenes/mainmeny.unity"
           rm "$archive" "$RUNNER_TEMP/st1ce-download.json"
 
       - name: Verify the source project and prepare the iOS export
