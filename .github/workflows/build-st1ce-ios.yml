@@ -17,12 +17,16 @@ jobs:
     env:
       UNITY_VERSION: '2021.3.41f1'
       UNITY_REVISION: '6c5a9e20c022'
-      ST1CE_PROJECT: ${{ runner.temp }}/st1ce-source/Slendytubbies 1 Community Edition Updated
-      ST1CE_XCODE: ${{ runner.temp }}/st1ce-xcode
     defaults:
       run:
         shell: bash
     steps:
+      - name: Set build paths
+        run: |
+          set -euo pipefail
+          printf 'ST1CE_PROJECT=%s\n' "$RUNNER_TEMP/st1ce-source/Slendytubbies 1 Community Edition Updated" >> "$GITHUB_ENV"
+          printf 'ST1CE_XCODE=%s\n' "$RUNNER_TEMP/st1ce-xcode" >> "$GITHUB_ENV"
+
       - name: Download and extract the original Unity project
         run: |
           set -euo pipefail
