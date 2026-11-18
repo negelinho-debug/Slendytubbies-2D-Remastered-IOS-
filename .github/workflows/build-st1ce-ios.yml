@@ -347,6 +347,141 @@ jobs:
           #endif
           CS
 
+          cat > "$ST1CE_PROJECT/Assets/ST1CECrouch.cs" <<'CS'
+          using UnityEngine;
+
+          public sealed class ST1CECrouch : MonoBehaviour
+          {
+              internal bool Held { get; set; }
+
+              private CharacterController controller;
+              private Transform view;
+              private float standingHeight;
+              private Vector3 standingCenter;
+              private Vector3 standingView;
+              private bool crouching;
+
+              internal void Initialize(CharacterController motor, Camera camera)
+              {
+                  controller = motor;
+                  standingHeight = motor.height;
+                  standingCenter = motor.center;
+                  view = camera == null ? null : camera.transform;
+                  if (view != null)
+                      standingView = view.localPosition;
+              }
+
+              internal bool Step()
+              {
+                  if (controller == null || Held == crouching)
+                      return crouching;
+
+                  if (!Held && !HasStandingClearance())
+                      return true;
+
+                  float height = Held ? Mathf.Min(standingHeight,
+                      Mathf.Max(controller.radius * 2f, standingHeight * 0.58f)) : standingHeight;
+                  float drop = (standingHeight - height) * 0.5f;
+                  controller.height = height;
+                  controller.center = standingCenter - Vector3.up * drop;
+
+                  if (view != null)
+                  {
+                      Vector3 offset = transform.TransformVector(Vector3.down * drop);
+                      if (view.parent != null)
+                          offset = view.parent.InverseTransformVector(offset);
+                      view.localPosition = standingView + offset;
+                  }
+
+                  crouching = Held;
+                  return crouching;
+              }
+
+              private bool HasStandingClearance()
+              {
+                  Vector3 scale = transform.lossyScale;
+                  float radius = controller.radius * Mathf.Max(Mathf.Abs(scale.x), Mathf.Abs(scale.z));
+                  float skin = controller.skinWidth * Mathf.Abs(scale.y);
+                  radius = Mathf.Max(0.01f, radius - skin);
+
+                  Vector3 crouchedTop = transform.TransformPoint(
+                      controller.center + Vector3.up * (controller.height * 0.5f)) - transform.up * radius;
+                  Vector3 standingTop = transform.TransformPoint(
+                      standingCenter + Vector3.up * (standingHeight * 0.5f)) - transform.up * radius;
+
+                  foreach (var hit in Physics.OverlapCapsule(crouchedTop, standingTop, radius,
+                      Physics.AllLayers, QueryTriggerInteraction.Ignore))
+                  {
+                      if (hit != controller && !hit.transform.IsChildOf(transform)
+                          && !Physics.GetIgnoreLayerCollision(gameObject.layer, hit.gameObject.layer)
+                          && !Physics.GetIgnoreCollision(controller, hit))
+                          return false;
+                  }
+                  return true;
+              }
+
+              private void OnDisable()
+              {
+                  Held = false;
+              }
+          }
+          CS
+
+          cat > "$ST1CE_PROJECT/Assets/ST1CECrouchButton.cs" <<'CS'
+          using UnityEngine;
+          using UnityEngine.EventSystems;
+          using UnityEngine.UI;
+
+          public sealed class ST1CECrouchButton : MonoBehaviour, IPointerDownHandler, IPointerUpHandler
+          {
+              public ST1CECrouch[] players = System.Array.Empty<ST1CECrouch>();
+              public Image background;
+              private int? activePointer;
+
+              public void OnPointerDown(PointerEventData eventData)
+              {
+                  if (activePointer.HasValue || eventData.button != PointerEventData.InputButton.Left)
+                      return;
+
+                  activePointer = eventData.pointerId;
+                  SetHeld(true);
+                  background.color = new Color(0.25f, 0.25f, 0.25f, 0.9f);
+              }
+
+              public void OnPointerUp(PointerEventData eventData)
+              {
+                  if (activePointer == eventData.pointerId)
+                      Release();
+              }
+
+              private void OnDisable()
+              {
+                  Release();
+              }
+
+              private void OnApplicationFocus(bool hasFocus)
+              {
+                  if (!hasFocus)
+                      Release();
+              }
+
+              private void Release()
+              {
+                  activePointer = null;
+                  SetHeld(false);
+                  if (background != null)
+                      background.color = new Color(0f, 0f, 0f, 0.7f);
+              }
+
+              private void SetHeld(bool held)
+              {
+                  foreach (var player in players)
+                      if (player != null && (!held || player.isActiveAndEnabled))
+                          player.Held = held;
+              }
+          }
+          CS
+
           cat > "$ST1CE_PROJECT/Assets/Editor/ST1CEPortScenes.cs" <<'CS'
           using System.Collections.Generic;
           using System.Linq;
@@ -363,7 +498,7 @@ jobs:
 
               private const string FontPath = "Assets/ST1CEPortNoto.ttf";
               private const string MenuPath = "Assets/NewScenes/mainmeny.unity";
-              private const string EnglishHelp = "Left joystick: move.\nRight joystick: look.\nUse Jump, Run and Flashlight.\nEsc: return to the main menu.\nIn Sandbox, use the Sandbox button for sandbox options.";
+              private const string EnglishHelp = "Left joystick: move.\nRight joystick: look.\nUse Jump, Run and Flashlight. Hold Crouch to crouch.\nEsc: return to the main menu.\nIn Sandbox, use the Sandbox button for sandbox options.";
 
               private static readonly Dictionary<string, (string russian, string ukrainian)> Translations =
                   new Dictionary<string, (string, string)>
@@ -384,6 +519,7 @@ jobs:
                       { "Skins:", ("Облики:", "Образи:") },
                       { "Jump", ("Прыжок", "Стрибок") },
                       { "Run", ("Бег", "Біг") },
+                      { "Crouch", ("Присесть", "Присісти") },
                       { "Flashlight", ("Фонарь", "Ліхтар") },
                       { "Esc", ("В меню", "У меню") },
                       { "Chat", ("Чат", "Чат") },
@@ -457,7 +593,58 @@ jobs:
                           localized.ukrainian = translations.ukrainian;
                       }
                   }
+                  AddCrouch(roots, mobileObjects, font, scene.path);
                   Debug.Log("[ST1CE] Enabled the original mobile player, UI and room setup in " + scene.name);
+              }
+
+              private static void AddCrouch(GameObject[] roots, GameObject[] mobileObjects, Font font, string scenePath)
+              {
+                  var players = roots
+                      .SelectMany(root => root.GetComponentsInChildren<CharacterController>(true))
+                      .Where(controller => controller.GetComponent<PlayerControllerMobile>() != null
+                          || controller.GetComponent<EnemyControllerMobile>() != null
+                          || controller.GetComponent<PlayerSandboxMobile>() != null)
+                      .Select(controller => controller.gameObject.AddComponent<ST1CECrouch>())
+                      .ToArray();
+                  var canvases = mobileObjects.Where(obj => obj.GetComponent<Canvas>() != null).ToArray();
+                  var canvas = canvases.FirstOrDefault(obj => obj.GetComponentInChildren<Joystick>(true) != null);
+                  if (players.Length == 0 || canvas == null)
+                      throw new BuildFailedException("Crouch requires the original mobile player and joystick canvas in " + scenePath);
+
+                  var button = new GameObject("Crouch (iOS)", typeof(RectTransform), typeof(Image));
+                  button.transform.SetParent(canvas.transform, false);
+                  var rect = (RectTransform)button.transform;
+                  rect.anchorMin = rect.anchorMax = new Vector2(0.5f, 0.10f);
+                  rect.pivot = new Vector2(0.5f, 0.5f);
+                  rect.sizeDelta = new Vector2(112f, 52f);
+                  rect.anchoredPosition = Vector2.zero;
+
+                  var image = button.GetComponent<Image>();
+                  image.color = new Color(0f, 0f, 0f, 0.7f);
+                  var press = button.AddComponent<ST1CECrouchButton>();
+                  press.players = players;
+                  press.background = image;
+
+                  var title = new GameObject("Label", typeof(RectTransform), typeof(Text));
+                  title.transform.SetParent(button.transform, false);
+                  var titleRect = (RectTransform)title.transform;
+                  titleRect.anchorMin = Vector2.zero;
+                  titleRect.anchorMax = Vector2.one;
+                  titleRect.offsetMin = new Vector2(5f, 3f);
+                  titleRect.offsetMax = new Vector2(-5f, -3f);
+                  var label = title.GetComponent<Text>();
+                  label.text = "Crouch";
+                  label.font = font;
+                  label.fontSize = 19;
+                  label.alignment = TextAnchor.MiddleCenter;
+                  label.color = Color.white;
+                  label.raycastTarget = false;
+                  var translation = Translations[label.text];
+                  var localized = title.AddComponent<ST1CEPortLabel>();
+                  localized.label = label;
+                  localized.cyrillicFont = font;
+                  localized.russian = translation.russian;
+                  localized.ukrainian = translation.ukrainian;
               }
 
               private static void AddLanguages(LanguageManager manager, Font font)
@@ -471,8 +658,8 @@ jobs:
                       if (key.StartsWith("Walk:"))
                       {
                           row.textoIngles = EnglishHelp;
-                          row.textoRusso = "Левый джойстик: движение.\nПравый джойстик: обзор.\nКнопки: прыжок, бег и фонарь.\n«В меню»: вернуться в главное меню.\nКнопка «Песочница» открывает её настройки.";
-                          row.textoUcraniano = "Лівий джойстик: рух.\nПравий джойстик: огляд.\nКнопки: стрибок, біг і ліхтар.\n«У меню»: повернутися до головного меню.\nКнопка «Пісочниця» відкриває її налаштування.";
+                          row.textoRusso = "Левый джойстик: движение.\nПравый джойстик: обзор.\nКнопки: прыжок, бег и фонарь. Удерживай «Присесть».\n«В меню»: вернуться в главное меню.\nКнопка «Песочница» открывает её настройки.";
+                          row.textoUcraniano = "Лівий джойстик: рух.\nПравий джойстик: огляд.\nКнопки: стрибок, біг і ліхтар. Утримуй «Присісти».\n«У меню»: повернутися до головного меню.\nКнопка «Пісочниця» відкриває її налаштування.";
                       }
                       else if (key.StartsWith("Original Game:"))
                       {
@@ -520,12 +707,16 @@ jobs:
           fields = """#if UNITY_IOS
               private Joystick iosMoveStick;
               private Joystick iosLookStick;
+              private ST1CECrouch iosCrouch;
           #endif
 
           """
           init = """#if UNITY_IOS
                   iosMoveStick = ST1CEPortInput.FindStick(uiMover);
                   iosLookStick = ST1CEPortInput.FindStick(uiMoverCamera);
+                  iosCrouch = GetComponent<ST1CECrouch>();
+                  if (iosCrouch != null)
+                      iosCrouch.Initialize(characterController, playerCamera);
                   if (playerCamera != null)
                       rotationX = Mathf.DeltaAngle(0f, playerCamera.transform.localEulerAngles.x);
           #endif
@@ -553,7 +744,10 @@ jobs:
               source = change_once(source, "        characterController = GetComponent<CharacterController>();\n",
                   "        characterController = GetComponent<CharacterController>();\n" + init, relative)
 
-              move = """        float currentSpeed = run ? sprintSpeed : speed;
+              move = """        bool crouched = iosCrouch != null && iosCrouch.Step();
+                  float currentSpeed = crouched ? speed * 0.5f : (run ? sprintSpeed : speed);
+                  if (crouched)
+                      jump = false;
                   Vector3 move = ST1CEPortInput.GroundDirection(transform, iosMoveStick);
                   ST1CEPortInput.Move(characterController, move * currentSpeed,
                       gravity, jumpHeight, ref velocity, ref jump);"""
@@ -563,7 +757,12 @@ jobs:
               if relative.startswith("Sandbox/"):
                   source = add_ios_body(source, "    void NormalMovement()", move, relative)
                   source = add_ios_body(source, "    void HandleCameraRotation()", look, relative)
-                  source = add_ios_body(source, "    void NoclipMovement()", """        float currentSpeed = run ? sprintSpeed : speed;
+                  source = add_ios_body(source, "    void NoclipMovement()", """        if (iosCrouch != null)
+                  {
+                      iosCrouch.Held = false;
+                      iosCrouch.Step();
+                  }
+                  float currentSpeed = run ? sprintSpeed : speed;
                   Vector2 input = ST1CEPortInput.Read(iosMoveStick);
                   Vector3 move = playerCamera.transform.TransformDirection(new Vector3(input.x, 0f, input.y));
                   if (jump)
