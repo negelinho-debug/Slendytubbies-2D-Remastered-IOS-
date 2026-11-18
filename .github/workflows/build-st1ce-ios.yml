@@ -1,0 +1,240 @@
+name: Build ST1 Community Edition iOS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: st1ce-ios
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 75
+    env:
+      UNITY_VERSION: '2021.3.41f1'
+      UNITY_REVISION: '6c5a9e20c022'
+      ST1CE_PROJECT: ${{ runner.temp }}/st1ce-source/Slendytubbies 1 Community Edition Updated
+      ST1CE_XCODE: ${{ runner.temp }}/st1ce-xcode
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Download and extract the original Unity project
+        run: |
+          set -euo pipefail
+          mkdir -p logs
+          page='https://gamejolt.com/games/St1cer/972452'
+          resolver='https://gamejolt.com/site-api/web/discover/games/builds/get-download-url/1829390'
+          archive="$RUNNER_TEMP/st1ce-source.rar"
+          curl --fail --silent --show-error --retry 4 --connect-timeout 25 \
+            -A 'Mozilla/5.0' -e "$page" -H 'Content-Type: application/json' \
+            -d '{"forceDownload":true}' "$resolver" -o "$RUNNER_TEMP/st1ce-download.json"
+          url="$(python3 - "$RUNNER_TEMP/st1ce-download.json" <<'PY'
+          import json
+          import sys
+          from urllib.parse import urlsplit
+          with open(sys.argv[1], encoding="utf-8") as source:
+              url = json.load(source)["payload"]["url"]
+          if urlsplit(url).scheme != "https":
+              raise SystemExit("Expected a secure Game Jolt download URL")
+          print(url)
+          PY
+          )"
+          curl --fail --location --silent --show-error --retry 4 --connect-timeout 25 \
+            --proto '=https' --proto-redir '=https' "$url" -o "$archive"
+          test "$(stat -f %z "$archive")" = 2520987739
+
+          if ! command -v 7zz >/dev/null && ! command -v 7z >/dev/null; then
+            brew install sevenzip
+          fi
+          unpack="$(command -v 7zz || command -v 7z)"
+          folder='Slendytubbies 1 Community Edition Updated'
+          "$unpack" x -y "-o$RUNNER_TEMP/st1ce-source" "$archive" \
+            "$folder/Assets/*" "$folder/Packages/*" "$folder/ProjectSettings/*" \
+            > logs/extraction.log 2>&1 || {
+              tail -n 80 logs/extraction.log
+              exit 1
+            }
+          rm "$archive" "$RUNNER_TEMP/st1ce-download.json"
+
+      - name: Verify the source project and prepare the iOS export
+        run: |
+          set -euo pipefail
+          python3 - "$ST1CE_PROJECT" "$UNITY_VERSION" <<'PY' | tee logs/project.log
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          project = Path(sys.argv[1])
+          version_file = project / "ProjectSettings/ProjectVersion.txt"
+          version = version_file.read_text(encoding="utf-8")
+          if f"m_EditorVersion: {sys.argv[2]}" not in version.splitlines():
+              raise SystemExit(f"Unexpected project version:\n{version}")
+          print(version, end="")
+
+          settings = (project / "ProjectSettings/EditorBuildSettings.asset").read_text(encoding="utf-8")
+          scenes = re.findall(r"(?m)^\s*- enabled: 1\n\s+path: (Assets/[^\r\n]+)", settings)
+          if not scenes or scenes[0] != "Assets/NewScenes/mainmeny.unity":
+              raise SystemExit("The original main menu is missing from the build settings")
+          for scene in scenes:
+              if not (project / scene).is_file():
+                  raise SystemExit(f"Missing enabled scene: {scene}")
+              print(scene)
+
+          manifest_path = project / "Packages/manifest.json"
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          toolchain = "com.unity.toolchain.win-x86_64-linux-x86_64"
+          if manifest["dependencies"].pop(toolchain, None):
+              manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+              print(f"Removed the Windows-hosted Linux toolchain from the staged iOS project: {toolchain}")
+
+          print("\nMobile input and native plugin candidates")
+          for asset in sorted((project / "Assets").rglob("*")):
+              if asset.suffix.lower() in {".cs", ".prefab", ".a", ".so", ".aar", ".bundle", ".framework"}:
+                  label = str(asset.relative_to(project))
+                  if re.search(r"mobile|android|ios|joystick|touch|controller|/plugins/", label, re.I):
+                      print(label)
+          PY
+
+          mkdir -p "$ST1CE_PROJECT/Assets/Editor"
+          cat > "$ST1CE_PROJECT/Assets/Editor/ST1CEIOSExport.cs" <<'CS'
+          using System;
+          using System.Linq;
+          using UnityEditor;
+          using UnityEditor.Build;
+          using UnityEditor.Build.Reporting;
+
+          public static class ST1CEIOSExport
+          {
+              public static void Run()
+              {
+                  var scenes = EditorBuildSettings.scenes.Where(scene => scene.enabled)
+                      .Select(scene => scene.path).ToArray();
+                  if (scenes.Length == 0 || scenes[0] != "Assets/NewScenes/mainmeny.unity")
+                      throw new InvalidOperationException("The original main menu must be the first scene.");
+
+                  PlayerSettings.SetApplicationIdentifier(NamedBuildTarget.iOS, "com.fanport.st1ceremaster");
+                  PlayerSettings.SetScriptingBackend(NamedBuildTarget.iOS, ScriptingImplementation.IL2CPP);
+                  PlayerSettings.iOS.sdkVersion = iOSSdkVersion.DeviceSDK;
+                  PlayerSettings.iOS.targetOSVersionString = "15.0";
+
+                  string output = Environment.GetEnvironmentVariable("ST1CE_XCODE");
+                  if (string.IsNullOrWhiteSpace(output))
+                      throw new InvalidOperationException("ST1CE_XCODE is missing.");
+
+                  var result = BuildPipeline.BuildPlayer(new BuildPlayerOptions
+                  {
+                      scenes = scenes,
+                      locationPathName = output,
+                      target = BuildTarget.iOS,
+                      options = BuildOptions.None
+                  });
+
+                  if (result.summary.result != BuildResult.Succeeded)
+                      throw new InvalidOperationException("Unity export failed: " + result.summary.result);
+              }
+          }
+          CS
+
+      - name: Set up the Unity license CLI
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install Unity and iOS Build Support
+        run: |
+          set -euo pipefail
+          base="https://download.unity3d.com/download_unity/$UNITY_REVISION"
+          curl -fLSs --retry 3 --connect-timeout 30 \
+            "$base/MacEditorInstaller/Unity-$UNITY_VERSION.pkg" -o "$RUNNER_TEMP/st1ce-editor.pkg"
+          sudo installer -pkg "$RUNNER_TEMP/st1ce-editor.pkg" -target /
+          rm "$RUNNER_TEMP/st1ce-editor.pkg"
+          curl -fLSs --retry 3 --connect-timeout 30 \
+            "$base/MacEditorTargetInstaller/UnitySetup-iOS-Support-for-Editor-$UNITY_VERSION.pkg" \
+            -o "$RUNNER_TEMP/st1ce-ios.pkg"
+          sudo installer -pkg "$RUNNER_TEMP/st1ce-ios.pkg" -target /
+          rm "$RUNNER_TEMP/st1ce-ios.pkg"
+
+          unity="/Applications/Unity/Unity.app/Contents/MacOS/Unity"
+          if [[ ! -x "$unity" ]]; then
+            unity="/Applications/Unity/Hub/Editor/$UNITY_VERSION/Unity.app/Contents/MacOS/Unity"
+          fi
+          test -x "$unity"
+          printf 'UNITY_EDITOR_PATH=%s\n' "$unity" >> "$GITHUB_ENV"
+
+          xcode='/Applications/Xcode_16.4.app/Contents/Developer'
+          if [[ -d "$xcode" ]]; then
+            printf 'DEVELOPER_DIR=%s\n' "$xcode" >> "$GITHUB_ENV"
+          fi
+          df -h "$RUNNER_TEMP"
+
+      - name: Activate Unity Personal
+        id: activate
+        env:
+          UNITY_USERNAME: ${{ secrets.UNITY_USERNAME }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$UNITY_USERNAME" || -z "$UNITY_PASSWORD" ]]; then
+            echo "::error::Set UNITY_USERNAME and UNITY_PASSWORD in Actions secrets."
+            exit 1
+          fi
+          npm install --global @rage-against-the-pixel/unity-cli@4.2.2
+          unity-cli activate-license --license personal
+
+      - name: Export all original enabled scenes from Unity
+        run: |
+          set -euo pipefail
+          "$UNITY_EDITOR_PATH" -batchmode -nographics -quit -projectPath "$ST1CE_PROJECT" \
+            -buildTarget iOS -executeMethod ST1CEIOSExport.Run -logFile "$PWD/logs/unity.log" || {
+              tail -n 100 logs/unity.log || true
+              exit 1
+            }
+          test -d "$ST1CE_XCODE/Unity-iPhone.xcodeproj"
+
+      - name: Compile and package the unsigned arm64 IPA
+        run: |
+          set -euo pipefail
+          derived="$RUNNER_TEMP/st1ce-derived"
+          package="$RUNNER_TEMP/st1ce-package"
+          mkdir -p dist "$package/Payload"
+          xcodebuild -version | tee logs/xcode-version.log
+          xcodebuild -project "$ST1CE_XCODE/Unity-iPhone.xcodeproj" \
+            -scheme Unity-iPhone -configuration Release -sdk iphoneos \
+            -destination 'generic/platform=iOS' -derivedDataPath "$derived" \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            2>&1 | tee logs/xcode.log
+
+          shopt -s nullglob
+          apps=("$derived/Build/Products/Release-iphoneos/"*.app)
+          [[ "${#apps[@]}" -eq 1 ]]
+          app="${apps[0]}"
+          executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Info.plist")"
+          xcrun lipo "$app/$executable" -verify_arch arm64
+          ditto "$app" "$package/Payload/ST1CERemaster.app"
+          ditto -c -k --keepParent "$package/Payload" "$PWD/dist/ST1-CE-Remaster.ipa"
+          unzip -tq dist/ST1-CE-Remaster.ipa
+
+      - name: Upload the IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ST1-CE-Remaster-iOS
+          path: dist/ST1-CE-Remaster.ipa
+          if-no-files-found: error
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ST1-CE-Build-Logs
+          path: logs
+          if-no-files-found: ignore
+
+      - name: Return the Unity license
+        if: always() && steps.activate.outcome == 'success'
+        run: unity-cli return-license --license personal
