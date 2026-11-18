@@ -157,6 +157,426 @@ jobs:
           }
           CS
 
+      - name: Prepare iPhone controls and menu translations
+        run: |
+          set -euo pipefail
+          noto=https://raw.githubusercontent.com/notofonts/noto-fonts/main
+          font="$ST1CE_PROJECT/Assets/ST1CEPortNoto.ttf"
+          curl -fLSs --retry 3 --connect-timeout 25 "$noto/hinted/ttf/NotoSans/NotoSans-Regular.ttf" -o "$font"
+          test "$(git hash-object "$font")" = d55220958aa51eeeb85048d746eabe43d2cd9f14
+          curl -fLSs --retry 3 --connect-timeout 25 "$noto/LICENSE" -o logs/Noto-OFL.txt
+
+          cat > "$ST1CE_PROJECT/Assets/LanguageManager.cs" <<'CS'
+          using System.Collections.Generic;
+          using UnityEngine;
+          using UnityEngine.UI;
+
+          public class LanguageManager : MonoBehaviour
+          {
+              public enum Idioma { Portugues, Ingles, Espanhol, Japones, Chines, Russo, Ucraniano }
+              public Idioma idiomaAtual = Idioma.Portugues;
+
+              [System.Serializable]
+              public class TextoIdioma
+              {
+                  public Text textoUI;
+
+                  [TextArea] public string textoPortugues;
+                  [TextArea] public string textoIngles;
+                  [TextArea] public string textoEspanhol;
+                  [TextArea] public string textoJapones;
+                  [TextArea] public string textoChines;
+                  [TextArea] public string textoRusso;
+                  [TextArea] public string textoUcraniano;
+
+                  public string GetText(Idioma idioma)
+                  {
+                      switch (idioma)
+                      {
+                          case Idioma.Portugues: return textoPortugues;
+                          case Idioma.Espanhol: return textoEspanhol;
+                          case Idioma.Japones: return textoJapones;
+                          case Idioma.Chines: return textoChines;
+                          case Idioma.Russo: return string.IsNullOrEmpty(textoRusso) ? textoIngles : textoRusso;
+                          case Idioma.Ucraniano: return string.IsNullOrEmpty(textoUcraniano) ? textoIngles : textoUcraniano;
+                          default: return textoIngles;
+                      }
+                  }
+              }
+
+              public TextoIdioma[] textos;
+              public Button botaoPortugues;
+              public Button botaoIngles;
+              public Button botaoEspanhol;
+              public Button botaoJapones;
+              public Button botaoChines;
+              public Button botaoRusso;
+              public Button botaoUcraniano;
+              public Font portFont;
+
+              private const string Preference = "st1ce.language";
+              private readonly Dictionary<Text, Font> originalFonts = new Dictionary<Text, Font>();
+
+              public static Idioma SavedLanguage(Idioma fallback = Idioma.Ingles)
+              {
+                  return (Idioma)Mathf.Clamp(PlayerPrefs.GetInt(Preference, (int)fallback), 0, (int)Idioma.Ucraniano);
+              }
+
+              void Start()
+              {
+                  foreach (var item in textos)
+                      if (item.textoUI != null)
+                          originalFonts[item.textoUI] = item.textoUI.font;
+
+                  Bind(botaoPortugues, Idioma.Portugues);
+                  Bind(botaoIngles, Idioma.Ingles);
+                  Bind(botaoEspanhol, Idioma.Espanhol);
+                  Bind(botaoJapones, Idioma.Japones);
+                  Bind(botaoChines, Idioma.Chines);
+                  Bind(botaoRusso, Idioma.Russo);
+                  Bind(botaoUcraniano, Idioma.Ucraniano);
+                  idiomaAtual = SavedLanguage(idiomaAtual);
+                  AtualizarTextos();
+              }
+
+              private void Bind(Button button, Idioma idioma)
+              {
+                  if (button != null)
+                      button.onClick.AddListener(() => TrocarIdioma(idioma));
+              }
+
+              public void TrocarIdioma(Idioma novoIdioma)
+              {
+                  idiomaAtual = novoIdioma;
+                  PlayerPrefs.SetInt(Preference, (int)novoIdioma);
+                  PlayerPrefs.Save();
+                  AtualizarTextos();
+              }
+
+              void AtualizarTextos()
+              {
+                  bool cyrillic = idiomaAtual == Idioma.Russo || idiomaAtual == Idioma.Ucraniano;
+                  foreach (var item in textos)
+                  {
+                      Text label = item.textoUI;
+                      if (label == null)
+                          continue;
+                      if (cyrillic && portFont != null)
+                          label.font = portFont;
+                      else if (originalFonts.TryGetValue(label, out Font original))
+                          label.font = original;
+                      label.text = item.GetText(idiomaAtual);
+                  }
+              }
+          }
+          CS
+
+          cat > "$ST1CE_PROJECT/Assets/ST1CEPortLabel.cs" <<'CS'
+          using UnityEngine;
+          using UnityEngine.UI;
+
+          public sealed class ST1CEPortLabel : MonoBehaviour
+          {
+              public Text label;
+              public Font cyrillicFont;
+              public string russian;
+              public string ukrainian;
+
+              private void Start()
+              {
+                  var language = LanguageManager.SavedLanguage();
+                  if (language != LanguageManager.Idioma.Russo && language != LanguageManager.Idioma.Ucraniano)
+                      return;
+
+                  label.font = cyrillicFont;
+                  label.resizeTextForBestFit = true;
+                  label.resizeTextMinSize = Mathf.Min(10, label.fontSize);
+                  label.resizeTextMaxSize = Mathf.Max(label.fontSize, label.resizeTextMinSize);
+                  label.text = language == LanguageManager.Idioma.Russo ? russian : ukrainian;
+              }
+          }
+          CS
+
+          cat > "$ST1CE_PROJECT/Assets/ST1CEPortInput.cs" <<'CS'
+          #if UNITY_IOS
+          using UnityEngine;
+
+          internal static class ST1CEPortInput
+          {
+              internal static Joystick FindStick(Transform handle)
+              {
+                  return handle == null ? null : handle.GetComponentInParent<Joystick>();
+              }
+
+              internal static Vector2 Read(Joystick stick)
+              {
+                  return stick == null ? Vector2.zero : Vector2.ClampMagnitude(stick.Direction, 1f);
+              }
+
+              internal static Vector3 GroundDirection(Transform player, Joystick stick)
+              {
+                  Vector2 input = Read(stick);
+                  return player.right * input.x + player.forward * input.y;
+              }
+
+              internal static void Move(CharacterController controller, Vector3 horizontalVelocity,
+                  float gravity, float jumpHeight, ref Vector3 velocity, ref bool jump)
+              {
+                  if (controller.isGrounded)
+                      velocity.y = jump ? Mathf.Sqrt(2f * jumpHeight * gravity) : -1f;
+                  else
+                      velocity.y -= gravity * Time.deltaTime;
+
+                  jump = false;
+                  controller.Move((horizontalVelocity + Vector3.up * velocity.y) * Time.deltaTime);
+              }
+
+              internal static void Look(Transform player, Camera camera, Joystick stick, ref float pitch)
+              {
+                  if (camera == null || stick == null)
+                      return;
+
+                  Vector2 input = Read(stick);
+                  float sensitivity = Mathf.Clamp(PlayerPrefs.GetFloat("CameraSensitivity", 2f), 0.25f, 8f);
+                  float step = Time.deltaTime * 65f * sensitivity;
+                  player.Rotate(0f, input.x * step, 0f);
+                  pitch = Mathf.Clamp(pitch - input.y * step, -85f, 85f);
+                  camera.transform.localRotation = Quaternion.Euler(pitch, 0f, 0f);
+              }
+          }
+          #endif
+          CS
+
+          cat > "$ST1CE_PROJECT/Assets/Editor/ST1CEPortScenes.cs" <<'CS'
+          using System.Collections.Generic;
+          using System.Linq;
+          using UnityEditor;
+          using UnityEditor.Build;
+          using UnityEditor.Build.Reporting;
+          using UnityEngine;
+          using UnityEngine.SceneManagement;
+          using UnityEngine.UI;
+
+          public sealed class ST1CEPortScenes : IProcessSceneWithReport
+          {
+              public int callbackOrder => 0;
+
+              private const string FontPath = "Assets/ST1CEPortNoto.ttf";
+              private const string MenuPath = "Assets/NewScenes/mainmeny.unity";
+              private const string EnglishHelp = "Left joystick: move.\nRight joystick: look.\nUse Jump, Run and Flashlight.\nEsc: return to the main menu.\nIn Sandbox, use the Sandbox button for sandbox options.";
+
+              private static readonly Dictionary<string, (string russian, string ukrainian)> Translations =
+                  new Dictionary<string, (string, string)>
+                  {
+                      { "SinglePlayer", ("Одиночная игра", "Одиночна гра") },
+                      { "Credits", ("Авторы", "Автори") },
+                      { "Settings", ("Настройки", "Налаштування") },
+                      { "Multiplayer", ("Сетевая игра", "Мережева гра") },
+                      { "Controls", ("Управление", "Керування") },
+                      { "Language (Menu)", ("Язык меню", "Мова меню") },
+                      { "Volume:", ("Громкость:", "Гучність:") },
+                      { "Screen:", ("Экран:", "Екран:") },
+                      { "graphics:", ("Графика:", "Графіка:") },
+                      { "Disable Shadows:", ("Отключить тени:", "Вимкнути тіні:") },
+                      { "Back", ("Назад", "Назад") },
+                      { "Field of View:", ("Поле зрения:", "Поле зору:") },
+                      { "RoomName:", ("Название комнаты:", "Назва кімнати:") },
+                      { "Skins:", ("Облики:", "Образи:") },
+                      { "Jump", ("Прыжок", "Стрибок") },
+                      { "Run", ("Бег", "Біг") },
+                      { "Flashlight", ("Фонарь", "Ліхтар") },
+                      { "Esc", ("В меню", "У меню") },
+                      { "Chat", ("Чат", "Чат") },
+                      { "Name", ("Имя", "Ім’я") },
+                      { "Send", ("Отправить", "Надіслати") },
+                      { "Enter text...", ("Введи текст…", "Введи текст…") },
+                      { "Create as a Player", ("Создать за игрока", "Створити за гравця") },
+                      { "Create as a Enemy", ("Создать за монстра", "Створити за монстра") },
+                      { "Connect as a Player", ("Войти за игрока", "Увійти за гравця") },
+                      { "Connect as a Enemy", ("Войти за монстра", "Увійти за монстра") },
+                      { "Sandbox", ("Песочница", "Пісочниця") },
+                      { "Close", ("Закрыть", "Закрити") },
+                      { "Maps", ("Карты", "Мапи") },
+                      { "Enemies", ("Монстры", "Монстри") },
+                      { "Light/Effects", ("Свет и эффекты", "Світло й ефекти") },
+                  };
+
+              public void OnProcessScene(Scene scene, BuildReport report)
+              {
+                  if (report == null || report.summary.platform != BuildTarget.iOS)
+                      return;
+
+                  var roots = scene.GetRootGameObjects();
+                  Font font = AssetDatabase.LoadAssetAtPath<Font>(FontPath);
+                  if (font == null)
+                      throw new BuildFailedException("ST1CE Cyrillic font did not import: " + FontPath);
+
+                  if (scene.path == MenuPath)
+                  {
+                      var manager = roots.SelectMany(root => root.GetComponentsInChildren<LanguageManager>(true)).Single();
+                      AddLanguages(manager, font);
+                      return;
+                  }
+
+                  var rooms = roots.SelectMany(root => root.GetComponentsInChildren<Room>(true)).ToArray();
+                  var mobile = rooms.FirstOrDefault(room => room.gameObject.name == "NetworkManagerMobile");
+                  var desktop = rooms.FirstOrDefault(room => room.gameObject.name == "NetworkManager");
+                  if (mobile == null)
+                  {
+                      if (desktop != null && scene.path.StartsWith("Assets/NewScenes/"))
+                          throw new BuildFailedException("Original mobile setup is missing in " + scene.path);
+                      return;
+                  }
+                  if (desktop == null || mobile.objectsToDisable == null || desktop.objectsToDisable == null)
+                      throw new BuildFailedException("Incomplete mobile and desktop setup in " + scene.path);
+
+                  var mobileObjects = mobile.objectsToDisable.Where(item => item != null).ToArray();
+                  var mobilePlayer = mobileObjects.FirstOrDefault(item => item.name == "Player Mobile");
+                  if (mobilePlayer == null || !mobileObjects.Any(item => item.GetComponent<Canvas>() != null))
+                      throw new BuildFailedException("Original Player Mobile or joystick canvas is missing in " + scene.path);
+
+                  foreach (var item in desktop.objectsToDisable)
+                      if (item != null && !mobileObjects.Contains(item))
+                          item.SetActive(false);
+
+                  desktop.gameObject.SetActive(false);
+                  mobile.gameObject.SetActive(true);
+                  foreach (var item in mobileObjects)
+                      item.SetActive(true);
+
+                  foreach (var obj in mobileObjects.Where(item => item.GetComponent<Canvas>() != null).Append(mobile.gameObject))
+                  {
+                      foreach (Text label in obj.GetComponentsInChildren<Text>(true))
+                      {
+                          if (!Translations.TryGetValue(label.text.Trim(), out var translations))
+                              continue;
+                          var localized = label.gameObject.AddComponent<ST1CEPortLabel>();
+                          localized.label = label;
+                          localized.cyrillicFont = font;
+                          localized.russian = translations.russian;
+                          localized.ukrainian = translations.ukrainian;
+                      }
+                  }
+                  Debug.Log("[ST1CE] Enabled the original mobile player, UI and room setup in " + scene.name);
+              }
+
+              private static void AddLanguages(LanguageManager manager, Font font)
+              {
+                  manager.portFont = font;
+                  manager.botaoRusso = MakeLanguageButton(manager, font, "Русский", 28f);
+                  manager.botaoUcraniano = MakeLanguageButton(manager, font, "Українська", 56f);
+                  foreach (var row in manager.textos)
+                  {
+                      string key = row.textoIngles.Trim();
+                      if (key.StartsWith("Walk:"))
+                      {
+                          row.textoIngles = EnglishHelp;
+                          row.textoRusso = "Левый джойстик: движение.\nПравый джойстик: обзор.\nКнопки: прыжок, бег и фонарь.\n«В меню»: вернуться в главное меню.\nКнопка «Песочница» открывает её настройки.";
+                          row.textoUcraniano = "Лівий джойстик: рух.\nПравий джойстик: огляд.\nКнопки: стрибок, біг і ліхтар.\n«У меню»: повернутися до головного меню.\nКнопка «Пісочниця» відкриває її налаштування.";
+                      }
+                      else if (key.StartsWith("Original Game:"))
+                      {
+                          row.textoRusso = row.textoIngles.Replace("Original Game:", "Оригинальная игра:")
+                              .Replace("Fan game:", "Фанатская игра:").Replace("Special Thanks:", "Благодарности:")
+                              .Replace("Beta test:", "Бета-тест:").Replace("New Ester Egg:", "Новая пасхалка:");
+                          row.textoUcraniano = row.textoIngles.Replace("Original Game:", "Оригінальна гра:")
+                              .Replace("Fan game:", "Фанатська гра:").Replace("Special Thanks:", "Подяки:")
+                              .Replace("Beta test:", "Бета-тест:").Replace("New Ester Egg:", "Нова великодка:");
+                      }
+                      else if (Translations.TryGetValue(key, out var translations))
+                      {
+                          row.textoRusso = translations.russian;
+                          row.textoUcraniano = translations.ukrainian;
+                      }
+                  }
+                  Debug.Log("[ST1CE] Added Russian and Ukrainian to the original language menu.");
+              }
+
+              private static Button MakeLanguageButton(LanguageManager manager, Font font, string caption, float offset)
+              {
+                  Button template = manager.botaoIngles;
+                  var button = Object.Instantiate(template, template.transform.parent);
+                  button.name = caption;
+                  button.onClick = new Button.ButtonClickedEvent();
+
+                  var rect = (RectTransform)button.transform;
+                  var last = (RectTransform)manager.botaoChines.transform;
+                  rect.anchoredPosition = last.anchoredPosition - new Vector2(0f, offset);
+                  var label = button.GetComponent<Text>();
+                  label.font = font;
+                  label.text = caption;
+                  return button;
+              }
+          }
+          CS
+
+          python3 - "$ST1CE_PROJECT" <<'PY'
+          from pathlib import Path
+          import sys
+
+          project_root = Path(sys.argv[1])
+          assets = project_root / "Assets"
+
+          fields = """#if UNITY_IOS
+              private Joystick iosMoveStick;
+              private Joystick iosLookStick;
+          #endif
+
+          """
+          init = """#if UNITY_IOS
+                  iosMoveStick = ST1CEPortInput.FindStick(uiMover);
+                  iosLookStick = ST1CEPortInput.FindStick(uiMoverCamera);
+                  if (playerCamera != null)
+                      rotationX = Mathf.DeltaAngle(0f, playerCamera.transform.localEulerAngles.x);
+          #endif
+          """
+
+          def change_once(source, old, new, filename):
+              if source.count(old) != 1:
+                  raise SystemExit(f"{filename}: expected one occurrence of {old!r}")
+              return source.replace(old, new, 1)
+
+          def add_ios_body(source, signature, ios_body, filename):
+              start = source.find(signature + "\n    {\n")
+              if start < 0:
+                  raise SystemExit(f"{filename}: cannot locate {signature}")
+              begin = start + len(signature + "\n    {\n")
+              end = source.find("\n    }", begin)
+              if end < 0:
+                  raise SystemExit(f"{filename}: cannot locate end of {signature}")
+              return source[:begin] + "#if UNITY_IOS\n" + ios_body.rstrip() + "\n#else\n" + source[begin:end] + "\n#endif" + source[end:]
+
+          for relative in ("PlayerControllerMobile.cs", "EnemyControllerMobile.cs", "Sandbox/PlayerSandboxMobile.cs"):
+              path = assets / relative
+              source = path.read_text(encoding="utf-8-sig", errors="surrogateescape")
+              source = change_once(source, "    void Start()\n", fields + "    void Start()\n", relative)
+              source = change_once(source, "        characterController = GetComponent<CharacterController>();\n",
+                  "        characterController = GetComponent<CharacterController>();\n" + init, relative)
+
+              move = """        float currentSpeed = run ? sprintSpeed : speed;
+                  Vector3 move = ST1CEPortInput.GroundDirection(transform, iosMoveStick);
+                  ST1CEPortInput.Move(characterController, move * currentSpeed,
+                      gravity, jumpHeight, ref velocity, ref jump);"""
+
+              look = """        ST1CEPortInput.Look(transform, playerCamera, iosLookStick, ref rotationX);"""
+
+              if relative.startswith("Sandbox/"):
+                  source = add_ios_body(source, "    void NormalMovement()", move, relative)
+                  source = add_ios_body(source, "    void HandleCameraRotation()", look, relative)
+                  source = add_ios_body(source, "    void NoclipMovement()", """        float currentSpeed = run ? sprintSpeed : speed;
+                  Vector2 input = ST1CEPortInput.Read(iosMoveStick);
+                  Vector3 move = playerCamera.transform.TransformDirection(new Vector3(input.x, 0f, input.y));
+                  if (jump)
+                      move.y += 1f;
+                  jump = false;
+                  transform.position += Vector3.ClampMagnitude(move, 1f) * currentSpeed * Time.deltaTime;""", relative)
+              else:
+                  source = add_ios_body(source, "    void Update()", move + "\n" + look, relative)
+
+              path.write_text(source, encoding="utf-8", errors="surrogateescape")
+              print("Connected iOS joystick input:", relative)
+          PY
+
       - name: Set up the Unity license CLI
         uses: actions/setup-node@v4
         with:
@@ -208,14 +628,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p logs
-          echo "Starting Unity iOS export. Unity output is recorded in logs/unity.log."
           "$UNITY_EDITOR_PATH" -batchmode -nographics -quit -projectPath "$ST1CE_PROJECT" \
             -buildTarget iOS -executeMethod ST1CEIOSExport.Run -logFile - \
             2>&1 | tee logs/unity.log
-          if [[ ! -d "$ST1CE_XCODE/Unity-iPhone.xcodeproj" ]]; then
-            echo "::error::Unity exited successfully but did not create Unity-iPhone.xcodeproj."
-            exit 1
-          fi
+          test -d "$ST1CE_XCODE/Unity-iPhone.xcodeproj"
 
       - name: Compile and package the unsigned arm64 IPA
         run: |
@@ -237,6 +653,7 @@ jobs:
           executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Info.plist")"
           xcrun lipo "$app/$executable" -verify_arch arm64
           ditto "$app" "$package/Payload/ST1CERemaster.app"
+          cp logs/Noto-OFL.txt "$package/Payload/ST1CERemaster.app/Noto-OFL.txt"
           ditto -c -k --keepParent "$package/Payload" "$PWD/dist/ST1-CE-Remaster.ipa"
           unzip -tq dist/ST1-CE-Remaster.ipa
 
