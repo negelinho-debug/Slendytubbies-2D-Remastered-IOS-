@@ -13,7 +13,7 @@ concurrency:
 jobs:
   build:
     runs-on: macos-15-intel
-    timeout-minutes: 75
+    timeout-minutes: 160
     env:
       UNITY_VERSION: '2021.3.41f1'
       UNITY_REVISION: '6c5a9e20c022'
@@ -141,6 +141,7 @@ jobs:
                   if (string.IsNullOrWhiteSpace(output))
                       throw new InvalidOperationException("ST1CE_XCODE is missing.");
 
+                  UnityEngine.Debug.Log("[ST1CE] Starting iOS build for " + scenes.Length + " enabled scenes.");
                   var result = BuildPipeline.BuildPlayer(new BuildPlayerOptions
                   {
                       scenes = scenes,
@@ -151,6 +152,7 @@ jobs:
 
                   if (result.summary.result != BuildResult.Succeeded)
                       throw new InvalidOperationException("Unity export failed: " + result.summary.result);
+                  UnityEngine.Debug.Log("[ST1CE] Xcode project exported successfully.");
               }
           }
           CS
@@ -202,14 +204,18 @@ jobs:
           unity-cli activate-license --license personal
 
       - name: Export all original enabled scenes from Unity
+        timeout-minutes: 105
         run: |
           set -euo pipefail
+          mkdir -p logs
+          echo "Starting Unity iOS export. Unity output is recorded in logs/unity.log."
           "$UNITY_EDITOR_PATH" -batchmode -nographics -quit -projectPath "$ST1CE_PROJECT" \
-            -buildTarget iOS -executeMethod ST1CEIOSExport.Run -logFile "$PWD/logs/unity.log" || {
-              tail -n 100 logs/unity.log || true
-              exit 1
-            }
-          test -d "$ST1CE_XCODE/Unity-iPhone.xcodeproj"
+            -buildTarget iOS -executeMethod ST1CEIOSExport.Run -logFile - \
+            2>&1 | tee logs/unity.log
+          if [[ ! -d "$ST1CE_XCODE/Unity-iPhone.xcodeproj" ]]; then
+            echo "::error::Unity exited successfully but did not create Unity-iPhone.xcodeproj."
+            exit 1
+          fi
 
       - name: Compile and package the unsigned arm64 IPA
         run: |
