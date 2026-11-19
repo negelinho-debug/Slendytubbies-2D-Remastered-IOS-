@@ -1,0 +1,236 @@
+name: DeadTubbies 2 — restore Level 1
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  restore:
+    runs-on: macos-15-intel
+    timeout-minutes: 65
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download the successful recovery
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run_id="$(gh run list --workflow dt2-recover.yml --status success \
+            --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+          test -n "$run_id"
+          gh run download "$run_id" --name DT2-recovery --dir recovered
+          tar -xzf recovered/DT2-recovered-unity.tar.gz
+          mkdir -p output
+
+      - name: Restore verified gameplay methods
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          scripts = Path("ExportedProject/Assets/Scripts/Assembly-CSharp")
+          report = Path("output/patch.txt")
+          report.parent.mkdir(exist_ok=True)
+
+          door_open = """if (!enabled || Door == null)
+              return;
+          Door.Play("YellowDoorOpen");
+          Destroy(DoorTrigger);
+          if (Door01_LockerMain != null)
+          {
+              Door01_LockerMain.Play("InteractiveNotBlinking");
+              Invoke(nameof(UseDisabled), UseDisabledTime);
+          }"""
+
+          door_finish = """var player = GameObject.FindGameObjectWithTag("Player");
+          if (player == null)
+              return;
+          var use = player.GetComponent<Use>();
+          if (use != null)
+          {
+              use.enabled = false;
+              Destroy(this);
+          }"""
+
+          loading_screen = """ChapterLoadingNew.BackGround = BackGround_Int;
+          ChapterLoadingNew.Level_Name = Load_Level;
+          UnityEngine.SceneManagement.SceneManager.LoadScene("LoadingChapterS");"""
+
+          def animate_npc(state):
+              return f'''if (Head != null)
+          {{
+              Head.Play("{state}");
+              Destroy(this);
+          }}'''
+
+          patches = {
+              "DoorUse": {
+                  "OnMouseDown": door_open,
+                  "UseDisabled": door_finish,
+              },
+              "LoadLevel": {"Start": "UnityEngine.SceneManagement.SceneManager.LoadScene(LevelName);"},
+              "LoadLevelNew": {"Update": loading_screen},
+              "ChapterLoadingNew": {
+                  "Start": "UnityEngine.SceneManagement.SceneManager.LoadScene(Level_Name);",
+              },
+              "EndLevel": {
+                  "OnTriggerStay": 'if (player != null && player.gameObject.tag == "Player")\n'
+                                   "    UnityEngine.SceneManagement.SceneManager.LoadScene(Level);",
+              },
+              "NPCSilentCut": {"Update": animate_npc("Silent")},
+              "NPCSpeakCut": {"Update": animate_npc("Speak")},
+              "EnergyDisable": {
+                  "Update": "if (EnergyDisabled != null)\n"
+                            "{\n"
+                            "    EnergyDisabled.enabled = true;\n"
+                            "    Destroy(this);\n"
+                            "}",
+              },
+          }
+
+          staged = {}
+          updated = []
+          for name, methods in patches.items():
+              path = scripts / f"{name}.cs"
+              text = path.read_text()
+              for method, implementation in methods.items():
+                  pattern = re.compile(rf"(\bprivate\s+void\s+{re.escape(method)}\([^()]*\)\s*\{{)\s*\}}")
+                  def replacement(match):
+                      body = "\n".join("\t\t" + line for line in implementation.splitlines())
+                      return match[1] + "\n" + body + "\n\t}"
+                  text, count = pattern.subn(replacement, text)
+                  if count != 1:
+                      raise SystemExit(f"{path}: expected exactly one empty {method} method")
+                  updated.append(f"{name}.{method}")
+              if name == "ChapterLoadingNew":
+                  old = "public static int BackGround;"
+                  if text.count(old) != 1:
+                      raise SystemExit("ChapterLoadingNew.BackGround declaration changed")
+                  text = text.replace(old, "public static int BackGround = 6;")
+              staged[path] = text
+
+          for path, text in staged.items():
+              path.write_text(text)
+          summary = [f"Restored {len(updated)} methods across {len(staged)} files.",
+                     *updated, "",
+                     "Open items: movement, enemy AI, loading-screen visuals and remaining triggers.",
+                     "Gameplay and iOS build are unverified."]
+          report.write_text("\n".join(summary) + "\n")
+          print(report.read_text(), end="")
+          PY
+          cat output/patch.txt >> "$GITHUB_STEP_SUMMARY"
+          tar -czf output/DT2-level1-patched.tar.gz ExportedProject
+
+      - name: Prepare the Unity check
+        shell: bash
+        run: |
+          mkdir -p ExportedProject/Assets/Editor
+          cat > ExportedProject/Assets/Editor/DT2Level1Audit.cs <<'CS'
+          using System;
+          using System.IO;
+          using System.Linq;
+          using UnityEditor;
+          using UnityEditor.SceneManagement;
+          using UnityEngine;
+
+          public static class DT2Level1Audit
+          {
+              public static void Run()
+              {
+                  var entry = EditorBuildSettings.scenes.Single(item =>
+                      item.enabled && item.path.EndsWith("/Level_1.unity", StringComparison.Ordinal));
+                  var scene = EditorSceneManager.OpenScene(entry.path, OpenSceneMode.Single);
+                  int missing = 0;
+                  foreach (var root in scene.GetRootGameObjects())
+                  {
+                      missing += root.GetComponentsInChildren<Component>(true)
+                          .Count(component => component == null);
+                  }
+
+                  var output = Path.GetFullPath(Path.Combine(Application.dataPath, "../../output"));
+                  Directory.CreateDirectory(output);
+                  File.WriteAllText(Path.Combine(output, "unity-level1.txt"),
+                      "Opened: " + scene.path + "\nMissing component scripts: " + missing
+                      + "\nPlay Mode was not run.\n");
+              }
+          }
+          CS
+
+      - name: Check Unity account secrets
+        shell: bash
+        env:
+          UNITY_USERNAME: ${{ secrets.UNITY_USERNAME || secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        run: |
+          if [ -z "$UNITY_USERNAME" ] || [ -z "$UNITY_PASSWORD" ]; then
+            echo "::error::Set UNITY_USERNAME (or UNITY_EMAIL) and UNITY_PASSWORD in Actions secrets."
+            exit 1
+          fi
+
+      - name: Set up Node for Unity CLI
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install Unity 2019.4.40f1
+        shell: bash
+        timeout-minutes: 20
+        run: |
+          pkg="$RUNNER_TEMP/dt2-unity.pkg"
+          curl -fLsS --retry 3 --connect-timeout 30 --max-time 720 \
+            https://download.unity3d.com/download_unity/ffc62b691db5/MacEditorInstaller/Unity-2019.4.40f1.pkg \
+            -o "$pkg"
+          sudo installer -pkg "$pkg" -target /
+          rm -f "$pkg"
+
+          editor="/Applications/Unity/Unity.app/Contents/MacOS/Unity"
+          if [ ! -x "$editor" ]; then
+            editor="/Applications/Unity/Hub/Editor/2019.4.40f1/Unity.app/Contents/MacOS/Unity"
+          fi
+          test -x "$editor"
+          printf 'UNITY_EDITOR_PATH=%s\n' "$editor" >> "$GITHUB_ENV"
+
+      - name: Activate Unity Personal
+        id: activate
+        shell: bash
+        timeout-minutes: 10
+        env:
+          UNITY_USERNAME: ${{ secrets.UNITY_USERNAME || secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        run: |
+          npm install --global @rage-against-the-pixel/unity-cli@4.2.2
+          unity-cli activate-license --license personal
+
+      - name: Compile scripts and open Level 1 in Unity
+        shell: bash
+        timeout-minutes: 20
+        run: |
+          "$UNITY_EDITOR_PATH" -batchmode -nographics -quit \
+            -projectPath "$PWD/ExportedProject" \
+            -executeMethod DT2Level1Audit.Run -logFile - \
+            2>&1 | tee output/unity-editor.log
+          test -s output/unity-level1.txt
+          cat output/unity-level1.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Return the Unity license
+        if: always() && steps.activate.outcome == 'success'
+        shell: bash
+        timeout-minutes: 5
+        run: unity-cli return-license --license personal --when auto
+
+      - name: Upload the patched project and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DT2-level1-patched
+          path: output/
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 5
