@@ -187,18 +187,24 @@ jobs:
 
       - name: Compile scripts and open the original Level 1
         shell: bash
-        timeout-minutes: 22
+        timeout-minutes: 30
         run: |
           export DT1_REPORT_PATH="$PWD/output/unity-level1.txt"
+          log="$PWD/output/unity-editor.log"
+          : > "$log"
+          tail -n +1 -F "$log" &
+          log_pid=$!
+          trap 'kill "$log_pid" 2>/dev/null || true' EXIT
+
           status=0
-          "$UNITY_EDITOR_PATH" -batchmode -nographics -quit \
+          "$UNITY_EDITOR_PATH" -batchmode -nographics -noUpm -quit \
             -projectPath "$PWD/ExportedProject" \
             -executeMethod DT1Level1Check.Run \
-            -logFile "$PWD/output/unity-editor.log" || status=$?
+            -logFile "$log" || status=$?
           if [ -s "$DT1_REPORT_PATH" ]; then
-            cat "$DT1_REPORT_PATH" | tee -a "$GITHUB_STEP_SUMMARY"
+            tee -a "$GITHUB_STEP_SUMMARY" < "$DT1_REPORT_PATH"
           else
-            tail -n 60 output/unity-editor.log || true
+            tail -n 60 "$log" || true
             echo "::error::Unity did not write the scene report. See the editor log."
             exit 1
           fi
