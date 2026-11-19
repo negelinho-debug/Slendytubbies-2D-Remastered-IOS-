@@ -17,15 +17,26 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p recovered output
-          run_id="$(gh run list --repo "$GITHUB_REPOSITORY" \
-            --workflow dt1-recover.yml --status success --limit 1 \
-            --json databaseId --jq '.[0].databaseId // empty')"
+          run_id="$(gh api --paginate --method GET "repos/$GITHUB_REPOSITORY/actions/artifacts" \
+            -f name=DT1-recovery -F per_page=100 \
+            | jq -sr '
+              [.[].artifacts[] | select(.name == "DT1-recovery"
+                and .expired == false and .workflow_run.id != null)]
+              | sort_by(.created_at, .id)
+              | last
+              | .workflow_run.id // empty
+            ')"
           if [ -z "$run_id" ]; then
-            echo "::error::Run dt1-recover.yml successfully first."
+            echo "::error::No active DT1-recovery artifact in $GITHUB_REPOSITORY. Run the recovery workflow in this repository."
             exit 1
           fi
+          echo "Using DT1-recovery from Actions run $run_id"
           gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
             --name DT1-recovery --dir recovered
+          if [ ! -s recovered/DT1-recovered-unity.tar.gz ]; then
+            echo "::error::The DT1-recovery artifact is missing DT1-recovered-unity.tar.gz."
+            exit 1
+          fi
           tar -xzf recovered/DT1-recovered-unity.tar.gz
           test -s ExportedProject/Assets/GAME_FILES/LevelS/SinglLevelS/Level_1.unity
 
