@@ -134,11 +134,24 @@ jobs:
           test -s output/rosetta-draft/Assembly-CSharp/DoorUse.cs
           test -s output/rosetta-draft/Assembly-CSharp/UniversalEnemyAI.cs
 
+      - name: Pack the recovered code
+        if: always()
+        shell: bash
+        run: |
+          if [ -d output/rosetta-draft ]; then
+            tar -czf output/.DT2-rosetta-draft.tmp -C output rosetta-draft
+            mv output/.DT2-rosetta-draft.tmp output/DT2-rosetta-draft.tar.gz
+          fi
+
       - name: Save report and recovery files
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: DT2-recovery
-          path: output/
+          path: |
+            output/*.tar.gz
+            output/*.txt
+            output/*.log
           if-no-files-found: warn
           retention-days: 5
+          compression-level: 0
