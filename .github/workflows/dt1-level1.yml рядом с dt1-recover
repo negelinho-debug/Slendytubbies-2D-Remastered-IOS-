@@ -1,0 +1,209 @@
+name: DeadTubbies 1 — check Level 1
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+
+jobs:
+  editor-check:
+    runs-on: macos-15-intel
+    timeout-minutes: 55
+    steps:
+      - name: Download DT1-recovery
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p recovered output
+          run_id="$(gh run list --repo "$GITHUB_REPOSITORY" \
+            --workflow dt1-recover.yml --status success --limit 1 \
+            --json databaseId --jq '.[0].databaseId // empty')"
+          if [ -z "$run_id" ]; then
+            echo "::error::Run dt1-recover.yml successfully first."
+            exit 1
+          fi
+          gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
+            --name DT1-recovery --dir recovered
+          tar -xzf recovered/DT1-recovered-unity.tar.gz
+          test -s ExportedProject/Assets/GAME_FILES/LevelS/SinglLevelS/Level_1.unity
+
+      - name: Apply the C# fixes
+        shell: bash
+        run: |
+          python3 - ExportedProject <<'PY' | tee output/patch.txt
+          import re
+          import sys
+          from pathlib import Path
+
+          assets = Path(sys.argv[1]) / "Assets"
+          scripts = assets / "Scripts"
+          plugins = assets / "Plugins"
+          story = scripts / "Assembly-UnityScript"
+          stub = story / "EndingChoiceThree(Four).cs"
+          source = story / "EndingChoiceThree-Four-.cs"
+          target = story / "EndingChoiceThree_0028Four_0029.cs"
+          stub_meta = stub.with_suffix(".cs.meta")
+          target_meta = target.with_suffix(".cs.meta")
+
+          if "Dummy class." not in stub.read_text(encoding="utf-8"):
+              raise SystemExit("Expected AssetRipper's ending placeholder")
+          if "class EndingChoiceThree_0028Four_0029 : MonoBehaviour" not in source.read_text(encoding="utf-8"):
+              raise SystemExit("Expected the decompiled ending implementation")
+          if target.exists() or target_meta.exists() or source.with_suffix(".cs.meta").exists():
+              raise SystemExit("Ending script paths differ from the audited export")
+          source.rename(target)
+          stub_meta.rename(target_meta)
+          stub.unlink()
+          print("Restored the ending script with its original scene GUID")
+
+          locations = [
+              scripts / "Assembly-CSharp" / "Alloy" / "MapTextureChannelMapping.cs",
+              scripts / "Assembly-CSharp" / "EnviroSky.cs",
+          ]
+          for path in locations:
+              text = path.read_text(encoding="utf-8")
+              marker = "using UnityEngine;\n"
+              if text.count(marker) != 1 or "using Debug =" in text:
+                  raise SystemExit(f"Unexpected using directives in {path}")
+              path.write_text(text.replace(marker, marker + "using Debug = UnityEngine.Debug;\n"), encoding="utf-8")
+              print("Fixed Debug reference:", path.name)
+
+          for path in (
+              story / "Properties" / "AssemblyInfo.cs",
+              plugins / "Assembly-UnityScript-firstpass" / "Properties" / "AssemblyInfo.cs",
+          ):
+              text = path.read_text(encoding="utf-8")
+              text, count = re.subn(r'^\[assembly:\s*AssemblyVersion\("[^"]+"\)\]\s*$', "", text, flags=re.M)
+              if count != 1:
+                  raise SystemExit(f"Expected one duplicate assembly version in {path}")
+              path.write_text(text, encoding="utf-8")
+              print("Removed duplicate assembly version:", path.relative_to(assets))
+          PY
+
+      - name: Add the editor scene check
+        shell: bash
+        run: |
+          mkdir -p ExportedProject/Assets/Editor
+          cat > ExportedProject/Assets/Editor/DT1Level1Check.cs <<'CS'
+          using System;
+          using System.IO;
+          using UnityEditor.SceneManagement;
+          using UnityEngine;
+
+          public static class DT1Level1Check
+          {
+              public static void Run()
+              {
+                  const string path = "Assets/GAME_FILES/LevelS/SinglLevelS/Level_1.unity";
+                  var scene = EditorSceneManager.OpenScene(path, OpenSceneMode.Single);
+                  if (!scene.IsValid() || !scene.isLoaded)
+                      throw new InvalidOperationException("The campaign scene did not open");
+
+                  int missing = 0;
+                  var roots = scene.GetRootGameObjects();
+                  foreach (var root in roots)
+                  {
+                      foreach (var component in root.GetComponentsInChildren<Component>(true))
+                      {
+                          if (component == null)
+                              missing++;
+                      }
+                  }
+
+                  string report = Environment.GetEnvironmentVariable("DT1_REPORT_PATH");
+                  File.WriteAllLines(report, new[] {
+                      "Unity editor: " + Application.unityVersion,
+                      "Opened: " + scene.path,
+                      "Root objects: " + roots.Length,
+                      "Missing component scripts: " + missing,
+                      "Play Mode and iOS export were not run."
+                  });
+              }
+          }
+          CS
+
+      - name: Check Unity account secrets
+        shell: bash
+        env:
+          UNITY_USERNAME: ${{ secrets.UNITY_USERNAME || secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        run: |
+          if [ -z "$UNITY_USERNAME" ] || [ -z "$UNITY_PASSWORD" ]; then
+            echo "::error::Set UNITY_USERNAME (or UNITY_EMAIL) and UNITY_PASSWORD in Actions secrets."
+            exit 1
+          fi
+
+      - name: Set up Node for Unity CLI
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install Unity 2017.4.40f1
+        shell: bash
+        timeout-minutes: 15
+        run: |
+          pkg="$RUNNER_TEMP/dt1-unity.pkg"
+          curl -fLsS --retry 2 --connect-timeout 30 --max-time 600 \
+            https://download.unity3d.com/download_unity/6e14067f8a9a/MacEditorInstaller/Unity-2017.4.40f1.pkg \
+            -o "$pkg"
+          sudo installer -pkg "$pkg" -target /
+          rm "$pkg"
+          editor=/Applications/Unity/Unity.app/Contents/MacOS/Unity
+          test -x "$editor"
+          printf 'UNITY_EDITOR_PATH=%s\n' "$editor" >> "$GITHUB_ENV"
+
+      - name: Add the UnityScript runtime libraries
+        shell: bash
+        run: |
+          contents="$(dirname "$(dirname "$UNITY_EDITOR_PATH")")"
+          mono="$contents/MonoBleedingEdge/lib/mono/4.5"
+          plugins=ExportedProject/Assets/Plugins/DT1Legacy
+          mkdir -p "$plugins"
+          cp "$mono/Boo.Lang.dll" "$mono/UnityScript.Lang.dll" "$plugins/"
+
+      - name: Activate Unity Personal
+        id: activate
+        shell: bash
+        timeout-minutes: 10
+        env:
+          UNITY_USERNAME: ${{ secrets.UNITY_USERNAME || secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        run: |
+          npm install --global @rage-against-the-pixel/unity-cli@4.2.2
+          unity-cli activate-license --license personal
+
+      - name: Compile scripts and open the original Level 1
+        shell: bash
+        timeout-minutes: 22
+        run: |
+          export DT1_REPORT_PATH="$PWD/output/unity-level1.txt"
+          status=0
+          "$UNITY_EDITOR_PATH" -batchmode -nographics -quit \
+            -projectPath "$PWD/ExportedProject" \
+            -executeMethod DT1Level1Check.Run \
+            -logFile "$PWD/output/unity-editor.log" || status=$?
+          if [ -s "$DT1_REPORT_PATH" ]; then
+            cat "$DT1_REPORT_PATH" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            tail -n 60 output/unity-editor.log || true
+            echo "::error::Unity did not write the scene report. See the editor log."
+            exit 1
+          fi
+          exit "$status"
+
+      - name: Return the Unity license
+        if: always() && steps.activate.outcome == 'success'
+        shell: bash
+        timeout-minutes: 5
+        run: unity-cli return-license --license personal --when auto
+
+      - name: Upload the reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DT1-level1-check
+          path: output/
+          if-no-files-found: warn
+          retention-days: 5
