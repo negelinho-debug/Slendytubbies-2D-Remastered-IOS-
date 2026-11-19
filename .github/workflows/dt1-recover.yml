@@ -1,0 +1,135 @@
+name: DeadTubbies 1 — recover Windows 1.5
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  recover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Download and unpack the Windows release
+        shell: bash
+        run: |
+          mkdir -p work output
+          sudo apt-get update -q
+          sudo apt-get install -y innoextract libarchive-tools
+
+          url="$(curl -fsS --max-time 30 \
+            -H 'Content-Type: application/json' \
+            -d '{"forceDownload":true}' \
+            https://gamejolt.com/site-api/web/discover/games/builds/get-download-url/639894 \
+            | jq -er '.payload.url | select(length > 0)')"
+          curl -fLsS --retry 2 --max-time 480 "$url" -o work/DT1.rar
+
+          sha256sum --check <<'SHA'
+          0ad7cd039fad2e5b953a02688c3c5f11181ce652e8418221a77155ea7d284b51  work/DT1.rar
+          SHA
+
+          bsdtar -xOf work/DT1.rar \
+            'DeadTubbies - The Last Mistake (Eng version) Setup.exe' \
+            > work/DT1-setup.exe
+          innoextract --quiet --exclude-temp --output-dir work/game work/DT1-setup.exe \
+            2>&1 | tee output/extract.log
+
+          data="work/game/app/DeadTubbies - The Last Mistake_Data"
+          test -s "$data/globalgamemanagers"
+          test -s "$data/Managed/Assembly-CSharp.dll"
+          test -s "$data/Managed/Assembly-UnityScript.dll"
+          rm work/DT1.rar work/DT1-setup.exe
+
+      - name: Export the Unity project and decompile Mono scripts
+        shell: bash
+        env:
+          DOTNET_GCConserveMemory: '9'
+        run: |
+          work="$PWD/work"
+          out="$PWD/output"
+          mkdir -p "$work/tool"
+          curl -fLsS --retry 2 --max-time 120 \
+            https://github.com/AssetRipper/AssetRipper/releases/download/2.0.0/AssetRipper_linux_x64.tar.xz \
+            -o "$work/assetripper.tar.xz"
+          sha256sum --check <<'SHA'
+          6f5d4352d36795b944243eb3ec790ec37dbca6d6756e52605bc8616e042d384e  work/assetripper.tar.xz
+          SHA
+          tar -xJf "$work/assetripper.tar.xz" -C "$work/tool"
+
+          base=http://127.0.0.1:18795
+          "$work/tool/AssetRipper.GUI.Free" --headless --port 18795 \
+            --log-path "$out/assetripper.log" > "$out/server.log" 2>&1 &
+          ripper_pid=$!
+          trap 'kill "$ripper_pid" 2>/dev/null || true' EXIT
+
+          for attempt in $(seq 1 60); do
+            if curl -fs --max-time 2 "$base/openapi.json" >/dev/null; then
+              break
+            fi
+            kill -0 "$ripper_pid"
+            sleep 1
+          done
+          curl -fsS --max-time 4 "$base/openapi.json" >/dev/null
+          curl -fsS --max-time 20 \
+            -d 'DefaultVersion=0.0.0a0&TargetVersion=0.0.0a0&BundledAssetsExportMode=GroupByAssetType&ScriptContentLevel=Level2&EnablePrefabOutlining=on&AudioExportFormat=Default&ImageExportFormat=Png&LightmapTextureExportFormat=Exr&SpriteExportMode=Yaml&ShaderExportMode=Dummy&TextExportMode=Parse&ScriptLanguageVersion=AutoSafe&ScriptExportMode=Decompiled' \
+            "$base/Settings/Update" >/dev/null
+          curl -fsSL --max-time 300 \
+            --data-urlencode "Path=$work/game/app/DeadTubbies - The Last Mistake_Data" \
+            "$base/LoadFolder" >/dev/null
+          curl -fsSL --max-time 900 --data-urlencode "Path=$work/export" \
+            "$base/Export/UnityProject" >/dev/null
+
+      - name: Check the story scenes and save the project
+        shell: bash
+        run: |
+          python3 - <<'PY' | tee output/audit.txt
+          from pathlib import Path
+
+          project = Path("work/export/ExportedProject")
+          assets = project / "Assets"
+          version = project / "ProjectSettings" / "ProjectVersion.txt"
+          print(version.read_text().strip())
+
+          campaign = assets / "GAME_FILES" / "LevelS" / "SinglLevelS"
+          for index in range(1, 8):
+              scene = campaign / f"Level_{index}.unity"
+              if not scene.is_file():
+                  raise SystemExit(f"Missing campaign scene: {scene}")
+              print("Campaign:", scene.relative_to(project))
+
+          print("All exported Unity scenes:", sum(1 for _ in assets.rglob("*.unity")))
+          scripts = assets / "Scripts"
+          for assembly in ("Assembly-CSharp", "Assembly-UnityScript"):
+              files = sorted((scripts / assembly).rglob("*.cs"))
+              if not files:
+                  raise SystemExit(f"No C# files exported for {assembly}")
+              print(f"{assembly}: {len(files)} C# files")
+
+          checks = {
+              "Assembly-CSharp/FPSPlayerControl.cs": 'StartCoroutine(Reload())',
+              "Assembly-UnityScript/DoorClick.cs": 'Application.Quit()',
+              "Assembly-UnityScript/EndingChoiceOne.cs": 'ClickGameButtonSound.PlayOneShot(',
+          }
+          for filename, marker in checks.items():
+              if marker not in (scripts / filename).read_text(encoding="utf-8"):
+                  raise SystemExit(f"Expected decompiled method body in {filename}")
+              print("Decompiled method body found in", filename)
+
+          print("Some exported scripts need cleanup. Shaders use placeholders.")
+          print("Unity compilation, Play Mode and iOS export were not run.")
+          PY
+          cat output/audit.txt >> "$GITHUB_STEP_SUMMARY"
+          tar -czf output/DT1-recovered-unity.tar.gz -C work/export ExportedProject
+
+      - name: Upload the project and reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DT1-recovery
+          path: |
+            output/*.tar.gz
+            output/*.txt
+            output/*.log
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 5
