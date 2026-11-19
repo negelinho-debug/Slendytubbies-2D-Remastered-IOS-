@@ -1,0 +1,144 @@
+name: DeadTubbies 2 — recover and check
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  recover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+
+    steps:
+      - name: Download the original APK and AssetRipper
+        shell: bash
+        run: |
+          mkdir -p work/tool output
+
+          download_url="$(curl -fsS --max-time 30 \
+            -H 'Content-Type: application/json' \
+            -d '{"forceDownload":true}' \
+            https://gamejolt.com/site-api/web/discover/games/builds/get-download-url/1061569 \
+            | jq -er '.payload.url')"
+          curl -fLsS --retry 2 --max-time 180 "$download_url" -o work/DT2.apk
+
+          sha256sum --check <<'SHA'
+          decb067c6074d44250f762cc3803e5cffde833a0acd6ba64c7ef8bf05a99e7df  work/DT2.apk
+          SHA
+
+          curl -fLsS --retry 2 --max-time 120 \
+            https://github.com/AssetRipper/AssetRipper/releases/download/2.0.0/AssetRipper_linux_x64.tar.xz \
+            -o work/assetripper.tar.xz
+
+          sha256sum --check <<'SHA'
+          6f5d4352d36795b944243eb3ec790ec37dbca6d6756e52605bc8616e042d384e  work/assetripper.tar.xz
+          SHA
+
+          tar -xJf work/assetripper.tar.xz -C work/tool
+
+      - name: Recover the Unity project
+        shell: bash
+        run: |
+          work="$PWD/work"
+          out="$PWD/output"
+          base=http://127.0.0.1:18795
+
+          "$work/tool/AssetRipper.GUI.Free" --headless --port 18795 \
+            --log-path "$out/assetripper.log" > "$out/server.log" 2>&1 &
+          ripper_pid=$!
+          trap 'kill "$ripper_pid" 2>/dev/null || true' EXIT
+
+          for attempt in $(seq 1 60); do
+            if curl -fs --max-time 2 "$base/openapi.json" >/dev/null; then
+              break
+            fi
+            kill -0 "$ripper_pid"
+            sleep 1
+          done
+          curl -fsS --max-time 4 "$base/openapi.json" >/dev/null
+
+          curl -fsS --max-time 20 \
+            -d 'DefaultVersion=0.0.0a0&TargetVersion=0.0.0a0&BundledAssetsExportMode=GroupByAssetType&ScriptContentLevel=Level2&EnablePrefabOutlining=on&AudioExportFormat=Default&ImageExportFormat=Png&LightmapTextureExportFormat=Exr&SpriteExportMode=Yaml&ShaderExportMode=Dummy&TextExportMode=Parse&ScriptLanguageVersion=AutoSafe&ScriptExportMode=Decompiled' \
+            "$base/Settings/Update" >/dev/null
+
+          curl -fsSL --max-time 240 --data-urlencode "Path=$work/DT2.apk" \
+            "$base/LoadFile" >/dev/null
+          curl -fsSL --max-time 600 --data-urlencode "Path=$work/export" \
+            "$base/Export/UnityProject" >/dev/null
+
+      - name: Check campaign scenes and gameplay scripts
+        shell: bash
+        run: |
+          python3 - <<'PY' | tee output/audit.txt
+          import re
+          from pathlib import Path
+
+          project = Path("work/export/ExportedProject")
+          assets = project / "Assets"
+          if not assets.is_dir():
+              raise SystemExit("AssetRipper did not produce Assets")
+
+          version = project / "ProjectSettings" / "ProjectVersion.txt"
+          print(version.read_text().strip())
+
+          for index in range(1, 7):
+              scenes = list(assets.rglob(f"Level_{index}.unity"))
+              if len(scenes) != 1:
+                  raise SystemExit(f"Expected one Level_{index} scene, found {len(scenes)}")
+              print("Scene:", scenes[0].relative_to(project))
+
+          scripts = assets / "Scripts" / "Assembly-CSharp"
+          checks = {
+              "LoadLevelScript.cs": "LoadTouchPad",
+              "DoorUse.cs": "OnMouseDown",
+              "UniversalEnemyAI.cs": "Update",
+          }
+
+          print("Game C# files:", sum(1 for _ in scripts.rglob("*.cs")))
+          for filename, method in checks.items():
+              source = (scripts / filename).read_text()
+              pattern = rf"\b{method}\s*\([^)]*\)\s*\{{\s*\}}"
+              status = "EMPTY STUB" if re.search(pattern, source) else "inspect manually"
+              print(f"{filename} / {method}: {status}")
+
+          print("Result: asset export and static audit only.")
+          print("Play Mode and iOS build were not run.")
+          PY
+
+          cat output/audit.txt >> "$GITHUB_STEP_SUMMARY"
+          tar -czf output/DT2-recovered-unity.tar.gz -C work/export ExportedProject
+
+      - name: Install .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.100'
+
+      - name: Recover gameplay code for review
+        shell: bash
+        run: |
+          mkdir -p work/rosetta
+
+          curl -fsSL --retry 2 --max-time 120 \
+            https://codeload.github.com/LibraHp/Cpp2iL/tar.gz/507dd2503d216d9316ef5803365f536b5e6f06f4 \
+            | tar -xz --strip-components=1 -C work/rosetta
+
+          rosetta_status=0
+          dotnet run --project work/rosetta/Rosetta.csproj -c Release -- \
+            scripts "$PWD/work/DT2.apk" --select Assembly-CSharp \
+            --output "$PWD/output/rosetta-draft" | tee output/rosetta.log || rosetta_status=$?
+
+          # This Rosetta revision returns 1 even after a successful export.
+          test "$rosetta_status" -le 1
+          grep -q '^COMPLETE' output/rosetta.log
+          test -s output/rosetta-draft/Assembly-CSharp/DoorUse.cs
+          test -s output/rosetta-draft/Assembly-CSharp/UniversalEnemyAI.cs
+
+      - name: Save report and recovery files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DT2-recovery
+          path: output/
+          if-no-files-found: warn
+          retention-days: 5
