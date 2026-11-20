@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       patch_url:
-        description: "Прямая HTTPS-ссылка на ZIP с тремя языками. Оставь пустым, если ZIP загружен в репозиторий."
+        description: "Прямая HTTPS-ссылка на исправленный ZIP. Оставь пустым, если ZIP загружен в репозиторий."
         required: false
         type: string
 
@@ -24,15 +24,17 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Find and verify the patch with three languages
+      - name: Find and verify the fixed patch
         env:
           PATCH_URL: ${{ inputs.patch_url }}
         run: |
           mkdir -p logs
           export PATCH_FILE="$RUNNER_TEMP/apocalypse-patch.zip"
+
           if [[ -n "$PATCH_URL" ]]; then
             curl -fsSL --retry 2 --max-time 180 --max-filesize 20000000 \
-              --proto '=https' --proto-redir '=https' --url "$PATCH_URL" -o "$PATCH_FILE"
+              --proto '=https' --proto-redir '=https' \
+              --url "$PATCH_URL" -o "$PATCH_FILE"
           fi
 
           python3 - <<'PY'
@@ -44,6 +46,9 @@ jobs:
           from zipfile import BadZipFile, ZipFile
 
           required = {
+              "ApocalypseCI/repair_export.py",
+              "Assets/Plugins/Assembly-CSharp.dll",
+              "Assets/Plugins/Unity.TextMeshPro.dll",
               "Assets/Shader/TMPro.cginc",
               "Assets/ApocalypseLocale/ApocalypseLanguageMenu.cs",
               "Assets/Resources/4/DLC.txt",
@@ -57,8 +62,11 @@ jobs:
               tracked = subprocess.check_output(["git", "ls-files", "-z"]).split(b"\0")
               candidates = sorted(
                   Path(os.fsdecode(name))
-                  for name in tracked if name
-                  and Path(os.fsdecode(name)).name.casefold().startswith("apocalypse-reboot-v1.03-shader-patch-ci")
+                  for name in tracked
+                  if name
+                  and Path(os.fsdecode(name)).name.casefold().startswith(
+                      "apocalypse-reboot-v1.03-shader-patch-ci"
+                  )
                   and Path(os.fsdecode(name)).suffix.casefold() == ".zip"
               )
 
@@ -69,8 +77,12 @@ jobs:
                           continue
                       for entry in archive.infolist():
                           path = PurePosixPath(entry.filename)
-                          if (path.is_absolute() or ".." in path.parts or "\\" in entry.filename
-                              or stat.S_ISLNK(entry.external_attr >> 16)):
+                          if (
+                              path.is_absolute()
+                              or ".." in path.parts
+                              or "\\" in entry.filename
+                              or stat.S_ISLNK(entry.external_attr >> 16)
+                          ):
                               raise BadZipFile("Unsafe archive entry")
                       if archive.testzip() is not None:
                           continue
@@ -78,12 +90,12 @@ jobs:
                   continue
               if candidate != target:
                   shutil.copyfile(candidate, target)
-              print("Verified Apocalypse 1.03 patch with all three languages.")
+              print("Verified patch with three languages, scene repair and TextCore fixes.")
               break
           else:
               raise SystemExit(
-                  "::error::Could not find the ZIP with three languages. "
-                  "Commit the patch ZIP or enter its direct HTTPS link in patch_url."
+                  "::error::Corrected patch ZIP not found. "
+                  "Upload the new 1.44 MB ZIP with repair_export.py and the two fixed DLLs."
               )
           PY
 
@@ -94,6 +106,7 @@ jobs:
             --data '{"forceDownload":true}' \
             https://gamejolt.com/site-api/web/discover/games/builds/get-download-url/1470786 \
             | jq -er '.payload.url | select(startswith("https://"))' > "$RUNNER_TEMP/game-url"
+
           curl -fsSL --retry 3 --max-time 600 --proto '=https' --proto-redir '=https' \
             --url "$(cat "$RUNNER_TEMP/game-url")" -o game.rar
           echo '049a0065ad012c9b5931f49cf3c5afa20016749236fbe4381a276930d8b14aac  game.rar' | shasum -a 256 -c
@@ -107,10 +120,12 @@ jobs:
           tar -xf ripper.tar.xz -C ripper
           ripper_bin="$(find "$PWD/ripper" -type f -name AssetRipper.GUI.Free -print -quit)"
           test -x "$ripper_bin"
+
           api=http://127.0.0.1:18766
           "$ripper_bin" --headless --port 18766 > logs/assetripper.log 2>&1 &
           ripper_pid=$!
           trap 'kill "$ripper_pid" 2>/dev/null || true' EXIT
+
           curl -fsS --retry 30 --retry-connrefused --retry-delay 1 "$api/Settings/Edit" -o /dev/null
           curl -fsS --max-time 30 \
             -d 'ScriptExportMode=DllExportWithRenaming&ScriptContentLevel=Level2' \
@@ -121,10 +136,12 @@ jobs:
             "$api/Export/UnityProject" -o /dev/null
           test -s export/ExportedProject/Assets/Plugins/Assembly-CSharp.dll
 
-      - name: Apply the shaders and languages and prepare the iOS build
+      - name: Apply shaders, languages and scene fixes
         run: |
           project="$PWD/export/ExportedProject"
           unzip -oq "$RUNNER_TEMP/apocalypse-patch.zip" -d "$project"
+          python3 "$project/ApocalypseCI/repair_export.py" "$project" | tee logs/apocalypse-repair.txt
+
           test -s "$project/Assets/Shader/TMPro.cginc"
           test -d "$project/Assets/DLCShaderIncludes/PostFX2"
           if grep -rl --include='*.shader' 'DummyShaderTextExporter' "$project/Assets" > logs/shader-placeholders.txt; then
@@ -220,7 +237,8 @@ jobs:
           result=0
           /Applications/Unity/Unity.app/Contents/MacOS/Unity \
             -quit -batchmode -nographics -buildTarget iOS \
-            -projectPath "$PWD/export/ExportedProject" -executeMethod BuildApocalypse.Run \
+            -projectPath "$PWD/export/ExportedProject" \
+            -executeMethod BuildApocalypse.Run \
             -logFile "$PWD/logs/unity.log" || result=$?
           tail -n 80 logs/unity.log || true
           test "$result" -eq 0
@@ -239,6 +257,7 @@ jobs:
             -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
             -derivedDataPath "$PWD/DerivedData" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
             ARCHS=arm64 build 2>&1 | tee logs/xcode.log
+
           app="$(find DerivedData/Build/Products/Release-iphoneos -maxdepth 1 -type d -name '*.app' -print -quit)"
           test -n "$app"
           exe="$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "$app/Info.plist")"
