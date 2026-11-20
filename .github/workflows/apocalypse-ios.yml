@@ -2,6 +2,11 @@ name: Apocalypse DLC Reboot 1.03 - iPhone
 
 on:
   workflow_dispatch:
+    inputs:
+      patch_url:
+        description: "Прямая HTTPS-ссылка на ZIP с тремя языками. Оставь пустым, если ZIP загружен в репозиторий."
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -19,19 +24,78 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Find and verify the patch with three languages
+        env:
+          PATCH_URL: ${{ inputs.patch_url }}
+        run: |
+          mkdir -p logs
+          export PATCH_FILE="$RUNNER_TEMP/apocalypse-patch.zip"
+          if [[ -n "$PATCH_URL" ]]; then
+            curl -fsSL --retry 2 --max-time 180 --max-filesize 20000000 \
+              --proto '=https' --proto-redir '=https' --url "$PATCH_URL" -o "$PATCH_FILE"
+          fi
+
+          python3 - <<'PY'
+          import os
+          from pathlib import Path, PurePosixPath
+          import shutil
+          import stat
+          import subprocess
+          from zipfile import BadZipFile, ZipFile
+
+          required = {
+              "Assets/Shader/TMPro.cginc",
+              "Assets/ApocalypseLocale/ApocalypseLanguageMenu.cs",
+              "Assets/Resources/4/DLC.txt",
+              "Assets/Resources/5/DLC.txt",
+          }
+          target = Path(os.environ["PATCH_FILE"])
+
+          if os.environ.get("PATCH_URL"):
+              candidates = [target]
+          else:
+              tracked = subprocess.check_output(["git", "ls-files", "-z"]).split(b"\0")
+              candidates = sorted(
+                  Path(os.fsdecode(name))
+                  for name in tracked if name
+                  and Path(os.fsdecode(name)).name.casefold().startswith("apocalypse-reboot-v1.03-shader-patch-ci")
+                  and Path(os.fsdecode(name)).suffix.casefold() == ".zip"
+              )
+
+          for candidate in candidates:
+              try:
+                  with ZipFile(candidate) as archive:
+                      if not required.issubset(archive.namelist()):
+                          continue
+                      for entry in archive.infolist():
+                          path = PurePosixPath(entry.filename)
+                          if (path.is_absolute() or ".." in path.parts or "\\" in entry.filename
+                              or stat.S_ISLNK(entry.external_attr >> 16)):
+                              raise BadZipFile("Unsafe archive entry")
+                      if archive.testzip() is not None:
+                          continue
+              except (OSError, BadZipFile, RuntimeError):
+                  continue
+              if candidate != target:
+                  shutil.copyfile(candidate, target)
+              print("Verified Apocalypse 1.03 patch with all three languages.")
+              break
+          else:
+              raise SystemExit(
+                  "::error::Could not find the ZIP with three languages. "
+                  "Commit the patch ZIP or enter its direct HTTPS link in patch_url."
+              )
+          PY
+
       - name: Download the Windows demo and recover the Unity project
         run: |
-          test -f Apocalypse-Reboot-v1.03-Shader-Patch-CI.zip || {
-            echo "::error::Upload Apocalypse-Reboot-v1.03-Shader-Patch-CI.zip to the repo root"
-            exit 1
-          }
-          mkdir -p logs windows ripper
+          mkdir -p windows ripper
           curl -fsSL --retry 3 --max-time 60 -H 'Content-Type: application/json' \
             --data '{"forceDownload":true}' \
             https://gamejolt.com/site-api/web/discover/games/builds/get-download-url/1470786 \
             | jq -er '.payload.url | select(startswith("https://"))' > "$RUNNER_TEMP/game-url"
           curl -fsSL --retry 3 --max-time 600 --proto '=https' --proto-redir '=https' \
-            "$(cat "$RUNNER_TEMP/game-url")" -o game.rar
+            --url "$(cat "$RUNNER_TEMP/game-url")" -o game.rar
           echo '049a0065ad012c9b5931f49cf3c5afa20016749236fbe4381a276930d8b14aac  game.rar' | shasum -a 256 -c
           bsdtar -xf game.rar -C windows
           game_data="$(find "$PWD/windows" -type d -name '*_Data' -print -quit)"
@@ -48,7 +112,8 @@ jobs:
           ripper_pid=$!
           trap 'kill "$ripper_pid" 2>/dev/null || true' EXIT
           curl -fsS --retry 30 --retry-connrefused --retry-delay 1 "$api/Settings/Edit" -o /dev/null
-          curl -fsS --max-time 30 -d 'ScriptExportMode=DllExportWithRenaming&ScriptContentLevel=Level2' \
+          curl -fsS --max-time 30 \
+            -d 'ScriptExportMode=DllExportWithRenaming&ScriptContentLevel=Level2' \
             "$api/Settings/Update" -o /dev/null
           curl -fsS --max-time 180 --data-urlencode "Path=$(dirname "$game_data")" \
             "$api/LoadFolder" -o /dev/null
@@ -56,11 +121,10 @@ jobs:
             "$api/Export/UnityProject" -o /dev/null
           test -s export/ExportedProject/Assets/Plugins/Assembly-CSharp.dll
 
-      - name: Apply the shader patch and prepare the iOS build
+      - name: Apply the shaders and languages and prepare the iOS build
         run: |
           project="$PWD/export/ExportedProject"
-          patch="$PWD/Apocalypse-Reboot-v1.03-Shader-Patch-CI.zip"
-          unzip -oq "$patch" -d "$project"
+          unzip -oq "$RUNNER_TEMP/apocalypse-patch.zip" -d "$project"
           test -s "$project/Assets/Shader/TMPro.cginc"
           test -d "$project/Assets/DLCShaderIncludes/PostFX2"
           if grep -rl --include='*.shader' 'DummyShaderTextExporter' "$project/Assets" > logs/shader-placeholders.txt; then
