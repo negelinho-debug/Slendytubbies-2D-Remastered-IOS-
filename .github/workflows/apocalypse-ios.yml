@@ -1,4 +1,4 @@
-name: Apocalypse DLC Reboot 1.03 - iPhone
+name: Apocalypse DLC Reboot 1.03 - iPhone with saves
 
 'on':
   workflow_dispatch:
@@ -152,6 +152,34 @@ jobs:
               }
           }
           CS
+
+      - name: Enable the original save and load buttons
+        shell: bash
+        run: |
+          python3 - "$GITHUB_WORKSPACE/export/ExportedProject" <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          assets = Path(sys.argv[1]) / "Assets" / "GameObject"
+          pause = assets / "PauseUI.prefab"
+          for name in ("SaveUI.prefab", "LoadUI.prefab"):
+              if not (assets / name).is_file():
+                  raise SystemExit(f"Missing original save or load menu: {name}")
+
+          source = pause.read_text(encoding="utf-8")
+          for name in ("btnSave", "btnLoad"):
+              target = re.compile(
+                  r"(?m)(^  m_Name: " + name
+                  + r"\n(?:(?!^--- ).*\n)*?^  m_IsActive: )[01]$"
+              )
+              source, count = target.subn(r"\g<1>1", source)
+              if count != 1:
+                  raise SystemExit(f"Expected one pause-menu button: {name}")
+
+          pause.write_text(source, encoding="utf-8")
+          print("Apocalypse: enabled the original Save and Load buttons.")
+          PY
 
       - name: Fix the original startup scripts
         shell: bash
@@ -335,15 +363,15 @@ jobs:
           stage="$(mktemp -d "$RUNNER_TEMP/apocalypse-ipa.XXXXXX")"
           mkdir -p dist "$stage/Payload"
           ditto "$app" "$stage/Payload/$(basename "$app")"
-          output="$PWD/dist/Apocalypse-Reboot-1.03.ipa"
+          output="$PWD/dist/Apocalypse-Reboot-1.03-Saves.ipa"
           ditto -c -k --norsrc --keepParent "$stage/Payload" "$output"
           unzip -tq "$output"
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: Apocalypse-Reboot-1.03-IPA
-          path: dist/Apocalypse-Reboot-1.03.ipa
+          name: Apocalypse-Reboot-1.03-Saves-IPA
+          path: dist/Apocalypse-Reboot-1.03-Saves.ipa
           if-no-files-found: error
           compression-level: 0
 
