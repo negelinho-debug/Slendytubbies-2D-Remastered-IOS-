@@ -1,12 +1,13 @@
 name: Apocalypse DLC Reboot 1.03 - iPhone
 
-on:
+'on':
   workflow_dispatch:
     inputs:
       patch_url:
-        description: "Прямая HTTPS-ссылка на исправленный ZIP. Оставь пустым, если ZIP загружен в репозиторий."
+        description: Optional direct URL for the CI patch ZIP
         required: false
         type: string
+        default: ''
 
 permissions:
   contents: read
@@ -14,162 +15,100 @@ permissions:
 jobs:
   ipa:
     runs-on: macos-15
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
+      UNITY_EDITOR_PATH: /Applications/Unity/Unity.app/Contents/MacOS/Unity
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
-    defaults:
-      run:
-        shell: bash
-
+      PATCH_NAME: Apocalypse-Reboot-v1.03-Shader-Patch-CI.zip
     steps:
       - uses: actions/checkout@v5
 
       - name: Find and verify the fixed patch
+        shell: bash
         env:
           PATCH_URL: ${{ inputs.patch_url }}
         run: |
           mkdir -p logs
-          export PATCH_FILE="$RUNNER_TEMP/apocalypse-patch.zip"
-
+          patch="$GITHUB_WORKSPACE/$PATCH_NAME"
           if [[ -n "$PATCH_URL" ]]; then
-            curl -fsSL --retry 2 --max-time 180 --max-filesize 20000000 \
-              --proto '=https' --proto-redir '=https' \
-              --url "$PATCH_URL" -o "$PATCH_FILE"
+            patch="$RUNNER_TEMP/$PATCH_NAME"
+            curl -fLsS --retry 3 --max-time 300 "$PATCH_URL" -o "$patch"
+          elif [[ ! -f "$patch" ]]; then
+            patch="$(find "$GITHUB_WORKSPACE" -type f -name "$PATCH_NAME" -print -quit)"
           fi
-
-          python3 - <<'PY'
-          import os
-          from pathlib import Path, PurePosixPath
-          import shutil
-          import stat
-          import subprocess
-          from zipfile import BadZipFile, ZipFile
-
-          required = {
-              "ApocalypseCI/repair_export.py",
-              "Assets/Plugins/Assembly-CSharp.dll",
-              "Assets/Plugins/Unity.TextMeshPro.dll",
-              "Assets/Shader/TMPro.cginc",
-              "Assets/ApocalypseLocale/ApocalypseLanguageMenu.cs",
-              "Assets/Resources/4/DLC.txt",
-              "Assets/Resources/5/DLC.txt",
-          }
-          target = Path(os.environ["PATCH_FILE"])
-
-          if os.environ.get("PATCH_URL"):
-              candidates = [target]
-          else:
-              tracked = subprocess.check_output(["git", "ls-files", "-z"]).split(b"\0")
-              candidates = sorted(
-                  Path(os.fsdecode(name))
-                  for name in tracked
-                  if name
-                  and Path(os.fsdecode(name)).name.casefold().startswith(
-                      "apocalypse-reboot-v1.03-shader-patch-ci"
-                  )
-                  and Path(os.fsdecode(name)).suffix.casefold() == ".zip"
-              )
-
-          for candidate in candidates:
-              try:
-                  with ZipFile(candidate) as archive:
-                      if not required.issubset(archive.namelist()):
-                          continue
-                      for entry in archive.infolist():
-                          path = PurePosixPath(entry.filename)
-                          if (
-                              path.is_absolute()
-                              or ".." in path.parts
-                              or "\\" in entry.filename
-                              or stat.S_ISLNK(entry.external_attr >> 16)
-                          ):
-                              raise BadZipFile("Unsafe archive entry")
-                      if archive.testzip() is not None:
-                          continue
-              except (OSError, BadZipFile, RuntimeError):
-                  continue
-              if candidate != target:
-                  shutil.copyfile(candidate, target)
-              print("Verified patch with three languages, scene repair and TextCore fixes.")
-              break
-          else:
-              raise SystemExit(
-                  "::error::Corrected patch ZIP not found. "
-                  "Upload the new 1.44 MB ZIP with repair_export.py and the two fixed DLLs."
-              )
-          PY
+          if [[ ! -s "$patch" ]]; then
+            echo "::error::Add $PATCH_NAME to this branch or supply its direct URL."
+            exit 1
+          fi
+          unzip -tq "$patch"
+          unzip -Z1 "$patch" > "$RUNNER_TEMP/apocalypse-patch-files.txt"
+          for entry in ApocalypseCI/repair_export.py \
+              Assets/Plugins/Assembly-CSharp.dll \
+              Assets/Plugins/Unity.TextMeshPro.dll \
+              Assets/ApocalypseLocale/ApocalypseLanguageMenu.cs; do
+            grep -Fx "$entry" "$RUNNER_TEMP/apocalypse-patch-files.txt"
+          done
+          printf 'APOCALYPSE_PATCH=%s\n' "$patch" >> "$GITHUB_ENV"
 
       - name: Download the Windows demo and recover the Unity project
+        shell: bash
+        timeout-minutes: 20
         run: |
           mkdir -p windows ripper
-          curl -fsSL --retry 3 --max-time 60 -H 'Content-Type: application/json' \
-            --data '{"forceDownload":true}' \
-            https://gamejolt.com/site-api/web/discover/games/builds/get-download-url/1470786 \
-            | jq -er '.payload.url | select(startswith("https://"))' > "$RUNNER_TEMP/game-url"
-
-          curl -fsSL --retry 3 --max-time 600 --proto '=https' --proto-redir '=https' \
-            --url "$(cat "$RUNNER_TEMP/game-url")" -o game.rar
-          echo '049a0065ad012c9b5931f49cf3c5afa20016749236fbe4381a276930d8b14aac  game.rar' | shasum -a 256 -c
-          bsdtar -xf game.rar -C windows
+          api="https://gamejolt.com/site-api/web/discover/games/builds/get-download-url/1470786"
+          source_url="$(curl -fsS --retry 3 --max-time 60 \
+            -A 'Mozilla/5.0' -H 'Content-Type: application/json' \
+            -H 'Referer: https://gamejolt.com/get/build?game=774657&build=1470786' \
+            --data '{"forceDownload":true}' "$api" | jq -er '.payload.url')"
+          curl -fLsS --retry 3 --max-time 600 \
+            -A 'Mozilla/5.0' -e 'https://gamejolt.com/' "$source_url" -o source.rar
+          printf '%s  %s\n' \
+            049a0065ad012c9b5931f49cf3c5afa20016749236fbe4381a276930d8b14aac \
+            source.rar | shasum -a 256 -c -
+          if ! /usr/bin/tar -xf source.rar -C windows; then
+            7z x -y -owindows source.rar >/dev/null
+          fi
           game_data="$(find "$PWD/windows" -type d -name '*_Data' -print -quit)"
           test -s "$game_data/Managed/Assembly-CSharp.dll"
 
-          curl -fsSL --retry 3 --max-time 180 \
-            https://github.com/AssetRipper/AssetRipper/releases/download/2.0.0/AssetRipper_mac_arm64.tar.xz \
-            -o ripper.tar.xz
+          release="https://github.com/AssetRipper/AssetRipper/releases/download/2.0.0"
+          curl -fLsS --retry 3 --max-time 300 \
+            "$release/AssetRipper_mac_arm64.tar.xz" -o ripper.tar.xz
           tar -xf ripper.tar.xz -C ripper
           ripper_bin="$(find "$PWD/ripper" -type f -name AssetRipper.GUI.Free -print -quit)"
           test -x "$ripper_bin"
-
-          api=http://127.0.0.1:18766
           "$ripper_bin" --headless --port 18766 > logs/assetripper.log 2>&1 &
           ripper_pid=$!
           trap 'kill "$ripper_pid" 2>/dev/null || true' EXIT
-
-          curl -fsS --retry 30 --retry-connrefused --retry-delay 1 "$api/Settings/Edit" -o /dev/null
+          ripper_api=http://127.0.0.1:18766
+          curl -fsS --retry 25 --retry-connrefused --retry-delay 1 \
+            "$ripper_api/Settings/Edit" -o /dev/null
           curl -fsS --max-time 30 \
             -d 'ScriptExportMode=DllExportWithRenaming&ScriptContentLevel=Level2' \
-            "$api/Settings/Update" -o /dev/null
+            "$ripper_api/Settings/Update" -o /dev/null
           curl -fsS --max-time 180 --data-urlencode "Path=$(dirname "$game_data")" \
-            "$api/LoadFolder" -o /dev/null
+            "$ripper_api/LoadFolder" -o /dev/null
           curl -fsS --max-time 900 --data-urlencode "Path=$PWD/export" \
-            "$api/Export/UnityProject" -o /dev/null
+            "$ripper_api/Export/UnityProject" -o /dev/null
           test -s export/ExportedProject/Assets/Plugins/Assembly-CSharp.dll
 
       - name: Apply shaders, languages and scene fixes
+        shell: bash
         run: |
-          project="$PWD/export/ExportedProject"
-          unzip -oq "$RUNNER_TEMP/apocalypse-patch.zip" -d "$project"
-          python3 "$project/ApocalypseCI/repair_export.py" "$project" | tee logs/apocalypse-repair.txt
+          project="$GITHUB_WORKSPACE/export/ExportedProject"
+          unzip -oq "$APOCALYPSE_PATCH" -d "$project"
+          python3 "$project/ApocalypseCI/repair_export.py" "$project" \
+            | tee logs/apocalypse-repair.txt
 
-          test -s "$project/Assets/Shader/TMPro.cginc"
-          test -d "$project/Assets/DLCShaderIncludes/PostFX2"
-          if grep -rl --include='*.shader' 'DummyShaderTextExporter' "$project/Assets" > logs/shader-placeholders.txt; then
-            cat logs/shader-placeholders.txt
-            exit 1
-          fi
-
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-
-          plugins = Path("export/ExportedProject/Assets/Plugins")
-          for meta in plugins.glob("*.dll.meta"):
-              original = meta.read_text()
-              updated = re.sub(r"(Editor: Editor\n    second:\n      enabled: )0", r"\g<1>1", original)
-              if original != updated:
-                  meta.write_text(updated)
-          PY
-
-          mkdir -p "$project/Assets/Editor/ApocalypseCI"
-          cat > "$project/Assets/Editor/ApocalypseCI/ApocalypseCI.asmdef" <<'JSON'
-          {"name":"ApocalypseCI","includePlatforms":["Editor"]}
-          JSON
-
-          cat > "$project/Assets/Editor/ApocalypseCI/BuildApocalypse.cs" <<'CS'
+          editor="$project/Assets/Editor/ApocalypseCI"
+          mkdir -p "$editor"
+          printf '%s\n' '{"name":"ApocalypseCI","includePlatforms":["Editor"]}' \
+            > "$editor/ApocalypseCI.asmdef"
+          cat > "$editor/BuildApocalypse.cs" <<'CS'
           using System;
           using System.Linq;
           using UnityEditor;
+          using UnityEditor.Build;
           using UnityEditor.Build.Reporting;
           using UnityEngine;
           using UnityEngine.Rendering;
@@ -178,107 +117,236 @@ jobs:
           {
               public static void Run()
               {
-                  var scenes = EditorBuildSettings.scenes.Where(s => s.enabled).Select(s => s.path).ToArray();
-                  if (scenes.Length != 11 || !scenes.Any(s => s.EndsWith("/Chapter 2 Meltdown.unity")))
-                      throw new Exception("Unexpected scene list for Apocalypse DLC Reboot 1.03");
+                  var scenes = EditorBuildSettings.scenes
+                      .Where(scene => scene.enabled)
+                      .Select(scene => scene.path)
+                      .ToArray();
+                  if (scenes.Length != 11 ||
+                      scenes[0] != "Assets/Scenes/DLC/Menus/COMPANYNAME.unity")
+                      throw new BuildFailedException("Expected all 11 original scenes in order.");
 
                   PlayerSettings.productName = "Apocalypse DLC Reboot";
                   PlayerSettings.bundleVersion = "1.0.3";
-                  PlayerSettings.SetApplicationIdentifier(BuildTargetGroup.iOS, "com.apocalypsedlcreboot.ios");
-                  PlayerSettings.SetScriptingBackend(BuildTargetGroup.iOS, ScriptingImplementation.IL2CPP);
-                  PlayerSettings.SetManagedStrippingLevel(BuildTargetGroup.iOS, ManagedStrippingLevel.Low);
-                  PlayerSettings.defaultInterfaceOrientation = UIOrientation.LandscapeLeft;
+                  PlayerSettings.SetApplicationIdentifier(
+                      BuildTargetGroup.iOS, "com.apocalypsedlcreboot.ios");
                   PlayerSettings.iOS.targetOSVersionString = "15.0";
-                  PlayerSettings.iOS.sdkVersion = iOSSdkVersion.DeviceSDK;
+                  PlayerSettings.defaultInterfaceOrientation = UIOrientation.LandscapeLeft;
+                  PlayerSettings.SetScriptingBackend(
+                      BuildTargetGroup.iOS, ScriptingImplementation.IL2CPP);
+                  PlayerSettings.SetManagedStrippingLevel(
+                      BuildTargetGroup.iOS, ManagedStrippingLevel.Low);
+                  PlayerSettings.stripEngineCode = false;
                   PlayerSettings.SetUseDefaultGraphicsAPIs(BuildTarget.iOS, false);
                   PlayerSettings.SetGraphicsAPIs(BuildTarget.iOS, new[] { GraphicsDeviceType.Metal });
 
-                  var report = BuildPipeline.BuildPlayer(scenes, Environment.GetEnvironmentVariable("IOS_OUTPUT"),
-                      BuildTarget.iOS, BuildOptions.None);
+                  string output = Environment.GetEnvironmentVariable("APOCALYPSE_XCODE_DIR");
+                  var report = BuildPipeline.BuildPlayer(
+                      scenes, output, BuildTarget.iOS, BuildOptions.None);
                   if (report.summary.result != BuildResult.Succeeded)
-                      throw new Exception("Unity iOS export: " + report.summary.result);
+                      throw new BuildFailedException("iOS export failed: " + report.summary.result);
               }
           }
           CS
 
+      - name: Fix the original startup scripts
+        shell: bash
+        run: |
+          project="$GITHUB_WORKSPACE/export/ExportedProject"
+          python3 - "$project" <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          assets = Path(sys.argv[1]) / "Assets"
+          plugins = assets / "Plugins"
+          renames = {
+              b"Assembly-CSharp": b"ApocalypseGames",
+              b"Assembly-CSharp-firstpass": b"ApocalypseGames.Firstpass",
+          }
+
+          editor = re.compile(rb"(Editor: Editor\r?\n[ \t]+second:\r?\n[ \t]+enabled: )[01]")
+          for old, new in renames.items():
+              dll = plugins / (old.decode() + ".dll")
+              meta = dll.with_suffix(".dll.meta")
+              binary = dll.read_bytes()
+              if binary.count(old + b"\0") != 1:
+                  raise SystemExit(f"Unexpected assembly metadata: {dll}")
+              for source, target in renames.items():
+                  if len(source) != len(target):
+                      raise SystemExit("Assembly names must have the same byte length")
+                  binary = binary.replace(source + b"\0", target + b"\0")
+                  binary = binary.replace(source + b".dll\0", target + b".dll\0")
+              importer, count = editor.subn(rb"\g<1>1", meta.read_bytes())
+              if count != 1:
+                  raise SystemExit(f"Unexpected Editor importer settings: {meta}")
+              target_dll = plugins / (new.decode() + ".dll")
+              target_dll.write_bytes(binary)
+              target_dll.with_suffix(".dll.meta").write_bytes(importer)
+              dll.unlink()
+              meta.unlink()
+
+          type_name = re.compile(
+              rb"(m_TargetAssemblyTypeName:[^\r\n]*?,[ \t]*)"
+              rb"(Assembly-CSharp(?:-firstpass)?)(?=[ \t\r\n,'\"]|$)"
+          )
+          total = 0
+          for path in assets.rglob("*"):
+              if path.suffix not in {".unity", ".asset", ".prefab"}:
+                  continue
+              original = path.read_bytes()
+              if not original.startswith((b"%YAML", b"\xef\xbb\xbf%YAML")):
+                  continue
+              updated, count = type_name.subn(
+                  lambda match: match[1] + renames[match[2]], original
+              )
+              if count:
+                  path.write_bytes(updated)
+                  total += count
+          print(f"Apocalypse: updated {total} UnityEvent assembly references.")
+
+          check = assets / "Editor" / "ApocalypseCI" / "ApocalypseStartupCheck.cs"
+          check.parent.mkdir(parents=True, exist_ok=True)
+          check.write_text("""using System.Collections.Generic;
+          using UnityEditor;
+          using UnityEditor.Build;
+          using UnityEditor.Build.Reporting;
+          using UnityEngine;
+          using UnityEngine.SceneManagement;
+
+          public sealed class ApocalypseStartupCheck : IProcessSceneWithReport
+          {
+              public int callbackOrder => 0;
+
+              public void OnProcessScene(Scene scene, BuildReport report)
+              {
+                  if (report == null || report.summary.platform != BuildTarget.iOS ||
+                      scene.name != "COMPANYNAME")
+                      return;
+
+                  var missing = new List<string>();
+                  var types = new HashSet<string>();
+                  foreach (var root in scene.GetRootGameObjects())
+                  {
+                      foreach (var item in root.GetComponentsInChildren<Transform>(true))
+                      {
+                          if (GameObjectUtility.GetMonoBehavioursWithMissingScriptCount(item.gameObject) > 0)
+                              missing.Add(item.name);
+                      }
+                      foreach (var component in root.GetComponentsInChildren<MonoBehaviour>(true))
+                      {
+                          if (component != null)
+                              types.Add(component.GetType().FullName);
+                      }
+                  }
+
+                  foreach (var required in new[] {
+                      "TranslateText", "AC.Sound", "SettingsManager2", "DiscordPresence.PresenceManager"
+                  })
+                  {
+                      if (!types.Contains(required))
+                          missing.Add(required);
+                  }
+
+                  if (missing.Count > 0)
+                      throw new BuildFailedException(
+                          "Apocalypse startup: missing " + string.Join(", ", missing));
+
+                  Debug.Log("Apocalypse startup check passed: original scripts resolved.");
+              }
+          }
+          """, encoding="utf-8")
+          PY
+
       - name: Install Unity and iOS Build Support
+        shell: bash
+        timeout-minutes: 25
         run: |
           base=https://download.unity3d.com/download_unity/88f88f591b2e
-          for module in MacEditorInstallerArm64/Unity-2021.3.45f2.pkg \
-                        MacEditorTargetInstaller/UnitySetup-iOS-Support-for-Editor-2021.3.45f2.pkg; do
-            pkg="$RUNNER_TEMP/${module##*/}"
-            curl -fsSL --retry 3 --max-time 1000 "$base/$module" -o "$pkg"
-            sudo installer -pkg "$pkg" -target /
-            rm "$pkg"
-          done
-          test -x /Applications/Unity/Unity.app/Contents/MacOS/Unity
+          curl -fLsS --retry 3 --max-time 600 \
+            "$base/MacEditorInstallerArm64/Unity-2021.3.45f2.pkg" \
+            -o "$RUNNER_TEMP/apocalypse-unity.pkg"
+          sudo installer -pkg "$RUNNER_TEMP/apocalypse-unity.pkg" -target /
+          rm "$RUNNER_TEMP/apocalypse-unity.pkg"
+          curl -fLsS --retry 3 --max-time 600 \
+            "$base/MacEditorTargetInstaller/UnitySetup-iOS-Support-for-Editor-2021.3.45f2.pkg" \
+            -o "$RUNNER_TEMP/apocalypse-ios.pkg"
+          sudo installer -pkg "$RUNNER_TEMP/apocalypse-ios.pkg" -target /
+          rm "$RUNNER_TEMP/apocalypse-ios.pkg"
+          test -x "$UNITY_EDITOR_PATH"
+          xcodebuild -version
 
       - uses: actions/setup-node@v5
         with:
           node-version: '24'
-          package-manager-cache: false
 
       - name: Activate Unity Personal
-        id: license
+        id: activate
+        shell: bash
+        timeout-minutes: 10
         env:
           UNITY_USERNAME: ${{ secrets.UNITY_USERNAME || secrets.UNITY_EMAIL }}
           UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
         run: |
-          if [[ -z "$UNITY_USERNAME" || -z "$UNITY_PASSWORD" ]]; then
-            echo "::error::Add UNITY_USERNAME (or UNITY_EMAIL) and UNITY_PASSWORD in Actions secrets"
-            exit 1
-          fi
-          npm install -g @rage-against-the-pixel/unity-cli@4.2.2
+          npm install --global @rage-against-the-pixel/unity-cli@4.2.2
           unity-cli activate-license --license personal
 
       - name: Export the Xcode project
-        timeout-minutes: 50
+        shell: bash
+        timeout-minutes: 70
         run: |
-          export IOS_OUTPUT="$PWD/Xcode"
-          result=0
-          /Applications/Unity/Unity.app/Contents/MacOS/Unity \
-            -quit -batchmode -nographics -buildTarget iOS \
-            -projectPath "$PWD/export/ExportedProject" \
-            -executeMethod BuildApocalypse.Run \
-            -logFile "$PWD/logs/unity.log" || result=$?
-          tail -n 80 logs/unity.log || true
-          test "$result" -eq 0
-          test -d Xcode/Unity-iPhone.xcodeproj
+          export APOCALYPSE_XCODE_DIR="$GITHUB_WORKSPACE/Xcode"
+          log="$GITHUB_WORKSPACE/logs/unity.log"
+          touch "$log"
+          tail -n +1 -F "$log" &
+          log_pid=$!
+          trap 'kill "$log_pid" 2>/dev/null || true' EXIT
+          "$UNITY_EDITOR_PATH" -quit -batchmode -nographics -buildTarget iOS \
+            -projectPath "$GITHUB_WORKSPACE/export/ExportedProject" \
+            -executeMethod BuildApocalypse.Run -logFile "$log"
+          grep -F 'Apocalypse startup check passed' "$log"
+          test -s Xcode/Unity-iPhone.xcodeproj/project.pbxproj
 
       - name: Return Unity Personal license
-        if: always() && steps.license.outcome == 'success'
-        continue-on-error: true
+        if: always() && steps.activate.outcome == 'success'
+        shell: bash
         timeout-minutes: 5
         run: unity-cli return-license --license personal --when auto
 
       - name: Build the ARM64 IPA
+        shell: bash
+        timeout-minutes: 20
         run: |
-          xcodebuild -version
-          xcodebuild -project Xcode/Unity-iPhone.xcodeproj -scheme Unity-iPhone \
-            -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
-            -derivedDataPath "$PWD/DerivedData" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
-            ARCHS=arm64 build 2>&1 | tee logs/xcode.log
+          xcodebuild -project Xcode/Unity-iPhone.xcodeproj \
+            -scheme Unity-iPhone -configuration Release -sdk iphoneos \
+            -destination 'generic/platform=iOS' -derivedDataPath "$PWD/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO ARCHS=arm64 build \
+            | tee logs/xcode.log
 
-          app="$(find DerivedData/Build/Products/Release-iphoneos -maxdepth 1 -type d -name '*.app' -print -quit)"
-          test -n "$app"
-          exe="$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "$app/Info.plist")"
+          products="$PWD/DerivedData/Build/Products/Release-iphoneos"
+          app="$(find "$products" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          test -d "$app/Data"
+          exe="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Info.plist")"
           lipo "$app/$exe" -verify_arch arm64
 
-          mkdir -p Payload
-          ditto "$app" Payload/ApocalypseReboot.app
-          ditto -c -k --keepParent Payload Apocalypse-Reboot-1.03.ipa
-          unzip -tq Apocalypse-Reboot-1.03.ipa
+          stage="$(mktemp -d "$RUNNER_TEMP/apocalypse-ipa.XXXXXX")"
+          mkdir -p dist "$stage/Payload"
+          ditto "$app" "$stage/Payload/$(basename "$app")"
+          output="$PWD/dist/Apocalypse-Reboot-1.03.ipa"
+          ditto -c -k --norsrc --keepParent "$stage/Payload" "$output"
+          unzip -tq "$output"
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
         with:
           name: Apocalypse-Reboot-1.03-IPA
-          path: Apocalypse-Reboot-1.03.ipa
-          compression-level: 0
+          path: dist/Apocalypse-Reboot-1.03.ipa
           if-no-files-found: error
+          compression-level: 0
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload build logs
         if: always()
+        uses: actions/upload-artifact@v4
         with:
           name: Apocalypse-build-logs
           path: logs/
-          if-no-files-found: ignore
+          if-no-files-found: warn
