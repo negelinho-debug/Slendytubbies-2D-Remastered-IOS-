@@ -165,6 +165,7 @@ jobs:
           cat > "$project/Assets/Editor/ApocalypseCI/ApocalypseCI.asmdef" <<'JSON'
           {"name":"ApocalypseCI","includePlatforms":["Editor"]}
           JSON
+
           cat > "$project/Assets/Editor/ApocalypseCI/BuildApocalypse.cs" <<'CS'
           using System;
           using System.Linq;
@@ -261,7 +262,8 @@ jobs:
           app="$(find DerivedData/Build/Products/Release-iphoneos -maxdepth 1 -type d -name '*.app' -print -quit)"
           test -n "$app"
           exe="$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "$app/Info.plist")"
-          lipo -verify_arch arm64 "$app/$exe"
+          lipo "$app/$exe" -verify_arch arm64
+
           mkdir -p Payload
           ditto "$app" Payload/ApocalypseReboot.app
           ditto -c -k --keepParent Payload Apocalypse-Reboot-1.03.ipa
