@@ -23,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Find and verify the fixed patch
+      - name: Find and verify the mobile patch
         shell: bash
         env:
           PATCH_URL: ${{ inputs.patch_url }}
@@ -45,8 +45,12 @@ jobs:
           for entry in ApocalypseCI/repair_export.py \
               Assets/Plugins/Assembly-CSharp.dll \
               Assets/Plugins/Unity.TextMeshPro.dll \
-              Assets/ApocalypseLocale/ApocalypseLanguageMenu.cs; do
-            grep -Fx "$entry" "$RUNNER_TEMP/apocalypse-patch-files.txt"
+              Assets/ApocalypseLocale/ApocalypseLanguageMenu.cs \
+              Assets/ApocalypseLocale/ApocalypseMobile.cs; do
+            if ! grep -Fxq "$entry" "$RUNNER_TEMP/apocalypse-patch-files.txt"; then
+              echo "::error::Patch is missing $entry. Upload the updated mobile ZIP."
+              exit 1
+            fi
           done
           printf 'APOCALYPSE_PATCH=%s\n' "$patch" >> "$GITHUB_ENV"
 
@@ -92,11 +96,12 @@ jobs:
             "$ripper_api/Export/UnityProject" -o /dev/null
           test -s export/ExportedProject/Assets/Plugins/Assembly-CSharp.dll
 
-      - name: Apply shaders, languages and scene fixes
+      - name: Apply the mobile patch and repair the scenes
         shell: bash
         run: |
           project="$GITHUB_WORKSPACE/export/ExportedProject"
           unzip -oq "$APOCALYPSE_PATCH" -d "$project"
+          test -s "$project/Assets/ApocalypseLocale/ApocalypseMobile.cs"
           python3 "$project/ApocalypseCI/repair_export.py" "$project" \
             | tee logs/apocalypse-repair.txt
 
@@ -205,7 +210,6 @@ jobs:
           print(f"Apocalypse: updated {total} UnityEvent assembly references.")
 
           check = assets / "Editor" / "ApocalypseCI" / "ApocalypseStartupCheck.cs"
-          check.parent.mkdir(parents=True, exist_ok=True)
           check.write_text("""using System.Collections.Generic;
           using UnityEditor;
           using UnityEditor.Build;
