@@ -1,0 +1,249 @@
+name: Slendytubbies 2026 - build IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      recovery_run_id:
+        description: 'Recovery run ID. Leave blank for the newest recovery artifact.'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build-ipa:
+    runs-on: macos-15
+    timeout-minutes: 100
+    defaults:
+      run:
+        shell: bash
+    env:
+      UNITY_EDITOR_PATH: /Applications/Unity/Unity-6000.4.10f1/Unity.app/Contents/MacOS/Unity
+    steps:
+      - name: Find the recovered project
+        id: recovery
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_RUN_ID: ${{ inputs.recovery_run_id }}
+        run: |
+          mkdir -p logs
+          if [[ -n "$REQUESTED_RUN_ID" ]]; then
+            if [[ ! "$REQUESTED_RUN_ID" =~ ^[0-9]+$ ]]; then
+              echo '::error::Use the numeric run ID from the Actions run URL.'
+              exit 1
+            fi
+            run_id="$REQUESTED_RUN_ID"
+          else
+            run_id="$(gh api --method GET "repos/$GITHUB_REPOSITORY/actions/artifacts" \
+              -f name=st2026-mobile-project -F per_page=100 |
+              jq -r '[.artifacts[] | select(.expired == false and .workflow_run.id != null)]
+                | sort_by(.created_at) | last | .workflow_run.id // empty')"
+          fi
+
+          if [[ -z "$run_id" ]]; then
+            echo '::error::No st2026-mobile-project artifact found. Run the mobile controls workflow first.'
+            exit 1
+          fi
+
+          printf 'run_id=%s\n' "$run_id" >> "$GITHUB_OUTPUT"
+          printf 'Recovery run %s\n' "$run_id" | tee logs/source.txt
+
+      - name: Check Unity account secrets
+        env:
+          UNITY_USERNAME: ${{ secrets.UNITY_USERNAME || secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        run: |
+          if [[ -z "$UNITY_USERNAME" || -z "$UNITY_PASSWORD" ]]; then
+            echo '::error::Set UNITY_USERNAME (or UNITY_EMAIL) and UNITY_PASSWORD in Actions secrets.'
+            exit 1
+          fi
+
+      - name: Install Unity and iOS Build Support
+        timeout-minutes: 35
+        run: |
+          if [[ "$(uname -m)" != arm64 ]]; then
+            echo '::error::This workflow uses the Apple silicon editor.'
+            exit 1
+          fi
+          base=https://download.unity3d.com/download_unity/feeafc12a938
+          editor_pkg="$RUNNER_TEMP/st2026-editor.pkg"
+          ios_pkg="$RUNNER_TEMP/st2026-ios.pkg"
+          curl -fsSL --retry 3 --connect-timeout 20 --max-time 1200 \
+            "$base/MacEditorInstallerArm64/Unity-6000.4.10f1.pkg" -o "$editor_pkg"
+          sudo installer -pkg "$editor_pkg" -target / | tee logs/unity-install.log
+          rm -f "$editor_pkg"
+
+          test -x "$UNITY_EDITOR_PATH"
+          curl -fsSL --retry 3 --connect-timeout 20 --max-time 450 \
+            "$base/MacEditorTargetInstaller/UnitySetup-iOS-Support-for-Editor-6000.4.10f1.pkg" -o "$ios_pkg"
+          sudo installer -pkg "$ios_pkg" -target / | tee -a logs/unity-install.log
+          rm -f "$ios_pkg"
+          test -d /Applications/Unity/Unity-6000.4.10f1/PlaybackEngines/iOSSupport
+          xcodebuild -version | tee logs/xcode-version.txt
+          xcrun --sdk iphoneos --show-sdk-version | tee -a logs/xcode-version.txt
+          df -h . | tee logs/disk.txt
+
+      - name: Download the patched Unity project
+        uses: actions/download-artifact@v4
+        with:
+          name: st2026-mobile-project
+          run-id: ${{ steps.recovery.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: recovered
+
+      - name: Prepare the iOS export
+        run: |
+          tar -xzf recovered/st2026-project.tar.gz
+          test -s ExportedProject/Assets/Scenes/TubbyLand.unity
+          test -s ExportedProject/Assets/Plugins/Assembly-CSharp.dll
+          test -s ExportedProject/Assets/Plugins/ST2026.Mobile.dll
+          test -s ExportedProject/ProjectSettings/EditorBuildSettings.asset
+
+          mkdir -p ExportedProject/Assets/Editor
+          cat > ExportedProject/Assets/Editor/ST2026BuildIOS.cs <<'CSHARP'
+          using System;
+          using System.IO;
+          using System.Linq;
+          using UnityEditor;
+          using UnityEditor.Build;
+          using UnityEditor.Build.Reporting;
+          using UnityEditor.SceneManagement;
+          using UnityEngine;
+
+          internal static class ST2026BuildIOS
+          {
+              public static void Export()
+              {
+                  string[] scenes = EditorBuildSettings.scenes.Where(scene => scene.enabled)
+                      .Select(scene => scene.path).ToArray();
+                  const string gameplayScene = "Assets/Scenes/TubbyLand.unity";
+                  if (!scenes.Contains(gameplayScene) || scenes.Any(path => !File.Exists(path)))
+                      throw new InvalidOperationException("The recovered scene list is incomplete.");
+
+                  var scene = EditorSceneManager.OpenScene(gameplayScene, OpenSceneMode.Single);
+                  foreach (var root in scene.GetRootGameObjects())
+                  {
+                      foreach (var child in root.GetComponentsInChildren<Transform>(true))
+                      {
+                          int missing = GameObjectUtility.GetMonoBehavioursWithMissingScriptCount(child.gameObject);
+                          if (missing > 0)
+                              Debug.LogWarning($"Missing scripts on object '{child.name}': {missing}", child);
+                      }
+                  }
+
+                  var target = NamedBuildTarget.iOS;
+                  PlayerSettings.productName = "Slendytubbies 2026";
+                  PlayerSettings.bundleVersion = "1.3.4";
+                  PlayerSettings.iOS.buildNumber = "1";
+                  PlayerSettings.iOS.targetOSVersionString = "15.0";
+                  PlayerSettings.iOS.sdkVersion = iOSSdkVersion.DeviceSDK;
+                  PlayerSettings.SetApplicationIdentifier(target, "com.fanport.slendytubbies2026");
+                  PlayerSettings.SetScriptingBackend(target, ScriptingImplementation.IL2CPP);
+                  PlayerSettings.SetManagedStrippingLevel(target, ManagedStrippingLevel.Minimal);
+                  PlayerSettings.defaultInterfaceOrientation = UIOrientation.AutoRotation;
+                  PlayerSettings.allowedAutorotateToPortrait = false;
+                  PlayerSettings.allowedAutorotateToPortraitUpsideDown = false;
+                  PlayerSettings.allowedAutorotateToLandscapeLeft = true;
+                  PlayerSettings.allowedAutorotateToLandscapeRight = true;
+
+                  string destination = Environment.GetEnvironmentVariable("ST2026_XCODE_PATH");
+                  var report = BuildPipeline.BuildPlayer(new BuildPlayerOptions
+                  {
+                      scenes = scenes,
+                      target = BuildTarget.iOS,
+                      locationPathName = destination,
+                      options = BuildOptions.None
+                  });
+                  if (report.summary.result != BuildResult.Succeeded)
+                      throw new InvalidOperationException($"iOS export failed: {report.summary.result}.");
+                  Debug.Log($"iOS export succeeded with {scenes.Length} original scenes.");
+              }
+          }
+          CSHARP
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Activate Unity Personal
+        id: activate
+        timeout-minutes: 8
+        env:
+          UNITY_USERNAME: ${{ secrets.UNITY_USERNAME || secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        run: |
+          npm install --global @rage-against-the-pixel/unity-cli@4.2.2
+          unity-cli activate-license --license personal
+
+      - name: Export the Xcode project
+        timeout-minutes: 35
+        run: |
+          export ST2026_XCODE_PATH="$PWD/ios-export"
+          log="$PWD/logs/unity-ios.log"
+          if ! "$UNITY_EDITOR_PATH" -batchmode -nographics -quit -buildTarget iOS \
+            -projectPath "$PWD/ExportedProject" -executeMethod ST2026BuildIOS.Export -logFile "$log"; then
+            tail -n 120 "$log" || true
+            exit 1
+          fi
+          test -s ios-export/Unity-iPhone.xcodeproj/project.pbxproj
+
+      - name: Build for iPhone
+        timeout-minutes: 45
+        run: |
+          if ! xcodebuild \
+            -project ios-export/Unity-iPhone.xcodeproj \
+            -scheme Unity-iPhone -configuration Release -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$PWD/derived" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build \
+            > logs/xcodebuild.log 2>&1; then
+            tail -n 120 logs/xcodebuild.log
+            exit 1
+          fi
+
+      - name: Package and verify the IPA
+        id: package
+        run: |
+          shopt -s nullglob
+          apps=("$PWD"/derived/Build/Products/Release-iphoneos/*.app)
+          if [[ "${#apps[@]}" -ne 1 ]]; then
+            echo '::error::Expected one device application from Xcode.'
+            exit 1
+          fi
+
+          app="${apps[0]}"
+          executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Info.plist")
+          test -f "$app/$executable"
+          xcrun lipo -verify_arch arm64 "$app/$executable"
+          test -d "$app/Frameworks/UnityFramework.framework"
+
+          mkdir -p package/Payload output
+          ditto "$app" package/Payload/Slendytubbies2026.app
+          ipa="$PWD/output/Slendytubbies-2026.ipa"
+          ditto -c -k --norsrc --keepParent package/Payload "$ipa"
+          unzip -tq "$ipa"
+          shasum -a 256 "$ipa" | tee logs/ipa-sha256.txt
+
+      - name: Upload the IPA
+        if: always() && steps.package.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Slendytubbies-2026-IPA
+          path: output/Slendytubbies-2026.ipa
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Return the Unity license
+        if: always() && steps.activate.outcome == 'success'
+        timeout-minutes: 5
+        run: unity-cli return-license --license personal --when auto
+
+      - name: Upload Unity and Xcode logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: st2026-ipa-logs
+          path: logs/
+          if-no-files-found: warn
