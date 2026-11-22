@@ -1,4 +1,4 @@
-name: Apocalypse DLC Reboot 1.03 - iPhone save fix
+name: Apocalypse DLC Reboot 1.03 - iPhone save overlay fix
 
 'on':
   workflow_dispatch:
@@ -278,9 +278,14 @@ jobs:
 
               private IEnumerator CheckFade()
               {
+                  var restoredScene = SceneManager.GetActiveScene();
                   yield return new WaitForSecondsRealtime(0.5f);
+                  if (loading || restoredScene.handle != SceneManager.GetActiveScene().handle)
+                      yield break;
+
+                  RevealScenePanel(restoredScene);
                   var camera = KickStarter.mainCamera;
-                  if (loading || camera == null || KickStarter.stateHandler == null)
+                  if (camera == null || KickStarter.stateHandler == null)
                       yield break;
 
                   float alpha = camera.GetFadeAlpha();
@@ -289,6 +294,36 @@ jobs:
                   {
                       camera.FadeIn(0f, false);
                       Record("Removed fully opaque camera fade after load.");
+                  }
+              }
+
+              private void RevealScenePanel(UnityEngine.SceneManagement.Scene scene)
+              {
+                  // The normal scene intro plays this fade. AC skips that intro after a save load.
+                  foreach (var root in scene.GetRootGameObjects())
+                  {
+                      foreach (var animator in root.GetComponentsInChildren<Animator>())
+                      {
+                          var controller = animator.runtimeAnimatorController;
+                          var image = animator.GetComponent<UnityEngine.UI.Image>();
+                          if (controller == null || controller.name != "Panel" ||
+                              animator.name != "Panel" || !animator.isActiveAndEnabled ||
+                              image == null || !image.isActiveAndEnabled ||
+                              !animator.GetCurrentAnimatorStateInfo(0).IsName("Base Layer.New State"))
+                              continue;
+
+                          Color color = image.color;
+                          var rect = image.rectTransform;
+                          if (color.a < 0.99f || color.r != 0f || color.g != 0f || color.b != 0f ||
+                              rect.anchorMin != Vector2.zero || rect.anchorMax != Vector2.one)
+                              continue;
+
+                          animator.SetBool("FadeOut", true);
+                          animator.Play("Base Layer.FadeOut", 0, 1f);
+                          animator.Update(0f);
+                          image.enabled = false;
+                          Record("Dismissed original full-screen scene panel after load in " + scene.name);
+                      }
                   }
               }
 
@@ -554,15 +589,15 @@ jobs:
           stage="$(mktemp -d "$RUNNER_TEMP/apocalypse-ipa.XXXXXX")"
           mkdir -p dist "$stage/Payload"
           ditto "$app" "$stage/Payload/$(basename "$app")"
-          output="$PWD/dist/Apocalypse-Reboot-1.03-SaveFix.ipa"
+          output="$PWD/dist/Apocalypse-Reboot-1.03-SaveOverlayFix.ipa"
           ditto -c -k --norsrc --keepParent "$stage/Payload" "$output"
           unzip -tq "$output"
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: Apocalypse-Reboot-1.03-SaveFix-IPA
-          path: dist/Apocalypse-Reboot-1.03-SaveFix.ipa
+          name: Apocalypse-Reboot-1.03-SaveOverlayFix-IPA
+          path: dist/Apocalypse-Reboot-1.03-SaveOverlayFix.ipa
           if-no-files-found: error
           compression-level: 0
 
