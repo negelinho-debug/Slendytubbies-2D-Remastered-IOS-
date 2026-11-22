@@ -1,4 +1,4 @@
-name: Apocalypse DLC Reboot 1.03 - iPhone with saves
+name: Apocalypse DLC Reboot 1.03 - iPhone save fix
 
 'on':
   workflow_dispatch:
@@ -181,6 +181,188 @@ jobs:
           print("Apocalypse: enabled the original Save and Load buttons.")
           PY
 
+      - name: Fix save restoration on iPhone
+        shell: bash
+        run: |
+          project="$GITHUB_WORKSPACE/export/ExportedProject"
+          python3 - "$project" <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          assets = Path(sys.argv[1]) / "Assets"
+          settings = assets / "MonoBehaviour" / (
+              "Slendytubbies 3 The Apocalypse DLC Reboot_SettingsManager.asset"
+          )
+          source = settings.read_text(encoding="utf-8")
+          source, count = re.subn(
+              r"(?m)^  reloadSceneWhenLoading: [01]$",
+              "  reloadSceneWhenLoading: 1",
+              source,
+          )
+          if count != 1:
+              raise SystemExit("Expected exactly one Adventure Creator reload setting.")
+          settings.write_text(source, encoding="utf-8")
+          PY
+
+          cat > "$project/Assets/ApocalypseLocale/ApocalypseSaveFix.cs" <<'CS'
+          using System;
+          using System.Collections;
+          using System.Collections.Generic;
+          using System.IO;
+          using AC;
+          using UnityEngine;
+          using SceneManager = UnityEngine.SceneManagement.SceneManager;
+
+          public sealed class ApocalypseSaveFix : MonoBehaviour
+          {
+              private string logPath;
+              private bool loading;
+
+              [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
+              private static void Install()
+              {
+                  if (Application.platform != RuntimePlatform.IPhonePlayer)
+                      return;
+
+                  iFileFormatHandler original = SaveSystem.FileFormatHandler;
+                  SaveSystem.FileFormatHandler = new IosSaveFormat(original);
+
+                  var root = new GameObject("Apocalypse save support");
+                  DontDestroyOnLoad(root);
+                  root.AddComponent<ApocalypseSaveFix>();
+              }
+
+              private void OnEnable()
+              {
+                  logPath = Path.Combine(Application.persistentDataPath, "apocalypse-save-load.txt");
+                  EventManager.OnFinishSaving += FinishSave;
+                  EventManager.OnBeforeLoading += BeginLoad;
+                  EventManager.OnFinishLoading += FinishLoad;
+                  EventManager.OnFailLoading += FailLoad;
+                  Application.logMessageReceived += RecordUnityError;
+              }
+
+              private void OnDisable()
+              {
+                  EventManager.OnFinishSaving -= FinishSave;
+                  EventManager.OnBeforeLoading -= BeginLoad;
+                  EventManager.OnFinishLoading -= FinishLoad;
+                  EventManager.OnFailLoading -= FailLoad;
+                  Application.logMessageReceived -= RecordUnityError;
+              }
+
+              private void FinishSave(SaveFile file)
+              {
+                  Record("Saved slot " + file.saveID + " in " + SceneManager.GetActiveScene().name);
+              }
+
+              private void BeginLoad(SaveFile file)
+              {
+                  loading = true;
+                  Record("Loading slot " + file.saveID + " from " + SceneManager.GetActiveScene().name);
+              }
+
+              private void FinishLoad()
+              {
+                  loading = false;
+                  Record("Save restored in " + SceneManager.GetActiveScene().name);
+                  StartCoroutine(CheckFade());
+              }
+
+              private void FailLoad(int slot)
+              {
+                  loading = false;
+                  Record("Adventure Creator could not read slot " + slot);
+              }
+
+              private IEnumerator CheckFade()
+              {
+                  yield return new WaitForSecondsRealtime(0.5f);
+                  var camera = KickStarter.mainCamera;
+                  if (loading || camera == null || KickStarter.stateHandler == null)
+                      yield break;
+
+                  float alpha = camera.GetFadeAlpha();
+                  Record("Camera fade after load: " + alpha);
+                  if (alpha >= 0.99f && KickStarter.stateHandler.IsInGameplay())
+                  {
+                      camera.FadeIn(0f, false);
+                      Record("Removed fully opaque camera fade after load.");
+                  }
+              }
+
+              private void RecordUnityError(string message, string stack, LogType type)
+              {
+                  if (loading && (type == LogType.Error || type == LogType.Exception || type == LogType.Assert))
+                      Record(message + Environment.NewLine + stack);
+              }
+
+              private void Record(string message)
+              {
+                  try
+                  {
+                      File.AppendAllText(logPath, DateTime.UtcNow.ToString("o") + " " + message + Environment.NewLine);
+                  }
+                  catch (IOException) { }
+                  catch (UnauthorizedAccessException) { }
+              }
+
+              private sealed class IosSaveFormat : iFileFormatHandler
+              {
+                  private readonly iFileFormatHandler legacy;
+                  private readonly FileFormatHandler_Json json = new FileFormatHandler_Json();
+
+                  internal IosSaveFormat(iFileFormatHandler legacy)
+                  {
+                      this.legacy = legacy;
+                  }
+
+                  public string GetSaveMethod() => json.GetSaveMethod();
+                  public string GetSaveExtension() => legacy.GetSaveExtension();
+                  public string SerializeObject<T>(object data) => json.SerializeObject<T>(data);
+                  public string SerializeAllRoomData(List<SingleLevelData> rooms) => json.SerializeAllRoomData(rooms);
+
+                  public T DeserializeObject<T>(string data)
+                  {
+                      return IsJson(data) ? json.DeserializeObject<T>(StripMethod(data, json))
+                                          : legacy.DeserializeObject<T>(StripMethod(data, legacy));
+                  }
+
+                  public List<SingleLevelData> DeserializeAllRoomData(string data)
+                  {
+                      if (string.IsNullOrEmpty(data))
+                          return new List<SingleLevelData>();
+
+                      return IsJson(data) ? json.DeserializeAllRoomData(StripMethod(data, json))
+                                          : legacy.DeserializeAllRoomData(StripMethod(data, legacy));
+                  }
+
+                  public T LoadScriptData<T>(string data) where T : RememberData
+                  {
+                      if (string.IsNullOrEmpty(data))
+                          return null;
+
+                      return IsJson(data) ? json.LoadScriptData<T>(StripMethod(data, json))
+                                          : legacy.LoadScriptData<T>(StripMethod(data, legacy));
+                  }
+
+                  private bool IsJson(string data)
+                  {
+                      return !string.IsNullOrEmpty(data) &&
+                          (data[0] == '{' || data[0] == '[' || data.StartsWith(json.GetSaveMethod(), StringComparison.Ordinal));
+                  }
+
+                  private static string StripMethod(string data, iFileFormatHandler format)
+                  {
+                      string marker = format.GetSaveMethod();
+                      return data != null && data.StartsWith(marker, StringComparison.Ordinal)
+                          ? data.Substring(marker.Length) : data;
+                  }
+              }
+          }
+          CS
+
       - name: Fix the original startup scripts
         shell: bash
         run: |
@@ -360,18 +542,27 @@ jobs:
           exe="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Info.plist")"
           lipo "$app/$exe" -verify_arch arm64
 
+          plist="$app/Info.plist"
+          for key in UIFileSharingEnabled LSSupportsOpeningDocumentsInPlace; do
+            if /usr/libexec/PlistBuddy -c "Print :$key" "$plist" >/dev/null 2>&1; then
+              /usr/libexec/PlistBuddy -c "Set :$key true" "$plist"
+            else
+              /usr/libexec/PlistBuddy -c "Add :$key bool true" "$plist"
+            fi
+          done
+
           stage="$(mktemp -d "$RUNNER_TEMP/apocalypse-ipa.XXXXXX")"
           mkdir -p dist "$stage/Payload"
           ditto "$app" "$stage/Payload/$(basename "$app")"
-          output="$PWD/dist/Apocalypse-Reboot-1.03-Saves.ipa"
+          output="$PWD/dist/Apocalypse-Reboot-1.03-SaveFix.ipa"
           ditto -c -k --norsrc --keepParent "$stage/Payload" "$output"
           unzip -tq "$output"
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: Apocalypse-Reboot-1.03-Saves-IPA
-          path: dist/Apocalypse-Reboot-1.03-Saves.ipa
+          name: Apocalypse-Reboot-1.03-SaveFix-IPA
+          path: dist/Apocalypse-Reboot-1.03-SaveFix.ipa
           if-no-files-found: error
           compression-level: 0
 
