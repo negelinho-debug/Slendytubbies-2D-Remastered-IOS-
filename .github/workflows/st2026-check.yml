@@ -779,6 +779,7 @@ jobs:
 
       - name: Install Unity 6000.4.10f1
         timeout-minutes: 25
+        shell: bash
         run: |
           if [[ "$(uname -m)" != arm64 ]]; then
             echo '::error::This workflow uses the ARM64 Unity editor installer.'
@@ -787,8 +788,30 @@ jobs:
           curl -fsSL --retry 3 --connect-timeout 20 --max-time 900 \
             'https://download.unity3d.com/download_unity/feeafc12a938/MacEditorInstallerArm64/Unity-6000.4.10f1.pkg' \
             -o "$RUNNER_TEMP/st2026-unity.pkg"
-          sudo installer -pkg "$RUNNER_TEMP/st2026-unity.pkg" -target /
-          test -x "$UNITY_EDITOR"
+          sudo installer -pkg "$RUNNER_TEMP/st2026-unity.pkg" -target / | tee output/unity-install.log
+
+          editor=""
+          for app in \
+            "/Applications/Unity/Unity-6000.4.10f1/Unity.app" \
+            "/Applications/Unity-6000.4.10f1/Unity.app" \
+            "/Applications/Unity/Unity.app"; do
+            candidate="$app/Contents/MacOS/Unity"
+            [[ -x "$candidate" ]] || continue
+            version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist" 2>/dev/null || true)
+            if [[ "$version" == "6000.4.10f1" ]]; then
+              editor="$candidate"
+              break
+            fi
+          done
+
+          if [[ -z "$editor" ]]; then
+            echo '::error::Installed Unity 6000.4.10f1 could not be located.'
+            find /Applications -name Unity.app -prune -print | tee -a output/unity-install.log
+            exit 1
+          fi
+
+          printf 'Unity editor: %s\n' "$editor" | tee -a output/unity-install.log
+          printf 'UNITY_EDITOR=%s\nUNITY_EDITOR_PATH=%s\n' "$editor" "$editor" >> "$GITHUB_ENV"
           rm -f "$RUNNER_TEMP/st2026-unity.pkg"
 
       - name: Activate Unity Personal
