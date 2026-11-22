@@ -1,0 +1,834 @@
+name: Slendytubbies 2026 - mobile controls check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download the author's Windows build
+        shell: bash
+        run: |
+          mkdir -p windows ripper output
+          download_url="$(curl -fsS --retry 3 --max-time 30 \
+            -H 'Content-Type: application/json' \
+            -H 'Origin: https://gamejolt.com' \
+            --data '{"forceDownload":true}' \
+            'https://gamejolt.com/site-api/web/discover/games/builds/get-download-url/2047794' \
+            | jq -er '.payload.url')"
+          curl -fsSL --retry 3 --connect-timeout 15 --max-time 300 \
+            "$download_url" -o source.rar
+          echo '98d2d1e682d0c2a80c39e4800e67140441e886e2b64917ad905198e5948bab41  source.rar' | sha256sum -c -
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libarchive-tools
+          bsdtar -xf source.rar -C windows
+          test -s 'windows/Slendytubbies 2026 1.3.4.1/Slendytubbies_Data/Managed/Assembly-CSharp.dll'
+
+      - name: Recover the original Unity scenes and assemblies
+        shell: bash
+        run: |
+          curl -fsSL --retry 3 --connect-timeout 15 --max-time 120 \
+            'https://github.com/AssetRipper/AssetRipper/releases/download/2.0.0/AssetRipper_linux_x64.tar.xz' \
+            -o ripper.tar.xz
+          echo '6f5d4352d36795b944243eb3ec790ec37dbca6d6756e52605bc8616e042d384e  ripper.tar.xz' | sha256sum -c -
+          tar -xJf ripper.tar.xz -C ripper
+          ./ripper/AssetRipper.GUI.Free --headless --port 18926 >output/recovery.log 2>&1 &
+          ripper_pid=$!
+          trap 'kill "$ripper_pid" 2>/dev/null || true' EXIT
+          api=http://127.0.0.1:18926
+          curl -fsS --retry 20 --retry-connrefused --retry-delay 1 "$api/Settings/Edit" -o /dev/null
+          curl -fsS --max-time 30 -d 'ScriptExportMode=DllExportWithRenaming&ScriptContentLevel=Level2' \
+            "$api/Settings/Update" -o /dev/null
+          curl -fsS --max-time 180 --data-urlencode "Path=$PWD/windows/Slendytubbies 2026 1.3.4.1" \
+            "$api/LoadFolder" -o /dev/null
+          curl -fsS --max-time 360 --data-urlencode "Path=$PWD/recovered" \
+            "$api/Export/UnityProject" -o /dev/null
+          test -s recovered/ExportedProject/Assets/Scenes/TubbyLand.unity
+          test -s recovered/ExportedProject/Assets/Plugins/Assembly-CSharp.dll
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Connect mobile controls to the original scripts
+        shell: bash
+        run: |
+          mkdir -p mobile/build/runtime mobile/build/patcher mobile/cecil
+          cat > mobile/ST2026Mobile.cs <<'ST2026_FILE_0'
+          using System;
+          using UnityEngine;
+          using UnityEngine.SceneManagement;
+
+          [assembly: UnityEngine.Scripting.AlwaysLinkAssembly]
+
+          namespace ST2026
+          {
+              [DefaultExecutionOrder(-32000)]
+              public sealed class MobileInput : MonoBehaviour
+              {
+                  private enum Control { None, Move, Look, Run, Crouch, Flashlight, Map, Camera, Jump, Pause, Continue, Language }
+
+                  private static MobileInput current;
+                  private Vector2 move, look;
+                  private int moveFinger = -1, lookFinger = -1, runFinger = -1;
+                  private bool crouching, showingMap, thirdPerson;
+                  private bool jumpPressed, lightPressed, cameraPressed, pausePressed;
+                  private bool gameplay, victory;
+                  private GameLocale locale;
+                  private GUIStyle label;
+                  private Rect safe;
+                  private float scale;
+                  private readonly Control[] buttons = {
+                      Control.Crouch, Control.Jump, Control.Run, Control.Map, Control.Flashlight,
+                      Control.Camera, Control.Pause, Control.Continue, Control.Language
+                  };
+
+                  [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
+                  private static void Install()
+                  {
+                      if (!Application.isMobilePlatform && !Array.Exists(
+                          Environment.GetCommandLineArgs(), arg => arg == "-st2026-touch"))
+                          return;
+                      var root = new GameObject("ST2026 Mobile Controls");
+                      DontDestroyOnLoad(root);
+                      root.AddComponent<MobileInput>();
+                  }
+
+                  private void Awake()
+                  {
+                      current = this;
+                      locale = new GameLocale();
+                      SceneManager.sceneLoaded += SceneLoaded;
+                  }
+
+                  private void OnDestroy()
+                  {
+                      SceneManager.sceneLoaded -= SceneLoaded;
+                      if (current == this) current = null;
+                  }
+
+                  private void SceneLoaded(Scene scene, LoadSceneMode mode)
+                  {
+                      gameplay = scene.name == "TubbyLand" || scene.name == "Dusk" || scene.name == "Night" ||
+                          scene.name == "TubbyLandRemake" || scene.name == "DuskRemake" || scene.name == "NightRemake";
+                      victory = scene.name == "End";
+                      crouching = showingMap = thirdPerson = false;
+                      ClearFingers();
+                      locale.Track(scene);
+                  }
+
+                  private void ClearFingers()
+                  {
+                      moveFinger = lookFinger = runFinger = -1;
+                      move = look = Vector2.zero;
+                  }
+
+                  private void OnApplicationPause(bool paused)
+                  {
+                      if (paused) ClearFingers();
+                  }
+
+                  private void Layout()
+                  {
+                      Rect bounds = Screen.safeArea;
+                      safe = new Rect(bounds.x, Screen.height - bounds.yMax, bounds.width, bounds.height);
+                      scale = Mathf.Min(safe.height / 540f, safe.width / 870f);
+                  }
+
+                  private Rect Position(float x, float y, float width, float height)
+                  {
+                      return new Rect(safe.x + x * scale, safe.y + y * scale, width * scale, height * scale);
+                  }
+
+                  private Rect Bounds(Control control)
+                  {
+                      float right = safe.width / scale, bottom = safe.height / scale;
+                      switch (control)
+                      {
+                          case Control.Move: return Position(22, bottom - 160, 132, 132);
+                          case Control.Crouch: return Position(right - 310, bottom - 64, 96, 44);
+                          case Control.Jump: return Position(right - 208, bottom - 64, 96, 44);
+                          case Control.Run: return Position(right - 106, bottom - 64, 86, 44);
+                          case Control.Map: return Position(right - 310, bottom - 114, 96, 44);
+                          case Control.Flashlight: return Position(right - 208, bottom - 114, 96, 44);
+                          case Control.Camera: return Position(right - 106, bottom - 114, 86, 44);
+                          case Control.Pause: return Position(right - 63, 12, 47, 40);
+                          case Control.Continue: return Position(right / 2 - 100, bottom - 85, 200, 48);
+                          case Control.Language: return Position(16, 12, 66, 40);
+                          default: return Rect.zero;
+                      }
+                  }
+
+                  private void Update()
+                  {
+                      Layout();
+                      jumpPressed = lightPressed = cameraPressed = pausePressed = false;
+                      look = Vector2.zero;
+                      bool paused = Time.timeScale == 0f;
+                      if (paused) ClearFingers();
+                      for (int i = 0; i < Input.touchCount; i++) ReadTouch(Input.GetTouch(i), paused);
+                      locale.Refresh();
+                  }
+
+                  private void ReadTouch(Touch touch, bool paused)
+                  {
+                      int id = touch.fingerId;
+                      Vector2 point = new Vector2(touch.position.x, Screen.height - touch.position.y);
+                      if (touch.phase == TouchPhase.Ended || touch.phase == TouchPhase.Canceled)
+                      {
+                          if (id == moveFinger) { moveFinger = -1; move = Vector2.zero; }
+                          if (id == lookFinger) lookFinger = -1;
+                          if (id == runFinger) runFinger = -1;
+                          return;
+                      }
+
+                      if (touch.phase == TouchPhase.Began)
+                      {
+                          foreach (Control button in buttons)
+                          {
+                              if (Visible(button, paused) && Bounds(button).Contains(point))
+                              {
+                                  Press(button, id);
+                                  return;
+                              }
+                          }
+
+                          if (gameplay && !paused && !showingMap)
+                          {
+                              if (moveFinger < 0 && Bounds(Control.Move).Contains(point)) moveFinger = id;
+                              else if (lookFinger < 0 && point.x >= safe.center.x) lookFinger = id;
+                          }
+                      }
+
+                      if (id == moveFinger)
+                      {
+                          Rect area = Bounds(Control.Move);
+                          Vector2 offset = point - area.center;
+                          move = Vector2.ClampMagnitude(new Vector2(offset.x, -offset.y) / (area.width * .42f), 1f);
+                          if (move.sqrMagnitude < .08f * .08f) move = Vector2.zero;
+                      }
+                      else if (id == lookFinger && touch.phase == TouchPhase.Moved)
+                      {
+                          // The original look controllers multiply the axis by sensitivity and deltaTime.
+                          look += touch.deltaPosition * (.0032f / (scale * Mathf.Max(Time.unscaledDeltaTime, .001f)));
+                      }
+                  }
+
+                  private bool Visible(Control control, bool paused)
+                  {
+                      if (control == Control.Language) return !gameplay || paused;
+                      if (control == Control.Continue) return victory;
+                      if (!gameplay) return false;
+                      if (control == Control.Pause) return true;
+                      return !paused && (!showingMap || control == Control.Map);
+                  }
+
+                  private void Press(Control control, int finger)
+                  {
+                      switch (control)
+                      {
+                          case Control.Language: locale.Next(); break;
+                          case Control.Run: if (runFinger < 0) runFinger = finger; break;
+                          case Control.Crouch: crouching = !crouching; break;
+                          case Control.Map: showingMap = !showingMap; ClearFingers(); break;
+                          case Control.Camera: thirdPerson = !thirdPerson; cameraPressed = true; break;
+                          case Control.Flashlight: lightPressed = true; break;
+                          case Control.Continue:
+                          case Control.Jump: jumpPressed = true; break;
+                          case Control.Pause: pausePressed = true; ClearFingers(); break;
+                      }
+                  }
+
+                  private void OnGUI()
+                  {
+                      if (Event.current.type != EventType.Repaint) return;
+                      Layout();
+                      if (scale <= 0f) return;
+                      if (label == null)
+                      {
+                          label = new GUIStyle(GUI.skin.label) { alignment = TextAnchor.MiddleCenter, font = locale.Font };
+                          label.normal.textColor = Color.white;
+                      }
+
+                      GUI.depth = -100;
+                      bool paused = Time.timeScale == 0f;
+                      if (gameplay && !paused && !showingMap)
+                      {
+                          Rect area = Bounds(Control.Move);
+                          Fill(area, new Color(.05f, .06f, .07f, .56f));
+                          float size = 44 * scale;
+                          Vector2 center = area.center + new Vector2(move.x, -move.y) * (area.width * .30f);
+                          Fill(new Rect(center.x - size / 2, center.y - size / 2, size, size),
+                              new Color(.86f, .91f, .93f, .80f));
+                      }
+
+                      foreach (Control button in buttons)
+                      {
+                          if (!Visible(button, paused)) continue;
+                          bool selected = button == Control.Crouch && crouching || button == Control.Map && showingMap ||
+                              button == Control.Camera && thirdPerson || button == Control.Run && runFinger >= 0;
+                          Rect bounds = Bounds(button);
+                          Fill(bounds, selected ? new Color(.14f, .32f, .36f, .92f) : new Color(.06f, .08f, .10f, .8f));
+                          label.fontSize = Mathf.Max(11, Mathf.RoundToInt(16 * scale));
+                          GUI.Label(bounds, locale.Button(button.ToString(), thirdPerson, showingMap), label);
+                      }
+                  }
+
+                  private static void Fill(Rect area, Color color)
+                  {
+                      Color previous = GUI.color;
+                      GUI.color = color;
+                      GUI.DrawTexture(area, Texture2D.whiteTexture);
+                      GUI.color = previous;
+                  }
+
+                  private static bool AcceptInput => current != null && current.gameplay && Time.timeScale != 0f;
+
+                  public static float GetAxis(string axis) => ReadAxis(axis, false);
+                  public static float GetAxisRaw(string axis) => ReadAxis(axis, true);
+
+                  private static float ReadAxis(string axis, bool raw)
+                  {
+                      if (AcceptInput)
+                      {
+                          switch (axis)
+                          {
+                              case "Horizontal": if (current.moveFinger >= 0) return current.move.x; break;
+                              case "Vertical": if (current.moveFinger >= 0) return current.move.y; break;
+                              case "Mouse X": return current.look.x;
+                              case "Mouse Y": return current.look.y;
+                          }
+                      }
+                      return raw ? Input.GetAxisRaw(axis) : Input.GetAxis(axis);
+                  }
+
+                  public static bool GetKey(KeyCode key)
+                  {
+                      if (AcceptInput)
+                      {
+                          switch (key)
+                          {
+                              case KeyCode.LeftShift: if (current.runFinger >= 0) return true; break;
+                              case KeyCode.LeftControl: if (current.crouching) return true; break;
+                              case KeyCode.M: if (current.showingMap) return true; break;
+                              case KeyCode.W: if (current.move.y > .1f) return true; break;
+                              case KeyCode.S: if (current.move.y < -.1f) return true; break;
+                              case KeyCode.D: if (current.move.x > .1f) return true; break;
+                              case KeyCode.A: if (current.move.x < -.1f) return true; break;
+                          }
+                      }
+                      return Input.GetKey(key);
+                  }
+
+                  public static bool GetKeyDown(KeyCode key)
+                  {
+                      if (current != null && current.gameplay && key == KeyCode.Escape && current.pausePressed)
+                          return true;
+                      if (current != null && current.victory && key == KeyCode.Space && current.jumpPressed)
+                          return true;
+                      if (AcceptInput)
+                      {
+                          switch (key)
+                          {
+                              case KeyCode.Space: if (current.jumpPressed) return true; break;
+                              case KeyCode.F: if (current.lightPressed) return true; break;
+                              case KeyCode.V: if (current.cameraPressed) return true; break;
+                          }
+                      }
+                      return Input.GetKeyDown(key);
+                  }
+              }
+          }
+          ST2026_FILE_0
+          cat > mobile/ST2026Locale.cs <<'ST2026_FILE_1'
+          using System;
+          using System.Collections.Generic;
+          using System.Text.RegularExpressions;
+          using TMPro;
+          using UnityEngine;
+          using UnityEngine.SceneManagement;
+          using UnityEngine.UI;
+
+          namespace ST2026
+          {
+              internal sealed class GameLocale
+              {
+                  private sealed class TextLabel
+                  {
+                      public Func<string> Read;
+                      public Action<string> Write;
+                      public string Original;
+                      public string Last;
+                  }
+
+                  private static readonly Regex Whitespace = new Regex(@"\s+");
+                  private static readonly Regex Collected = new Regex(
+                      @"^A player(?: as)? \(\s*(.+?)\s*\) (?:as )?Collected (\d+)\s*/\s*(\d+) Teletubby custard$|^(.+?) As collected (\d+) of (\d+) Teletubbie custards$",
+                      RegexOptions.IgnoreCase);
+
+                  private static readonly Dictionary<string, string[]> Texts =
+                      new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
+                  {
+                      ["Play"] = new[] { "Играть", "Грати" },
+                      ["Play Collect"] = new[] { "Сбор заварного крема", "Збір заварного крему" },
+                      ["Play Other Game modes"] = new[] { "Другие режимы", "Інші режими" },
+                      ["Collect"] = new[] { "Сбор", "Збір" },
+                      ["Classics"] = new[] { "Классика", "Класика" },
+                      ["Remastered"] = new[] { "Ремастер", "Ремастер" },
+                      ["Please select a game mode to start playing."] = new[] { "Выберите режим игры.", "Виберіть режим гри." },
+                      ["Please select a name for your player"] = new[] { "Введите имя игрока", "Введіть ім’я гравця" },
+                      ["Enter text..."] = new[] { "Введите текст…", "Введіть текст…" },
+                      ["Graphics settings"] = new[] { "Настройки графики", "Налаштування графіки" },
+                      ["Settings"] = new[] { "Настройки", "Налаштування" },
+                      ["Options"] = new[] { "Параметры", "Параметри" },
+                      ["Exclusive Full Screen"] = new[] { "Эксклюзивный полный экран", "Ексклюзивний повний екран" },
+                      ["Full Screen"] = new[] { "Полный экран", "Повний екран" },
+                      ["Windoned"] = new[] { "В окне", "У вікні" },
+                      ["Screen resolution"] = new[] { "Разрешение экрана", "Роздільна здатність екрана" },
+                      ["Screen Side"] = new[] { "Режим экрана", "Режим екрана" },
+                      ["Music"] = new[] { "Музыка", "Музика" },
+                      ["Help"] = new[] { "Помощь", "Допомога" },
+                      ["Singleplayer"] = new[] { "Одиночная игра", "Одиночна гра" },
+                      ["Multiplayer"] = new[] { "Мультиплеер", "Мультиплеєр" },
+                      ["Rooms :"] = new[] { "Комнаты", "Кімнати" },
+                      ["Join"] = new[] { "Присоединиться", "Приєднатися" },
+                      ["Credits"] = new[] { "Авторы", "Автори" },
+                      ["Fangame Made by ManyRaccoon"] = new[] { "Фан-игра от ManyRaccoon", "Фан-гра від ManyRaccoon" },
+                      ["Original game by Zeoworks"] = new[] { "Оригинальная игра от ZeoWorks", "Оригінальна гра від ZeoWorks" },
+                      ["Presents"] = new[] { "Представляет", "Представляє" },
+                      ["Option A"] = new[] { "Вариант A", "Варіант A" },
+                      ["Back"] = new[] { "Назад", "Назад" },
+                      ["Exit"] = new[] { "Выход", "Вихід" },
+                      ["Quit"] = new[] { "Выйти", "Вийти" },
+                      ["Accept"] = new[] { "Принять", "Прийняти" },
+                      ["Resume"] = new[] { "Продолжить", "Продовжити" },
+                      ["Leave game"] = new[] { "Выйти из игры", "Вийти з гри" },
+                      ["Press esc to resume game"] = new[] { "Нажмите паузу, чтобы продолжить", "Натисніть паузу, щоб продовжити" },
+                      ["Allies:"] = new[] { "Союзники:", "Союзники:" },
+                      ["Enemys :"] = new[] { "Враги:", "Вороги:" },
+                      ["Collect all 10 Teletubby custards"] = new[] { "Соберите все 10 порций крема", "Зберіть усі 10 порцій крему" },
+                      ["Collect all 10 teletubbie custards"] = new[] { "Соберите все 10 порций крема", "Зберіть усі 10 порцій крему" },
+                      ["A Helpless victim has joined to the game"] = new[] { "К игре присоединился новый игрок", "До гри приєднався новий гравець" },
+                      ["What are you doing here?"] = new[] { "Что ты здесь делаешь?", "Що ти тут робиш?" },
+                      ["YOU WON!!"] = new[] { "Ты победил!", "Ти переміг!" },
+                      ["You got all 10 Tubby custards and escaped from Tinky Winky, you were very lucky!"] =
+                          new[] { "Ты собрал все 10 порций крема и сбежал от Тинки-Винки!", "Ти зібрав усі 10 порцій крему й утік від Тінкі-Вінкі!" }
+                  };
+
+                  private readonly List<TextLabel> labels = new List<TextLabel>();
+                  private readonly List<TMP_Dropdown> dropdowns = new List<TMP_Dropdown>();
+                  private readonly Dictionary<TMP_Dropdown.OptionData, string> originalOptions =
+                      new Dictionary<TMP_Dropdown.OptionData, string>();
+                  private readonly TMP_FontAsset fallback;
+                  private int language;
+                  private float refreshAt;
+                  public Font Font { get; }
+
+                  public GameLocale()
+                  {
+                      language = Mathf.Clamp(PlayerPrefs.GetInt("ST2026.language", 0), 0, 2);
+                      Font = Resources.Load<Font>("Jura-Medium");
+                      if (Font != null) fallback = TMP_FontAsset.CreateFontAsset(Font);
+                  }
+
+                  public string Button(string control, bool thirdPerson, bool map)
+                  {
+                      switch (control)
+                      {
+                          case "Language": return Choose("EN", "РУС", "УКР");
+                          case "Crouch": return Choose("Crouch", "Присесть", "Присісти");
+                          case "Run": return Choose("Run", "Бег", "Біг");
+                          case "Flashlight": return Choose("Light", "Фонарик", "Ліхтарик");
+                          case "Jump": return Choose("Jump", "Прыжок", "Стрибок");
+                          case "Map": return map ? Choose("Close", "Закрыть", "Закрити") : Choose("Map", "Карта", "Мапа");
+                          case "Camera": return thirdPerson ? Choose("1st person", "1-е лицо", "1-ша особа") : Choose("3rd person", "3-е лицо", "3-тя особа");
+                          case "Pause": return "II";
+                          case "Continue": return Choose("Continue", "Продолжить", "Продовжити");
+                          default: return "";
+                      }
+                  }
+
+                  private string Choose(string english, string russian, string ukrainian)
+                  {
+                      return language == 0 ? english : language == 1 ? russian : ukrainian;
+                  }
+
+                  public void Next()
+                  {
+                      language = (language + 1) % 3;
+                      PlayerPrefs.SetInt("ST2026.language", language);
+                      PlayerPrefs.Save();
+                      Refresh(force: true);
+                  }
+
+                  public void Track(Scene scene)
+                  {
+                      labels.Clear();
+                      dropdowns.Clear();
+                      originalOptions.Clear();
+                      foreach (GameObject root in scene.GetRootGameObjects())
+                      {
+                          foreach (TMP_Text item in root.GetComponentsInChildren<TMP_Text>(true))
+                          {
+                              TrackText(() => item != null ? item.text : null, value =>
+                              {
+                                  if (item != null && item.text != value) item.text = value;
+                              });
+                              if (fallback != null && item.font != null && item.font != fallback)
+                              {
+                                  var table = item.font.fallbackFontAssetTable;
+                                  if (table == null) item.font.fallbackFontAssetTable = table = new List<TMP_FontAsset>();
+                                  if (!table.Contains(fallback)) table.Add(fallback);
+                              }
+                          }
+
+                          foreach (Text item in root.GetComponentsInChildren<Text>(true))
+                          {
+                              Font originalFont = item.font;
+                              TrackText(() => item != null ? item.text : null, value =>
+                              {
+                                  if (item == null || item.text == value) return;
+                                  item.text = value;
+                                  if (Font != null) item.font = language == 0 ? originalFont : Font;
+                              });
+                          }
+
+                          dropdowns.AddRange(root.GetComponentsInChildren<TMP_Dropdown>(true));
+                      }
+                      Refresh(force: true);
+                  }
+
+                  private void TrackText(Func<string> read, Action<string> write)
+                  {
+                      labels.Add(new TextLabel { Read = read, Write = write });
+                  }
+
+                  public void Refresh(bool force = false)
+                  {
+                      if (!force && Time.unscaledTime < refreshAt) return;
+                      refreshAt = Time.unscaledTime + .20f;
+
+                      foreach (TextLabel item in labels)
+                      {
+                          string seen = item.Read();
+                          if (seen == null) continue;
+                          if (item.Original == null || seen != item.Last) item.Original = seen;
+                          string translated = Translate(item.Original);
+                          if (seen != translated) item.Write(translated);
+                          item.Last = translated;
+                      }
+
+                      if (!force) return;
+                      foreach (TMP_Dropdown dropdown in dropdowns)
+                      {
+                          if (dropdown == null) continue;
+                          foreach (var option in dropdown.options)
+                          {
+                              if (!originalOptions.TryGetValue(option, out string original))
+                                  originalOptions[option] = original = option.text;
+                              option.text = Translate(original);
+                          }
+                          dropdown.RefreshShownValue();
+                      }
+                  }
+
+                  private string Translate(string input)
+                  {
+                      if (string.IsNullOrWhiteSpace(input)) return input;
+                      string normalized = Whitespace.Replace(input.Trim(), " ");
+                      if (language == 0)
+                          return normalized.Equals("Press esc to resume game", StringComparison.OrdinalIgnoreCase) ?
+                              "Tap pause to resume" : input;
+                      if (Texts.TryGetValue(normalized, out string[] translation)) return translation[language - 1];
+                      if (normalized.StartsWith("Welcome Back ", StringComparison.OrdinalIgnoreCase))
+                      {
+                          string name = normalized.Substring(13).TrimEnd(' ', '!');
+                          return Choose(input, "С возвращением, " + name + "!", "З поверненням, " + name + "!");
+                      }
+                      Match match = Collected.Match(normalized);
+                      if (!match.Success) return input;
+                      int group = match.Groups[1].Success ? 1 : 4;
+                      string count = match.Groups[group + 1].Value + "/" + match.Groups[group + 2].Value;
+                      string player = match.Groups[group].Value;
+                      return Choose(input, $"{player} · Крем: {count}", $"{player} · Крем: {count}");
+                  }
+              }
+          }
+          ST2026_FILE_1
+          cat > mobile/build/runtime/Mobile.csproj <<'ST2026_FILE_2'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <TargetFramework>netstandard2.1</TargetFramework>
+              <AssemblyName>ST2026.Mobile</AssemblyName>
+              <LangVersion>latest</LangVersion>
+              <DebugType>none</DebugType>
+            </PropertyGroup>
+            <ItemGroup>
+              <Compile Include="../../ST2026Mobile.cs" />
+              <Compile Include="../../ST2026Locale.cs" />
+              <Reference Include="$(ManagedDir)/UnityEngine.CoreModule.dll" Private="false" />
+              <Reference Include="$(ManagedDir)/UnityEngine.InputLegacyModule.dll" Private="false" />
+              <Reference Include="$(ManagedDir)/UnityEngine.IMGUIModule.dll" Private="false" />
+              <Reference Include="$(ManagedDir)/UnityEngine.TextRenderingModule.dll" Private="false" />
+              <Reference Include="$(ManagedDir)/UnityEngine.UIModule.dll" Private="false" />
+              <Reference Include="$(ManagedDir)/UnityEngine.UI.dll" Private="false" />
+              <Reference Include="$(ManagedDir)/Unity.TextMeshPro.dll" Private="false" />
+            </ItemGroup>
+          </Project>
+          ST2026_FILE_2
+          cat > mobile/build/patcher/Patcher.csproj <<'ST2026_FILE_3'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <OutputType>Exe</OutputType>
+              <TargetFramework>net8.0</TargetFramework>
+            </PropertyGroup>
+            <ItemGroup>
+              <Reference Include="Mono.Cecil" HintPath="$(CecilPath)" />
+            </ItemGroup>
+          </Project>
+          ST2026_FILE_3
+          cat > mobile/build/patcher/Program.cs <<'ST2026_FILE_4'
+          using System;
+          using System.Collections.Generic;
+          using System.IO;
+          using System.Linq;
+          using Mono.Cecil;
+          using Mono.Cecil.Cil;
+
+          if (args.Length != 2)
+              throw new ArgumentException("Usage: Patcher <Assembly-CSharp.dll> <ST2026.Mobile.dll>");
+
+          var targets = new HashSet<string>
+          {
+              "PlayerMovimiento", "PlayerController", "Salto", "Animations", "HeadBob", "AnimacionPlayer",
+              "CameraLook", "CambiarCamara", "PlayerVisible", "ManoLinterna", "Linterna",
+              "MostrarRawImageConM", "PauseManager", "PausaManager", "VolverMenu"
+          };
+          var required = new[]
+          {
+              "PlayerMovimiento", "CameraLook", "CambiarCamara", "Linterna", "MostrarRawImageConM"
+          };
+
+          using var original = AssemblyDefinition.ReadAssembly(args[0], new ReaderParameters { InMemory = true });
+          using var mobile = AssemblyDefinition.ReadAssembly(args[1]);
+          var bridge = mobile.MainModule.GetType("ST2026.MobileInput");
+          var replacements = bridge.Methods
+              .Where(method => method.IsPublic && method.IsStatic && method.Parameters.Count == 1)
+              .ToDictionary(method => (method.Name, method.Parameters[0].ParameterType.FullName));
+
+          var patched = new Dictionary<string, int>();
+          foreach (TypeDefinition type in original.MainModule.Types.Where(type => targets.Contains(type.Name)))
+          {
+              foreach (MethodDefinition method in type.Methods.Where(method => method.HasBody))
+              {
+                  foreach (Instruction instruction in method.Body.Instructions)
+                  {
+                      if (instruction.OpCode != OpCodes.Call || instruction.Operand is not MethodReference input ||
+                          input.DeclaringType.FullName != "UnityEngine.Input" || input.Parameters.Count != 1)
+                          continue;
+                      var signature = (input.Name, input.Parameters[0].ParameterType.FullName);
+                      if (!replacements.TryGetValue(signature, out MethodDefinition replacement))
+                          continue;
+
+                      instruction.Operand = original.MainModule.ImportReference(replacement);
+                      patched[type.Name] = patched.GetValueOrDefault(type.Name) + 1;
+                  }
+              }
+          }
+
+          if (required.Any(type => !patched.ContainsKey(type)))
+              throw new InvalidOperationException("The Windows build is missing expected input call sites.");
+          foreach (var entry in patched)
+              Console.WriteLine($"{entry.Key}: {entry.Value} input calls");
+          string temporary = args[0] + ".new";
+          original.Write(temporary);
+          File.Move(temporary, args[0], overwrite: true);
+          ST2026_FILE_4
+          curl -fsSL --retry 3 --max-time 120 \
+            'https://api.nuget.org/v3-flatcontainer/mono.cecil/0.11.6/mono.cecil.0.11.6.nupkg' \
+            -o mobile/cecil.nupkg
+          unzip -q mobile/cecil.nupkg -d mobile/cecil
+          managed="$PWD/windows/Slendytubbies 2026 1.3.4.1/Slendytubbies_Data/Managed"
+          cecil="$PWD/mobile/cecil/lib/netstandard2.0/Mono.Cecil.dll"
+          plugins="$PWD/recovered/ExportedProject/Assets/Plugins"
+          dotnet build mobile/build/runtime/Mobile.csproj -c Release "-p:ManagedDir=$managed"
+          dotnet build mobile/build/patcher/Patcher.csproj -c Release "-p:CecilPath=$cecil"
+          cp mobile/build/runtime/bin/Release/netstandard2.1/ST2026.Mobile.dll "$plugins/"
+          dotnet mobile/build/patcher/bin/Release/net8.0/Patcher.dll \
+            "$plugins/Assembly-CSharp.dll" "$plugins/ST2026.Mobile.dll" | tee output/input-patch.log
+          tar -czf output/st2026-project.tar.gz -C recovered ExportedProject
+
+      - name: Save the recovered project and log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: st2026-mobile-project
+          path: output/
+          if-no-files-found: warn
+          retention-days: 5
+
+  editor-check:
+    needs: recover
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      UNITY_EDITOR: /Applications/Unity/Unity.app/Contents/MacOS/Unity
+    steps:
+      - name: Create the report directory
+        run: mkdir -p output
+
+      - name: Check Unity account secrets
+        env:
+          UNITY_USERNAME: ${{ secrets.UNITY_USERNAME || secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        run: |
+          if [[ -z "$UNITY_USERNAME" || -z "$UNITY_PASSWORD" ]]; then
+            echo '::error::Set UNITY_USERNAME (or UNITY_EMAIL) and UNITY_PASSWORD in Actions secrets.'
+            exit 1
+          fi
+
+      - name: Download the recovered project
+        uses: actions/download-artifact@v4
+        with:
+          name: st2026-mobile-project
+          path: recovered
+
+      - name: Prepare the original TubbyLand scene check
+        run: |
+          tar -xzf recovered/st2026-project.tar.gz
+          mkdir -p ExportedProject/Assets/Editor
+          cat > ExportedProject/Assets/Editor/ST2026SceneCheck.cs <<'CSHARP'
+          using System;
+          using System.IO;
+          using System.Linq;
+          using UnityEditor;
+          using UnityEditor.SceneManagement;
+          using UnityEngine;
+
+          internal static class ST2026SceneCheck
+          {
+              public static void Run()
+              {
+                  const string scenePath = "Assets/Scenes/TubbyLand.unity";
+                  string reportPath = Environment.GetEnvironmentVariable("ST2026_REPORT");
+
+                  try
+                  {
+                      var scene = EditorSceneManager.OpenScene(scenePath, OpenSceneMode.Single);
+                      var roots = scene.GetRootGameObjects();
+                      var objects = roots
+                          .SelectMany(root => root.GetComponentsInChildren<Transform>(true))
+                          .Select(transform => transform.gameObject)
+                          .ToArray();
+
+                      int missingScripts = objects.Sum(
+                          GameObjectUtility.GetMonoBehavioursWithMissingScriptCount);
+                      int gameplayScripts = objects
+                          .SelectMany(gameObject => gameObject.GetComponents<MonoBehaviour>())
+                          .Count(component => component != null &&
+                              component.GetType().Assembly.GetName().Name == "Assembly-CSharp");
+
+                      var renderers = roots
+                          .SelectMany(root => root.GetComponentsInChildren<Renderer>(true))
+                          .ToArray();
+
+                      int missingShaders = renderers
+                          .SelectMany(renderer => renderer.sharedMaterials)
+                          .Where(material => material != null)
+                          .Distinct()
+                          .Count(material => material.shader == null ||
+                              material.shader.name == "Hidden/InternalErrorShader");
+
+                      var lines = new[]
+                      {
+                          "Unity " + Application.unityVersion,
+                          "Scene " + scene.path,
+                          "Scene objects " + objects.Length,
+                          "Original gameplay components " + gameplayScripts,
+                          "Missing scripts " + missingScripts,
+                          "Renderers " + renderers.Length,
+                          "Referenced materials with missing shaders " + missingShaders,
+                          "Edit Mode import check. Gameplay and rendering were not run."
+                      };
+
+                      File.WriteAllLines(reportPath, lines);
+                      bool valid = scene.isLoaded && objects.Length > 0 && gameplayScripts > 0 &&
+                          missingScripts == 0 && missingShaders == 0;
+                      EditorApplication.Exit(valid ? 0 : 1);
+                  }
+                  catch (Exception error)
+                  {
+                      File.WriteAllText(reportPath, error.ToString());
+                      Debug.LogException(error);
+                      EditorApplication.Exit(1);
+                  }
+              }
+          }
+          CSHARP
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Unity 6000.4.10f1
+        timeout-minutes: 25
+        run: |
+          if [[ "$(uname -m)" != arm64 ]]; then
+            echo '::error::This workflow uses the ARM64 Unity editor installer.'
+            exit 1
+          fi
+          curl -fsSL --retry 3 --connect-timeout 20 --max-time 900 \
+            'https://download.unity3d.com/download_unity/feeafc12a938/MacEditorInstallerArm64/Unity-6000.4.10f1.pkg' \
+            -o "$RUNNER_TEMP/st2026-unity.pkg"
+          sudo installer -pkg "$RUNNER_TEMP/st2026-unity.pkg" -target /
+          test -x "$UNITY_EDITOR"
+          rm -f "$RUNNER_TEMP/st2026-unity.pkg"
+
+      - name: Activate Unity Personal
+        id: activate
+        timeout-minutes: 8
+        env:
+          UNITY_USERNAME: ${{ secrets.UNITY_USERNAME || secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        run: |
+          npm install --global @rage-against-the-pixel/unity-cli@4.2.2
+          unity-cli activate-license --license personal
+
+      - name: Import the project and open TubbyLand
+        timeout-minutes: 20
+        run: |
+          export ST2026_REPORT="$PWD/output/TubbyLand.txt"
+          log="$PWD/output/unity-editor.log"
+          status=0
+          "$UNITY_EDITOR" -batchmode -nographics -quit \
+            -projectPath "$PWD/ExportedProject" \
+            -executeMethod ST2026SceneCheck.Run -logFile "$log" || status=$?
+          if [[ -s "$ST2026_REPORT" ]]; then
+            tee -a "$GITHUB_STEP_SUMMARY" < "$ST2026_REPORT"
+          else
+            tail -n 80 "$log" || true
+            echo '::error::Unity stopped before the TubbyLand check. See unity-editor.log.'
+            exit 1
+          fi
+          exit "$status"
+
+      - name: Return the Unity license
+        if: always() && steps.activate.outcome == 'success'
+        timeout-minutes: 5
+        run: unity-cli return-license --license personal --when auto
+
+      - name: Save the TubbyLand report and Unity log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: st2026-mobile-check
+          path: output/
+          if-no-files-found: warn
+          retention-days: 5
