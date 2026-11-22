@@ -216,7 +216,7 @@ jobs:
           app="${apps[0]}"
           executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Info.plist")
           test -f "$app/$executable"
-          xcrun lipo -verify_arch arm64 "$app/$executable"
+          xcrun lipo "$app/$executable" -verify_arch arm64
           test -d "$app/Frameworks/UnityFramework.framework"
 
           mkdir -p package/Payload output
