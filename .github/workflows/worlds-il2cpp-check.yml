@@ -1,0 +1,227 @@
+name: Slendytubbies Worlds - IL2CPP recovery check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-code:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Install download tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq p7zip-full file
+          python3 -m venv "$RUNNER_TEMP/worlds-venv"
+          "$RUNNER_TEMP/worlds-venv/bin/pip" install -q 'gdown==5.2.0'
+          mkdir -p source game tools cpp2il output recovered
+
+      - name: Get original Worlds v1.2 IL2CPP files
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view worlds-original-v1 -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release download worlds-original-v1 -R "$GITHUB_REPOSITORY" -D source
+          else
+            "$RUNNER_TEMP/worlds-venv/bin/python" -m gdown \
+              --id 1oKVp-NWbnGel4XkQb92zXdYybiiewoak \
+              -O source/worlds-original.download
+          fi
+
+          archive="$(find source -maxdepth 1 -type f -size +10M -print -quit)"
+          test -n "$archive"
+          7z t "$archive" >output/archive-test.txt
+          7z x -y "$archive" "-o$PWD/game" >output/extract.log
+
+          metadata="$(find game -type f \
+            -path '*/il2cpp_data/Metadata/global-metadata.dat' -print -quit)"
+          if [[ -z "$metadata" ]]; then
+            echo '::error::The original global-metadata.dat file is missing.'
+            exit 1
+          fi
+
+          data_dir="$(dirname "$(dirname "$(dirname "$metadata")")")"
+          game_root="$(dirname "$data_dir")"
+          binary="$game_root/GameAssembly.dll"
+          test -s "$binary"
+          test -s "$metadata"
+          test -n "$(find "$game_root" -maxdepth 1 -iname '*.exe' -print -quit)"
+
+          echo "GAME_ROOT=$PWD/$game_root" >> "$GITHUB_ENV"
+          echo "GAME_BINARY=$PWD/$binary" >> "$GITHUB_ENV"
+          echo "GAME_METADATA=$PWD/$metadata" >> "$GITHUB_ENV"
+          sha256sum "$binary" "$metadata" >output/original-hashes.txt
+
+          python3 - "$metadata" "$binary" <<'PY'
+          import pathlib, struct, sys
+          metadata, binary = map(pathlib.Path, sys.argv[1:])
+          header = metadata.read_bytes()[:8]
+          if len(header) != 8:
+              raise SystemExit('IL2CPP metadata header is truncated')
+          magic, version = struct.unpack('<II', header)
+          print(f'IL2CPP magic: 0x{magic:08X}')
+          print(f'IL2CPP metadata version: {version}')
+          print(f'GameAssembly size: {binary.stat().st_size:,} bytes')
+          if magic != 0xFAB11BAF:
+              raise SystemExit('Unexpected IL2CPP metadata header')
+          pathlib.Path('output/metadata-info.txt').write_text(
+              f'IL2CPP metadata version: {version}\n'
+              f'GameAssembly size: {binary.stat().st_size:,} bytes\n',
+              encoding='utf-8')
+          PY
+
+      - name: Check the Windows offline patch source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone -q --depth 1 \
+            https://github.com/Dyloso/SlendytubbiesWorldsOfflineOnlinePatch.git patch
+          test -s patch/OfflineSingleplayer.cs
+          find patch -name '*.cs' -type f | sort >output/patch-files.txt
+          grep -RniE 'HarmonyPatch|offline|server|connect|network|warp|singleplayer' \
+            patch --include='*.cs' | head -n 160 \
+            >output/patch-inspection.txt || true
+          git -C patch rev-parse HEAD >output/patch-commit.txt
+          echo 'Patch source inspected. It is not yet ported to iOS.' \
+            >>output/patch-inspection.txt
+
+      - name: Download a Linux Cpp2IL release
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api 'repos/SamboyCoding/Cpp2IL/releases?per_page=30' >tools/releases.json
+          mapfile -t chosen < <(jq -r '
+            [.[] | select(.draft == false) | . as $release |
+              .assets[] | select(.name | test("linux-x64"; "i")) |
+              [$release.tag_name, .name]] | first // [] | .[]
+          ' tools/releases.json)
+
+          if [[ "${#chosen[@]}" -ne 2 ]]; then
+            echo '::error::Could not find a Cpp2IL Linux x64 release asset.'
+            jq -r '.[] | .tag_name as $tag | .assets[] | "\($tag): \(.name)"' \
+              tools/releases.json | head -n 50
+            exit 1
+          fi
+
+          tag="${chosen[0]}"
+          asset="${chosen[1]}"
+          printf 'Cpp2IL %s - %s\n' "$tag" "$asset" | tee output/tool-version.txt
+          gh release download "$tag" -R SamboyCoding/Cpp2IL \
+            --pattern "$asset" -D tools
+
+          downloaded="tools/$asset"
+          if [[ "$asset" == *.zip ]]; then
+            unzip -q "$downloaded" -d cpp2il
+          elif [[ "$asset" == *.tar.gz || "$asset" == *.tgz ]]; then
+            tar -xzf "$downloaded" -C cpp2il
+          else
+            cp "$downloaded" cpp2il/Cpp2IL
+          fi
+
+          cli="$(find cpp2il -type f -name Cpp2IL -print -quit)"
+          if [[ -z "$cli" ]]; then
+            echo '::error::Cpp2IL executable not found in the release.'
+            find cpp2il -maxdepth 3 -type f | head -n 30
+            exit 1
+          fi
+          chmod +x "$cli"
+          printf 'CPP2IL_CLI=%s/%s\n' "$PWD" "$cli" >> "$GITHUB_ENV"
+
+      - name: Attempt managed-code recovery
+        shell: bash
+        timeout-minutes: 28
+        run: |
+          set -uo pipefail
+          set +e
+          timeout 1050 "$CPP2IL_CLI" \
+            --game-path "$GAME_ROOT" \
+            --output-as dll_il_recovery \
+            --output-to "$PWD/recovered/full" \
+            --low-memory-mode >output/cpp2il-full.log 2>&1
+          full_status=$?
+          set -e
+          printf '%s\n' "$full_status" >output/full-recovery-exit-code.txt
+
+          full_assembly="$(find recovered/full -type f \
+            -name 'Assembly-CSharp.dll' -print -quit 2>/dev/null || true)"
+
+          if [[ -s "$full_assembly" ]]; then
+            echo 'Recovered an Assembly-CSharp.dll candidate (NOT verified as playable).'
+            cp "$full_assembly" output/Assembly-CSharp-recovered.dll
+          else
+            echo 'No full Assembly-CSharp.dll was produced.'
+          fi
+
+          # A dummy DLL can still reveal class/method signatures;
+          # it does NOT contain complete original gameplay.
+          if [[ ! -s output/Assembly-CSharp-recovered.dll ]]; then
+            set +e
+            timeout 360 "$CPP2IL_CLI" \
+              --game-path "$GAME_ROOT" \
+              --output-as dummydll \
+              --output-to "$PWD/recovered/dummy" \
+              --low-memory-mode >output/cpp2il-dummy.log 2>&1
+            dummy_status=$?
+            set -e
+            printf '%s\n' "$dummy_status" >output/dummy-recovery-exit-code.txt
+            dummy_assembly="$(find recovered/dummy -type f \
+              -name 'Assembly-CSharp.dll' -print -quit 2>/dev/null || true)"
+            if [[ -s "$dummy_assembly" ]]; then
+              cp "$dummy_assembly" output/Assembly-CSharp-dummy.dll
+            fi
+          fi
+
+      - name: Write a realistic recovery report
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p output
+          python3 - <<'PY'
+          from pathlib import Path
+          out = Path('output')
+          full = (out / 'Assembly-CSharp-recovered.dll').is_file()
+          dummy = (out / 'Assembly-CSharp-dummy.dll').is_file()
+          metadata = (out / 'metadata-info.txt').read_text().strip() if (out / 'metadata-info.txt').exists() else 'NOT CHECKED'
+          patch = (out / 'patch-files.txt').exists()
+          full_code = (out / 'full-recovery-exit-code.txt').read_text().strip() if (out / 'full-recovery-exit-code.txt').exists() else 'not run'
+          dummy_code = (out / 'dummy-recovery-exit-code.txt').read_text().strip() if (out / 'dummy-recovery-exit-code.txt').exists() else 'not run'
+          lines = [
+              '# Worlds v1.2 — original IL2CPP recovery', '',
+              '## Inputs', metadata, f'- Offline patch source checked: {patch}', '',
+              '## Cpp2IL',
+              f'- Full recovery process exit code: {full_code}',
+              f'- Recovered assembly candidate exists: {full}',
+              f'- Dummy recovery process exit code: {dummy_code}',
+              f'- Dummy assembly exists: {dummy}', '',
+              '## What this means',
+              '- A recovered assembly is a candidate, not proof that the original code is complete.',
+              '- A dummy DLL contains type definitions and method signatures; it is NOT playable gameplay code.',
+              '- The Windows GameAssembly.dll is not executable on iOS ARM64.',
+              '- The MelonLoader/Harmony offline patch has NOT been adapted to an iOS game build.',
+              '- An iOS IPA must NOT be built yet solely from these results.',
+          ]
+          (out / 'report.md').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+          print('\n'.join(lines))
+          import os
+          summary = os.environ.get('GITHUB_STEP_SUMMARY')
+          if summary:
+              with open(summary, 'a', encoding='utf-8') as f:
+                  f.write('\n'.join(lines) + '\n')
+          PY
+
+      - name: Upload the report, recovery candidates, and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Worlds-v1.2-IL2CPP-recovery-check
+          path: output/
+          if-no-files-found: warn
+          retention-days: 5
