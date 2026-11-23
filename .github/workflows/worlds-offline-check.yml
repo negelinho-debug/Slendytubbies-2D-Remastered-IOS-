@@ -1,0 +1,306 @@
+name: Slendytubbies Worlds - original offline check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recover-and-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Install archive tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq p7zip-full libarchive-tools
+          python3 -m venv "$RUNNER_TEMP/worlds-venv"
+          "$RUNNER_TEMP/worlds-venv/bin/pip" install 'gdown==5.2.0'
+          mkdir -p source game recovered output patch
+
+      - name: Download original Worlds v1.2
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if gh release view worlds-original-v1 \
+            --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+
+            gh release download worlds-original-v1 \
+              --repo "$GITHUB_REPOSITORY" --dir source
+
+          else
+            # Official ZeoWorks Google Drive mirror
+            "$RUNNER_TEMP/worlds-venv/bin/python" -m gdown \
+              --id 1oKVp-NWbnGel4XkQb92zXdYybiiewoak \
+              -O source/Worlds-v1.2.download
+          fi
+
+          find source -maxdepth 1 -type f \
+            -printf '%f (%s bytes)\n' | tee output/download.txt
+
+          archive="$(find source -maxdepth 1 \
+            -type f -size +10M | head -n 1)"
+
+          if [[ -z "$archive" ]]; then
+            echo '::error::Original archive not found.'
+            exit 1
+          fi
+
+          7z t "$archive" >output/archive-test.txt || {
+            echo '::error::Downloaded archive is invalid.'
+            exit 1
+          }
+
+          7z x -y "$archive" "-o$PWD/game" \
+            >output/extract.log
+
+          data_dir="$(find game -type d \
+            -name '*_Data' | head -n 1)"
+
+          if [[ -z "$data_dir" ]]; then
+            echo '::error::Unity game files not found.'
+            exit 1
+          fi
+
+          game_root="$(dirname "$data_dir")"
+
+          echo "GAME_ROOT=$PWD/$game_root" >> "$GITHUB_ENV"
+          echo "GAME_DATA=$PWD/$data_dir" >> "$GITHUB_ENV"
+
+          printf 'Unity data: %s\n' "$data_dir" \
+            | tee output/original-data.txt
+
+          find "$data_dir" -maxdepth 2 -type f \
+            \( -name 'Assembly-CSharp.dll' \
+               -o -name 'globalgamemanagers' \
+               -o -name 'global-metadata.dat' \
+               -o -name 'level*' \) \
+            -printf '%P (%s bytes)\n' \
+            | head -n 100 \
+            | tee -a output/original-data.txt
+
+      - name: Inspect original offline patch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git clone --depth 1 \
+            https://github.com/Dyloso/SlendytubbiesWorldsOfflineOnlinePatch.git \
+            patch
+
+          test -s patch/OfflineSingleplayer.cs
+
+          python3 - <<'PY'
+          import pathlib
+          import re
+
+          source = pathlib.Path(
+              "patch/OfflineSingleplayer.cs"
+          ).read_text(encoding="utf-8-sig")
+
+          targets = re.findall(
+              r'\[HarmonyPatch\s*\((.*?)\)\s*\]',
+              source,
+              re.S
+          )
+
+          methods = re.findall(
+              r'\b(?:public|private|internal|protected)'
+              r'\s+(?:static\s+)?'
+              r'(?:bool|void|int|string|IEnumerator)'
+              r'\s+(\w+)\s*\(',
+              source
+          )
+
+          with open("output/offline-patch.txt", "w") as f:
+              f.write("Windows offline patch inspection\n")
+              f.write(
+                  f"Lines: {len(source.splitlines())}\n"
+              )
+              f.write(
+                  f"Harmony patches: {len(targets)}\n"
+              )
+
+              for target in targets[:100]:
+                  f.write(
+                      "  " + " ".join(
+                          target.split()
+                      )[:200] + "\n"
+                  )
+
+              f.write(
+                  "Methods: " +
+                  ", ".join(methods[:80]) + "\n"
+              )
+
+              f.write(
+                  "\nMelonLoader is Windows-specific.\n"
+                  "Offline behavior needs adaptation for iOS.\n"
+              )
+
+          print(
+              pathlib.Path(
+                  "output/offline-patch.txt"
+              ).read_text()
+          )
+          PY
+
+      - name: Recover original Unity scenes and assets
+        shell: bash
+        timeout-minutes: 35
+        run: |
+          set -euo pipefail
+
+          curl -fsSL --retry 3 \
+            --connect-timeout 20 --max-time 240 \
+            https://github.com/AssetRipper/AssetRipper/releases/download/2.0.0/AssetRipper_linux_x64.tar.xz \
+            -o /tmp/assetripper.tar.xz
+
+          mkdir -p /tmp/assetripper
+
+          tar -xJf /tmp/assetripper.tar.xz \
+            -C /tmp/assetripper
+
+          /tmp/assetripper/AssetRipper.GUI.Free \
+            --headless --port 18926 \
+            >output/assetripper.log 2>&1 &
+
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+
+          api=http://127.0.0.1:18926
+
+          curl -fsS \
+            --retry 30 --retry-connrefused \
+            --retry-delay 1 \
+            "$api/Settings/Edit" -o /dev/null
+
+          curl -fsS --max-time 30 \
+            -d 'ScriptExportMode=DllExportWithRenaming&ScriptContentLevel=Level2' \
+            "$api/Settings/Update" -o /dev/null
+
+          curl -fsS --max-time 360 \
+            --data-urlencode "Path=$GAME_ROOT" \
+            "$api/LoadFolder" -o /dev/null
+
+          curl -fsS --max-time 900 \
+            --data-urlencode "Path=$PWD/recovered" \
+            "$api/Export/UnityProject" -o /dev/null
+
+          test -d recovered/ExportedProject/Assets
+
+          find recovered/ExportedProject/Assets \
+            -type f -name '*.unity' \
+            | sort | tee output/scenes.txt
+
+          scene_count="$(wc -l < output/scenes.txt)"
+
+          echo "Scenes recovered: $scene_count" \
+            | tee output/scene-count.txt
+
+          if [[ "$scene_count" -eq 0 ]]; then
+            echo '::error::No original scenes recovered.'
+            exit 1
+          fi
+
+      - name: Generate recovery report
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p output
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+
+          data = Path(
+              os.environ.get("GAME_DATA", "/nonexistent")
+          )
+
+          mono = data / "Managed" / "Assembly-CSharp.dll"
+          il2cpp = data.parent / "GameAssembly.dll"
+
+          scenes = Path("output/scenes.txt")
+
+          scene_names = (
+              scenes.read_text().splitlines()
+              if scenes.exists() else []
+          )
+
+          patch_found = Path(
+              "output/offline-patch.txt"
+          ).exists()
+
+          lines = [
+              "# Slendytubbies Worlds v1.2",
+              "",
+              "## Original game",
+              f"- Unity data: {data.is_dir()}",
+              f"- Original Mono scripts: {mono.is_file()}",
+              f"- Windows IL2CPP: {il2cpp.is_file()}",
+              f"- Recovered scenes: {len(scene_names)}",
+              f"- Offline patch inspected: {patch_found}",
+              "",
+              "## iOS port status",
+              "- Original asset recovery attempted.",
+              "- Offline gameplay not yet verified.",
+              "- MelonLoader DLL cannot run directly on iOS.",
+              "- Native iOS gameplay not yet tested.",
+              "- This workflow does not produce an IPA.",
+          ]
+
+          if scene_names:
+              lines.append("")
+              lines.append("## Original scenes")
+
+              for name in scene_names[:100]:
+                  lines.append(
+                      "- " + Path(name).name
+                  )
+
+          Path("output/report.md").write_text(
+              "\n".join(lines) + "\n",
+              encoding="utf-8"
+          )
+
+          print("\n".join(lines))
+          PY
+
+          cat output/report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Package recovered Unity project
+        if: always()
+        shell: bash
+        run: |
+          if [[ -d recovered/ExportedProject/Assets ]]; then
+
+            size_mb="$(du -sm recovered/ExportedProject \
+              | cut -f1)"
+
+            if [[ "$size_mb" -le 1400 ]]; then
+
+              tar -czf \
+                output/worlds-recovered-project.tar.gz \
+                -C recovered ExportedProject
+
+            else
+
+              echo "Project exceeds artifact size target." \
+                >> output/report.md
+
+            fi
+          fi
+
+      - name: Upload recovery artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Worlds-v1.2-offline-preflight
+          path: output/
+          if-no-files-found: warn
+          retention-days: 5
