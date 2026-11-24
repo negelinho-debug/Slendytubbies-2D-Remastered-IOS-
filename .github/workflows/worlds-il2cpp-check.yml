@@ -62,78 +62,80 @@ jobs:
 
           python3 - "$metadata" "$binary" <<'PY'
           import pathlib, struct, sys
+
           metadata, binary = map(pathlib.Path, sys.argv[1:])
           header = metadata.read_bytes()[:8]
+
           if len(header) != 8:
               raise SystemExit('IL2CPP metadata header is truncated')
+
           magic, version = struct.unpack('<II', header)
+
           print(f'IL2CPP magic: 0x{magic:08X}')
           print(f'IL2CPP metadata version: {version}')
           print(f'GameAssembly size: {binary.stat().st_size:,} bytes')
+
           if magic != 0xFAB11BAF:
               raise SystemExit('Unexpected IL2CPP metadata header')
+
           pathlib.Path('output/metadata-info.txt').write_text(
               f'IL2CPP metadata version: {version}\n'
               f'GameAssembly size: {binary.stat().st_size:,} bytes\n',
-              encoding='utf-8')
+              encoding='utf-8'
+          )
           PY
 
       - name: Check the Windows offline patch source
         shell: bash
         run: |
           set -euo pipefail
+
           git clone -q --depth 1 \
             https://github.com/Dyloso/SlendytubbiesWorldsOfflineOnlinePatch.git patch
+
           test -s patch/OfflineSingleplayer.cs
-          find patch -name '*.cs' -type f | sort >output/patch-files.txt
+
+          find patch -name '*.cs' -type f \
+            | sort >output/patch-files.txt
+
           grep -RniE 'HarmonyPatch|offline|server|connect|network|warp|singleplayer' \
-            patch --include='*.cs' | head -n 160 \
+            patch --include='*.cs' \
+            | head -n 160 \
             >output/patch-inspection.txt || true
-          git -C patch rev-parse HEAD >output/patch-commit.txt
+
+          git -C patch rev-parse HEAD \
+            >output/patch-commit.txt
+
           echo 'Patch source inspected. It is not yet ported to iOS.' \
             >>output/patch-inspection.txt
 
-      - name: Download a Linux Cpp2IL release
+      - name: Download the correct Cpp2IL Linux binary
         shell: bash
         run: |
           set -euo pipefail
-          gh api 'repos/SamboyCoding/Cpp2IL/releases?per_page=30' >tools/releases.json
-          mapfile -t chosen < <(jq -r '
-            [.[] | select(.draft == false) | . as $release |
-              .assets[] | select(.name | test("linux-x64"; "i")) |
-              [$release.tag_name, .name]] | first // [] | .[]
-          ' tools/releases.json)
 
-          if [[ "${#chosen[@]}" -ne 2 ]]; then
-            echo '::error::Could not find a Cpp2IL Linux x64 release asset.'
-            jq -r '.[] | .tag_name as $tag | .assets[] | "\($tag): \(.name)"' \
-              tools/releases.json | head -n 50
-            exit 1
-          fi
+          tag='2022.1.0-pre-release.21'
+          asset="Cpp2IL-${tag}-Linux"
 
-          tag="${chosen[0]}"
-          asset="${chosen[1]}"
-          printf 'Cpp2IL %s - %s\n' "$tag" "$asset" | tee output/tool-version.txt
-          gh release download "$tag" -R SamboyCoding/Cpp2IL \
-            --pattern "$asset" -D tools
+          gh release download "$tag" \
+            --repo SamboyCoding/Cpp2IL \
+            --pattern "$asset" \
+            --dir tools
 
-          downloaded="tools/$asset"
-          if [[ "$asset" == *.zip ]]; then
-            unzip -q "$downloaded" -d cpp2il
-          elif [[ "$asset" == *.tar.gz || "$asset" == *.tgz ]]; then
-            tar -xzf "$downloaded" -C cpp2il
-          else
-            cp "$downloaded" cpp2il/Cpp2IL
-          fi
+          test -s "tools/$asset"
 
-          cli="$(find cpp2il -type f -name Cpp2IL -print -quit)"
-          if [[ -z "$cli" ]]; then
-            echo '::error::Cpp2IL executable not found in the release.'
-            find cpp2il -maxdepth 3 -type f | head -n 30
-            exit 1
-          fi
-          chmod +x "$cli"
-          printf 'CPP2IL_CLI=%s/%s\n' "$PWD" "$cli" >> "$GITHUB_ENV"
+          cp "tools/$asset" cpp2il/Cpp2IL
+          chmod +x cpp2il/Cpp2IL
+
+          file cpp2il/Cpp2IL \
+            | tee output/tool-file.txt
+
+          printf 'Cpp2IL version: %s\nAsset: %s\n' \
+            "$tag" "$asset" \
+            | tee output/tool-version.txt
+
+          printf 'CPP2IL_CLI=%s/cpp2il/Cpp2IL\n' \
+            "$PWD" >> "$GITHUB_ENV"
 
       - name: Attempt managed-code recovery
         shell: bash
@@ -141,83 +143,142 @@ jobs:
         run: |
           set -uo pipefail
           set +e
+
           timeout 1050 "$CPP2IL_CLI" \
             --game-path "$GAME_ROOT" \
             --output-as dll_il_recovery \
             --output-to "$PWD/recovered/full" \
-            --low-memory-mode >output/cpp2il-full.log 2>&1
+            --low-memory-mode \
+            >output/cpp2il-full.log 2>&1
+
           full_status=$?
           set -e
-          printf '%s\n' "$full_status" >output/full-recovery-exit-code.txt
+
+          printf '%s\n' "$full_status" \
+            >output/full-recovery-exit-code.txt
 
           full_assembly="$(find recovered/full -type f \
-            -name 'Assembly-CSharp.dll' -print -quit 2>/dev/null || true)"
+            -name 'Assembly-CSharp.dll' \
+            -print -quit 2>/dev/null || true)"
 
           if [[ -s "$full_assembly" ]]; then
+
             echo 'Recovered an Assembly-CSharp.dll candidate (NOT verified as playable).'
-            cp "$full_assembly" output/Assembly-CSharp-recovered.dll
+
+            cp "$full_assembly" \
+              output/Assembly-CSharp-recovered.dll
+
           else
+
             echo 'No full Assembly-CSharp.dll was produced.'
+
           fi
 
-          # A dummy DLL can still reveal class/method signatures;
-          # it does NOT contain complete original gameplay.
           if [[ ! -s output/Assembly-CSharp-recovered.dll ]]; then
+
             set +e
+
             timeout 360 "$CPP2IL_CLI" \
               --game-path "$GAME_ROOT" \
               --output-as dummydll \
               --output-to "$PWD/recovered/dummy" \
-              --low-memory-mode >output/cpp2il-dummy.log 2>&1
+              --low-memory-mode \
+              >output/cpp2il-dummy.log 2>&1
+
             dummy_status=$?
             set -e
-            printf '%s\n' "$dummy_status" >output/dummy-recovery-exit-code.txt
+
+            printf '%s\n' "$dummy_status" \
+              >output/dummy-recovery-exit-code.txt
+
             dummy_assembly="$(find recovered/dummy -type f \
-              -name 'Assembly-CSharp.dll' -print -quit 2>/dev/null || true)"
+              -name 'Assembly-CSharp.dll' \
+              -print -quit 2>/dev/null || true)"
+
             if [[ -s "$dummy_assembly" ]]; then
-              cp "$dummy_assembly" output/Assembly-CSharp-dummy.dll
+
+              cp "$dummy_assembly" \
+                output/Assembly-CSharp-dummy.dll
+
             fi
           fi
 
-      - name: Write a realistic recovery report
+      - name: Write recovery report
         if: always()
         shell: bash
         run: |
           mkdir -p output
+
           python3 - <<'PY'
           from pathlib import Path
+          import os
+
           out = Path('output')
-          full = (out / 'Assembly-CSharp-recovered.dll').is_file()
-          dummy = (out / 'Assembly-CSharp-dummy.dll').is_file()
-          metadata = (out / 'metadata-info.txt').read_text().strip() if (out / 'metadata-info.txt').exists() else 'NOT CHECKED'
+
+          full = (
+              out / 'Assembly-CSharp-recovered.dll'
+          ).is_file()
+
+          dummy = (
+              out / 'Assembly-CSharp-dummy.dll'
+          ).is_file()
+
+          metadata = (
+              (out / 'metadata-info.txt').read_text().strip()
+              if (out / 'metadata-info.txt').exists()
+              else 'NOT CHECKED'
+          )
+
           patch = (out / 'patch-files.txt').exists()
-          full_code = (out / 'full-recovery-exit-code.txt').read_text().strip() if (out / 'full-recovery-exit-code.txt').exists() else 'not run'
-          dummy_code = (out / 'dummy-recovery-exit-code.txt').read_text().strip() if (out / 'dummy-recovery-exit-code.txt').exists() else 'not run'
+
+          full_code = (
+              (out / 'full-recovery-exit-code.txt').read_text().strip()
+              if (out / 'full-recovery-exit-code.txt').exists()
+              else 'not run'
+          )
+
+          dummy_code = (
+              (out / 'dummy-recovery-exit-code.txt').read_text().strip()
+              if (out / 'dummy-recovery-exit-code.txt').exists()
+              else 'not run'
+          )
+
           lines = [
-              '# Worlds v1.2 — original IL2CPP recovery', '',
-              '## Inputs', metadata, f'- Offline patch source checked: {patch}', '',
+              '# Worlds v1.2 — original IL2CPP recovery',
+              '',
+              '## Inputs',
+              metadata,
+              f'- Offline patch source checked: {patch}',
+              '',
               '## Cpp2IL',
               f'- Full recovery process exit code: {full_code}',
               f'- Recovered assembly candidate exists: {full}',
               f'- Dummy recovery process exit code: {dummy_code}',
-              f'- Dummy assembly exists: {dummy}', '',
+              f'- Dummy assembly exists: {dummy}',
+              '',
               '## What this means',
-              '- A recovered assembly is a candidate, not proof that the original code is complete.',
-              '- A dummy DLL contains type definitions and method signatures; it is NOT playable gameplay code.',
-              '- The Windows GameAssembly.dll is not executable on iOS ARM64.',
-              '- The MelonLoader/Harmony offline patch has NOT been adapted to an iOS game build.',
-              '- An iOS IPA must NOT be built yet solely from these results.',
+              '- A recovered DLL is not proof that original gameplay works.',
+              '- A dummy DLL contains signatures only, not playable code.',
+              '- Windows GameAssembly.dll cannot run on iOS ARM64.',
+              '- The Windows offline patch has not been adapted for iOS.',
+              '- This workflow is a recovery check, not an IPA builder.',
           ]
-          (out / 'report.md').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+
+          (out / 'report.md').write_text(
+              '\n'.join(lines) + '\n',
+              encoding='utf-8'
+          )
+
           print('\n'.join(lines))
-          import os
+
           summary = os.environ.get('GITHUB_STEP_SUMMARY')
+
           if summary:
               with open(summary, 'a', encoding='utf-8') as f:
                   f.write('\n'.join(lines) + '\n')
           PY
 
-      - name: Upload the report, recovery candidates, and logs
+      - name: Upload recovery logs and candidates
         if: always()
         uses: actions/upload-artifact@v4
         with:
