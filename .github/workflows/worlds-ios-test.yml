@@ -1,0 +1,454 @@
+name: Slendytubbies Worlds - experimental iOS IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build-test-ipa:
+    runs-on: macos-15
+    timeout-minutes: 110
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UNITY_EDITOR: /Applications/Unity/Unity-6000.4.10f1/Unity.app/Contents/MacOS/Unity
+
+    steps:
+      - name: Find previous recovery artifacts
+        id: artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p logs
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" > logs/artifacts.json
+          for spec in \
+            'Worlds-v1.2-offline-preflight:scenes' \
+            'Worlds-v1.2-IL2CPP-recovery-check:code'; do
+            name="${spec%%:*}"
+            key="${spec##*:}"
+            run_id="$(jq -r --arg n "$name" '
+              [.artifacts[] | select(.name == $n and .expired == false)] |
+              sort_by(.created_at) | last | .workflow_run.id // empty
+            ' logs/artifacts.json)"
+            if [[ -z "$run_id" ]]; then
+              echo "::error::Missing artifact: $name. Run the earlier workflow again."
+              exit 1
+            fi
+            printf '%s_run=%s\n' "$key" "$run_id" >> "$GITHUB_OUTPUT"
+            echo "$name: run $run_id" | tee -a logs/source.txt
+          done
+
+      - name: Download original recovered scenes
+        uses: actions/download-artifact@v4
+        with:
+          name: Worlds-v1.2-offline-preflight
+          run-id: ${{ steps.artifacts.outputs.scenes_run }}
+          github-token: ${{ github.token }}
+          path: input/scenes
+
+      - name: Download recovered Cpp2IL candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: Worlds-v1.2-IL2CPP-recovery-check
+          run-id: ${{ steps.artifacts.outputs.code_run }}
+          github-token: ${{ github.token }}
+          path: input/code
+
+      - name: Extract project and check original input
+        run: |
+          set -euo pipefail
+          test -s input/scenes/worlds-recovered-project.tar.gz || {
+            echo '::error::Previous recovery did not upload the original Unity project archive.'
+            exit 1
+          }
+          test -s input/code/Assembly-CSharp-recovered.dll || {
+            echo '::error::Cpp2IL produced no Assembly-CSharp-recovered.dll.'
+            exit 1
+          }
+          tar -xzf input/scenes/worlds-recovered-project.tar.gz
+          test -d ExportedProject/Assets
+          find ExportedProject/Assets -type f -name '*.unity' | sort | tee logs/scenes.txt
+          test "$(wc -l < logs/scenes.txt | tr -d ' ')" -ge 12 || {
+            echo '::error::Not all 12 original Unity scenes were recovered.'
+            exit 1
+          }
+          find ExportedProject/Assets -name 'Assembly-CSharp.dll' -print | tee logs/old-assemblies.txt
+          mkdir -p ExportedProject/Assets/Plugins
+          old="$(find ExportedProject/Assets -type f -name Assembly-CSharp.dll -print -quit)"
+          if [[ -n "$old" ]]; then
+            cp input/code/Assembly-CSharp-recovered.dll "$old"
+          else
+            cp input/code/Assembly-CSharp-recovered.dll ExportedProject/Assets/Plugins/Assembly-CSharp.dll
+          fi
+          cat ExportedProject/ProjectSettings/ProjectVersion.txt >logs/project-version.txt || true
+
+      - name: Install .NET for code audit
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Check whether recovered DLL contains real method bodies
+        run: |
+          set -euo pipefail
+          mkdir -p audit
+          curl -fsSL --retry 3 --max-time 120 \
+            https://api.nuget.org/v3-flatcontainer/mono.cecil/0.11.6/mono.cecil.0.11.6.nupkg \
+            -o audit/cecil.nupkg
+          unzip -q audit/cecil.nupkg -d audit/cecil
+          cat >audit/Audit.csproj <<'XML'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <OutputType>Exe</OutputType>
+              <TargetFramework>net8.0</TargetFramework>
+            </PropertyGroup>
+            <ItemGroup>
+              <Reference Include="Mono.Cecil" HintPath="cecil/lib/netstandard2.0/Mono.Cecil.dll" />
+            </ItemGroup>
+          </Project>
+          XML
+          cat >audit/Program.cs <<'CS'
+          using System;
+          using System.Linq;
+          using Mono.Cecil;
+          using Mono.Cecil.Cil;
+
+          if (args.Length != 1)
+              throw new ArgumentException("Expected DLL path.");
+
+          using var assembly = AssemblyDefinition.ReadAssembly(args[0]);
+          var types = assembly.MainModule.Types;
+          var methods = types.SelectMany(t => t.Methods)
+              .Where(m => m.HasBody).ToArray();
+
+          var nontrivial = methods.Where(m =>
+          {
+              var ops = m.Body.Instructions;
+
+              if (ops.Count < 6)
+                  return false;
+
+              if (ops.Last().OpCode == OpCodes.Throw && ops.Count <= 12)
+                  return false;
+
+              if (ops.Count(i => i.OpCode.FlowControl == FlowControl.Call) == 0 &&
+                  ops.Count(i => i.OpCode.FlowControl == FlowControl.Branch ||
+                                 i.OpCode.FlowControl == FlowControl.Cond_Branch) == 0)
+                  return false;
+
+              return true;
+          }).ToArray();
+
+          Console.WriteLine($"Types: {types.Count}");
+          Console.WriteLine($"Methods with bodies: {methods.Length}");
+          Console.WriteLine($"Potentially nontrivial methods: {nontrivial.Length}");
+
+          foreach (var m in nontrivial.Take(25))
+              Console.WriteLine("  " + m.FullName);
+
+          if (nontrivial.Length < 15)
+              throw new InvalidOperationException(
+                  "Recovered DLL looks mostly like stubs. Refusing to package another black-screen IPA.");
+          CS
+
+          dotnet build audit/Audit.csproj -c Release --nologo >logs/audit-build.log
+
+          dotnet audit/bin/Release/net8.0/Audit.dll \
+            input/code/Assembly-CSharp-recovered.dll | tee logs/code-audit.txt
+
+      - name: Add startup logging and original-scene iOS export
+        run: |
+          set -euo pipefail
+          mkdir -p ExportedProject/Assets/Editor ExportedProject/Assets/ST2026Diagnostic
+
+          cat >ExportedProject/Assets/ST2026Diagnostic/WorldsStartupLog.cs <<'CS'
+          using System;
+          using System.IO;
+          using UnityEngine;
+          using UnityEngine.SceneManagement;
+
+          public static class WorldsStartupLog
+          {
+              private static readonly object Gate = new object();
+              private static string FilePath;
+
+              [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
+              private static void Install()
+              {
+                  FilePath = Path.Combine(
+                      Application.persistentDataPath,
+                      "worlds-ios-log.txt"
+                  );
+
+                  Write("Launch: " + Application.unityVersion +
+                        ", " + SystemInfo.deviceModel);
+
+                  Application.logMessageReceivedThreaded += OnLog;
+                  SceneManager.sceneLoaded += OnScene;
+              }
+
+              private static void OnScene(Scene scene, LoadSceneMode mode)
+                  => Write("Scene loaded: " + scene.name);
+
+              private static void OnLog(string condition, string stack, LogType type)
+              {
+                  if (type == LogType.Exception || type == LogType.Error)
+                      Write(type + ": " + condition + "\n" + stack);
+              }
+
+              private static void Write(string message)
+              {
+                  try
+                  {
+                      lock (Gate)
+                          File.AppendAllText(
+                              FilePath,
+                              DateTime.UtcNow.ToString("O") +
+                              " " + message + "\n"
+                          );
+                  }
+                  catch { }
+              }
+          }
+          CS
+
+          cat >ExportedProject/Assets/Editor/WorldsIOSBuild.cs <<'CS'
+          using System;
+          using System.IO;
+          using System.Linq;
+          using UnityEditor;
+          using UnityEditor.Build;
+          using UnityEditor.Build.Reporting;
+          using UnityEditor.SceneManagement;
+          using UnityEngine;
+
+          internal static class WorldsIOSBuild
+          {
+              public static void Export()
+              {
+                  string[] scenes = AssetDatabase.FindAssets("t:Scene")
+                      .Select(AssetDatabase.GUIDToAssetPath)
+                      .Where(p => p.StartsWith("Assets/") && p.EndsWith(".unity"))
+                      .OrderBy(p => Path.GetFileNameWithoutExtension(p) == "Menu" ? 0 : 1)
+                      .ThenBy(p => p)
+                      .ToArray();
+
+                  if (scenes.Length < 12 ||
+                      !scenes.Any(s => Path.GetFileNameWithoutExtension(s) == "Menu"))
+                      throw new Exception("Missing original Worlds scenes or Menu.");
+
+                  var menu = EditorSceneManager.OpenScene(
+                      scenes[0], OpenSceneMode.Single
+                  );
+
+                  var objects = menu.GetRootGameObjects()
+                      .SelectMany(r => r.GetComponentsInChildren<Transform>(true))
+                      .Select(t => t.gameObject).ToArray();
+
+                  var scripts = objects
+                      .SelectMany(o => o.GetComponents<MonoBehaviour>())
+                      .Count(m => m != null);
+
+                  var missing = objects.Sum(
+                      GameObjectUtility.GetMonoBehavioursWithMissingScriptCount
+                  );
+
+                  Debug.Log($"Worlds Menu: objects={objects.Length}, scripts={scripts}, missing={missing}");
+
+                  if (objects.Length == 0 || scripts == 0)
+                      throw new Exception("Original menu has no usable scripts. Refusing black-screen build.");
+
+                  PlayerSettings.productName = "Slendytubbies Worlds TEST";
+                  PlayerSettings.bundleVersion = "1.2.0";
+                  PlayerSettings.iOS.buildNumber = "1";
+                  PlayerSettings.iOS.targetOSVersionString = "15.0";
+
+                  PlayerSettings.SetApplicationIdentifier(
+                      NamedBuildTarget.iOS,
+                      "com.fanport.slendytubbiesworlds.test"
+                  );
+
+                  PlayerSettings.SetScriptingBackend(
+                      NamedBuildTarget.iOS,
+                      ScriptingImplementation.IL2CPP
+                  );
+
+                  PlayerSettings.SetManagedStrippingLevel(
+                      NamedBuildTarget.iOS,
+                      ManagedStrippingLevel.Minimal
+                  );
+
+                  PlayerSettings.defaultInterfaceOrientation = UIOrientation.AutoRotation;
+                  PlayerSettings.allowedAutorotateToPortrait = false;
+                  PlayerSettings.allowedAutorotateToPortraitUpsideDown = false;
+                  PlayerSettings.allowedAutorotateToLandscapeLeft = true;
+                  PlayerSettings.allowedAutorotateToLandscapeRight = true;
+
+                  var result = BuildPipeline.BuildPlayer(
+                      new BuildPlayerOptions {
+                          scenes = scenes,
+                          target = BuildTarget.iOS,
+                          locationPathName = Environment.GetEnvironmentVariable("WORLDS_XCODE"),
+                          options = BuildOptions.Development
+                      }
+                  );
+
+                  if (result.summary.result != BuildResult.Succeeded)
+                      throw new Exception(
+                          "iOS export failed: " + result.summary.result
+                      );
+              }
+          }
+          CS
+
+      - name: Check Unity license secrets
+        env:
+          UNITY_USERNAME: ${{ secrets.UNITY_USERNAME || secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        run: |
+          if [[ -z "$UNITY_USERNAME" || -z "$UNITY_PASSWORD" ]]; then
+            echo '::error::Set UNITY_USERNAME/UNITY_EMAIL and UNITY_PASSWORD in secrets.'
+            exit 1
+          fi
+
+      - name: Install Unity editor and iOS module
+        timeout-minutes: 35
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+
+          base=https://download.unity3d.com/download_unity/feeafc12a938
+
+          curl -fsSL --retry 3 --max-time 1200 \
+            "$base/MacEditorInstallerArm64/Unity-6000.4.10f1.pkg" \
+            -o "$RUNNER_TEMP/unity.pkg"
+
+          sudo installer -pkg "$RUNNER_TEMP/unity.pkg" \
+            -target / | tee logs/unity-install.log
+
+          rm -f "$RUNNER_TEMP/unity.pkg"
+          test -x "$UNITY_EDITOR"
+
+          curl -fsSL --retry 3 --max-time 600 \
+            "$base/MacEditorTargetInstaller/UnitySetup-iOS-Support-for-Editor-6000.4.10f1.pkg" \
+            -o "$RUNNER_TEMP/ios.pkg"
+
+          sudo installer -pkg "$RUNNER_TEMP/ios.pkg" \
+            -target / | tee -a logs/unity-install.log
+
+          rm -f "$RUNNER_TEMP/ios.pkg"
+
+          test -d /Applications/Unity/Unity-6000.4.10f1/PlaybackEngines/iOSSupport
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Activate Unity Personal
+        id: license
+        timeout-minutes: 8
+        env:
+          UNITY_USERNAME: ${{ secrets.UNITY_USERNAME || secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        run: |
+          npm install --global @rage-against-the-pixel/unity-cli@4.2.2
+          unity-cli activate-license --license personal
+
+      - name: Export original scenes to Xcode
+        timeout-minutes: 35
+        run: |
+          set -euo pipefail
+          export WORLDS_XCODE="$PWD/ios-export"
+
+          if ! "$UNITY_EDITOR" \
+            -batchmode -nographics -quit \
+            -buildTarget iOS \
+            -projectPath "$PWD/ExportedProject" \
+            -executeMethod WorldsIOSBuild.Export \
+            -logFile "$PWD/logs/unity-export.log"; then
+
+            tail -n 130 logs/unity-export.log || true
+            exit 1
+          fi
+
+          test -s ios-export/Unity-iPhone.xcodeproj/project.pbxproj
+
+      - name: Build unsigned iPhone application
+        timeout-minutes: 45
+        run: |
+          if ! xcodebuild \
+            -project ios-export/Unity-iPhone.xcodeproj \
+            -scheme Unity-iPhone \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$PWD/derived" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO build \
+            >logs/xcodebuild.log 2>&1; then
+
+            tail -n 130 logs/xcodebuild.log || true
+            exit 1
+          fi
+
+      - name: Package test IPA
+        id: package
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          apps=("$PWD"/derived/Build/Products/Release-iphoneos/*.app)
+
+          test "${#apps[@]}" -eq 1
+
+          app="${apps[0]}"
+
+          exe=$(/usr/libexec/PlistBuddy \
+            -c 'Print :CFBundleExecutable' "$app/Info.plist")
+
+          xcrun lipo "$app/$exe" -verify_arch arm64
+
+          mkdir -p package/Payload output
+
+          ditto "$app" \
+            package/Payload/WorldsIOSDiagnostic.app
+
+          plist=package/Payload/WorldsIOSDiagnostic.app/Info.plist
+
+          /usr/libexec/PlistBuddy \
+            -c 'Add :UIFileSharingEnabled bool true' "$plist" || true
+
+          /usr/libexec/PlistBuddy \
+            -c 'Add :LSSupportsOpeningDocumentsInPlace bool true' "$plist" || true
+
+          ditto -c -k --norsrc --keepParent package/Payload \
+            output/Worlds-v1.2-EXPERIMENTAL-UNSIGNED.ipa
+
+          unzip -tq output/Worlds-v1.2-EXPERIMENTAL-UNSIGNED.ipa
+
+          shasum -a 256 output/*.ipa | tee logs/ipa-sha256.txt
+
+      - name: Upload test IPA
+        if: steps.package.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Worlds-v1.2-experimental-IPA
+          path: output/*.ipa
+          compression-level: 0
+          retention-days: 5
+
+      - name: Return Unity license
+        if: always() && steps.license.outcome == 'success'
+        run: unity-cli return-license --license personal --when auto
+
+      - name: Upload diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Worlds-v1.2-iOS-build-logs
+          path: logs/
+          if-no-files-found: warn
+          retention-days: 5
