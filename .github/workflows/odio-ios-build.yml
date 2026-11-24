@@ -1,5 +1,5 @@
 
-name: Odio el Chocolate iOS Build
+name: Odio el Chocolate iOS Fix 1
 
 on:
   workflow_dispatch:
@@ -57,8 +57,6 @@ jobs:
           find ExportedProject/Assets \
             -name '*.cs' > logs/scripts.txt
 
-          test -s logs/scenes.txt
-
           test -f ExportedProject/Assets/Scene/MainMenu.unity
           test -f ExportedProject/Assets/Scene/School.unity
 
@@ -66,12 +64,67 @@ jobs:
             -name Assembly-CSharp.dll \
             -print -quit)
 
-          if [ -z "$DLL" ]; then
-            echo "Original assembly missing from exported project"
-            exit 1
-          fi
+          test -n "$DLL"
+          test -s "$DLL"
 
           ls -lh "$DLL"
+
+      - name: Fix 1 - Legacy UNET dependencies
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY' | tee logs/fix1.log
+          from pathlib import Path
+
+          assets = Path("ExportedProject/Assets")
+          legacy = "com.unity.multiplayer-hlapi.Runtime"
+
+          game = Path(
+              "recovered/Assembly-CSharp-original.dll"
+          ).read_bytes()
+
+          references = [
+              b"UnityEngine.Networking",
+              b"UnityEngine.UNETModule",
+              legacy.encode()
+          ]
+
+          if any(ref in game for ref in references):
+              raise SystemExit(
+                  "Original game may use networking. "
+                  "Manual dependency migration required."
+              )
+
+          plugins = list(
+              assets.rglob(legacy + ".dll")
+          )
+
+          for plugin in plugins:
+              for dll in assets.rglob("*.dll"):
+                  if dll == plugin:
+                      continue
+
+                  content = dll.read_bytes()
+
+                  if legacy.encode() in content:
+                      raise SystemExit(
+                          "Networking dependency: " + str(dll)
+                      )
+
+              print("Removing unused plugin:", plugin)
+
+              plugin.unlink()
+
+              meta = Path(str(plugin) + ".meta")
+
+              if meta.exists():
+                  meta.unlink()
+
+          print("Original game code preserved")
+          print("Fix 1 completed")
+          PY
+
+          echo "Fix 1 completed" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Install Unity and iOS support
         timeout-minutes: 40
@@ -104,12 +157,15 @@ jobs:
 
           UNITY=$(find /Applications \
             -path '*/Unity.app/Contents/MacOS/Unity' \
-            -type f 2>/dev/null | grep '6000.4.10f1' | head -n 1 || true)
+            -type f 2>/dev/null \
+            | grep '6000.4.10f1' \
+            | head -n 1 || true)
 
           if [ -z "$UNITY" ]; then
             UNITY=$(find /Applications \
               -path '*/Unity.app/Contents/MacOS/Unity' \
-              -type f 2>/dev/null | head -n 1 || true)
+              -type f 2>/dev/null \
+              | head -n 1 || true)
           fi
 
           test -x "$UNITY"
@@ -158,24 +214,32 @@ jobs:
                   foreach (string scene in scenes)
                   {
                       if (!File.Exists(scene))
-                          throw new Exception("Missing scene: " + scene);
+                          throw new Exception(
+                              "Missing scene: " + scene
+                          );
                   }
 
                   EditorBuildSettings.scenes = scenes
-                      .Select(s => new EditorBuildSettingsScene(s, true))
+                      .Select(s =>
+                          new EditorBuildSettingsScene(s, true))
                       .ToArray();
 
-                  PlayerSettings.productName = "Odio el Chocolate";
-                  PlayerSettings.companyName = "Odio Mobile";
+                  PlayerSettings.productName =
+                      "Odio el Chocolate";
+
+                  PlayerSettings.companyName =
+                      "Odio Mobile";
 
                   PlayerSettings.SetApplicationIdentifier(
                       BuildTargetGroup.iOS,
                       "com.odio.chocolate.ios"
                   );
 
-                  PlayerSettings.bundleVersion = "1.0";
-                  PlayerSettings.iOS.buildNumber = "1";
-                  PlayerSettings.iOS.targetOSVersionString = "15.0";
+                  PlayerSettings.bundleVersion = "1.0.1";
+                  PlayerSettings.iOS.buildNumber = "2";
+
+                  PlayerSettings.iOS.targetOSVersionString =
+                      "15.0";
 
                   PlayerSettings.defaultInterfaceOrientation =
                       UIOrientation.LandscapeLeft;
@@ -190,12 +254,16 @@ jobs:
                       ManagedStrippingLevel.Minimal
                   );
 
-                  PlayerSettings.iOS.appleEnableAutomaticSigning = false;
+                  PlayerSettings.iOS.appleEnableAutomaticSigning =
+                      false;
 
                   string destination =
-                      Environment.GetEnvironmentVariable("ODIO_XCODE");
+                      Environment.GetEnvironmentVariable(
+                          "ODIO_XCODE"
+                      );
 
-                  BuildPlayerOptions options = new BuildPlayerOptions
+                  BuildPlayerOptions options =
+                      new BuildPlayerOptions
                   {
                       scenes = scenes,
                       locationPathName = destination,
@@ -206,10 +274,30 @@ jobs:
                   BuildReport report =
                       BuildPipeline.BuildPlayer(options);
 
-                  if (report.summary.result != BuildResult.Succeeded)
+                  foreach (var step in report.steps)
+                  {
+                      foreach (var message in step.messages)
+                      {
+                          if (message.type == LogType.Error ||
+                              message.type == LogType.Exception)
+                          {
+                              Debug.LogError(
+                                  message.content
+                              );
+                          }
+                      }
+                  }
+
+                  if (report.summary.result !=
+                      BuildResult.Succeeded)
+                  {
                       throw new Exception(
-                          "iOS export failed: " + report.summary.result
+                          "iOS export failed: " +
+                          report.summary.result
                       );
+                  }
+
+                  Debug.Log("Odio Fix 1 export successful");
               }
           }
           EOF
@@ -237,7 +325,7 @@ jobs:
                       "odio-ios-log.txt"
                   );
 
-                  Write("Odio el Chocolate iOS started");
+                  Write("Odio el Chocolate iOS Fix 1");
                   Write("Device: " + SystemInfo.deviceModel);
                   Write("Unity: " + Application.unityVersion);
 
@@ -256,7 +344,9 @@ jobs:
 
                   if (type == LogType.Exception ||
                       type == LogType.Error)
+                  {
                       Write(stack);
+                  }
               }
 
               private static void Write(string message)
@@ -290,7 +380,18 @@ jobs:
             -executeMethod OdioIOSBuild.Export \
             -logFile "$PWD/logs/unity-export.log"; then
 
+            echo "===== MAIN ERRORS ====="
+
+            grep -Ei \
+              'error|exception|failed to resolve' \
+              logs/unity-export.log \
+              | cut -c1-1000 \
+              | tail -n 100 || true
+
+            echo "===== LAST LOG LINES ====="
+
             tail -n 150 logs/unity-export.log
+
             exit 1
           fi
 
@@ -332,7 +433,12 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             build > logs/xcodebuild.log 2>&1; then
 
+            grep -Ei 'error:|fatal error' \
+              logs/xcodebuild.log \
+              | tail -n 80 || true
+
             tail -n 150 logs/xcodebuild.log
+
             exit 1
           fi
 
@@ -341,7 +447,9 @@ jobs:
           set -euo pipefail
 
           APP=$(find derived/Build/Products/Release-iphoneos \
-            -maxdepth 1 -name '*.app' -print -quit)
+            -maxdepth 1 \
+            -name '*.app' \
+            -print -quit)
 
           test -n "$APP"
           test -d "$APP"
@@ -354,22 +462,25 @@ jobs:
 
           mkdir -p package/Payload
 
-          cp -R "$APP" \
-            package/Payload/Odio.app
+          cp -R "$APP" package/Payload/Odio.app
 
           (
             cd package
-            zip -qry ../output/Odio-el-Chocolate-iOS.ipa Payload
+            zip -qry \
+              ../output/Odio-el-Chocolate-iOS-Fix1.ipa \
+              Payload
           )
 
-          test -s output/Odio-el-Chocolate-iOS.ipa
+          test -s output/Odio-el-Chocolate-iOS-Fix1.ipa
 
           ls -lh output/
+
+          echo "IPA Fix 1 created" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: Odio-el-Chocolate-iOS
+          name: Odio-el-Chocolate-iOS-Fix1
           path: output/*.ipa
           if-no-files-found: error
           retention-days: 14
@@ -378,6 +489,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Odio-iOS-Build-Logs
+          name: Odio-iOS-Fix1-Logs
           path: logs/
           retention-days: 14
