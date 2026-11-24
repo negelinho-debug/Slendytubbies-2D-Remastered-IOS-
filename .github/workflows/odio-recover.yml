@@ -1,0 +1,160 @@
+
+name: Odio el Chocolate iOS Recovery
+
+on:
+  workflow_dispatch:
+    inputs:
+      download_url:
+        description: "Direct ZIP download URL (optional)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare folders
+        run: |
+          mkdir -p original recovered output tools
+
+      - name: Download original game
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DOWNLOAD_URL: ${{ inputs.download_url }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$DOWNLOAD_URL" ]; then
+            curl -fL --retry 3 \
+              "$DOWNLOAD_URL" \
+              -o original/game.zip
+          else
+            gh release download original-game \
+              --pattern '*.zip' \
+              --dir original
+
+            ZIP=$(find original -name '*.zip' -print -quit)
+
+            if [ "$ZIP" != "original/game.zip" ]; then
+              mv "$ZIP" original/game.zip
+            fi
+          fi
+
+          unzip -t original/game.zip
+          unzip -q original/game.zip -d original/game
+
+      - name: Check original Mono code
+        run: |
+          set -euo pipefail
+
+          DLL=$(find original/game \
+            -name Assembly-CSharp.dll \
+            -print -quit)
+
+          test -n "$DLL"
+          test -s "$DLL"
+
+          DATA=$(dirname "$(dirname "$DLL")")
+          ROOT=$(dirname "$DATA")
+
+          echo "GAME_ROOT=$ROOT" >> "$GITHUB_ENV"
+          echo "GAME_DATA=$DATA" >> "$GITHUB_ENV"
+
+          cp "$DLL" output/Assembly-CSharp-original.dll
+
+          echo "Original Mono code found"
+          ls -lh "$DLL"
+
+          if find "$ROOT" -name GameAssembly.dll | grep -q .; then
+            echo "Unexpected IL2CPP assembly"
+            exit 1
+          fi
+
+      - name: Download AssetRipper
+        run: |
+          curl -fL --retry 3 \
+            https://github.com/AssetRipper/AssetRipper/releases/download/2.0.0/AssetRipper_linux_x64.tar.xz \
+            -o tools/assetripper.tar.xz
+
+          mkdir -p tools/assetripper
+
+          tar -xJf tools/assetripper.tar.xz \
+            -C tools/assetripper
+
+      - name: Restore original Unity project
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+
+          tools/assetripper/AssetRipper.GUI.Free \
+            --headless --port 18926 \
+            > output/assetripper.log 2>&1 &
+
+          PID=$!
+          trap 'kill "$PID" 2>/dev/null || true' EXIT
+
+          API=http://127.0.0.1:18926
+
+          curl -fsS \
+            --retry 30 \
+            --retry-connrefused \
+            --retry-delay 2 \
+            "$API/Settings/Edit" \
+            -o /dev/null
+
+          curl -fsS \
+            -d 'ScriptExportMode=DllExportWithRenaming&ScriptContentLevel=Level2' \
+            "$API/Settings/Update" \
+            -o /dev/null
+
+          curl -fsS --max-time 360 \
+            --data-urlencode "Path=$PWD/$GAME_ROOT" \
+            "$API/LoadFolder" \
+            -o /dev/null
+
+          curl -fsS --max-time 900 \
+            --data-urlencode "Path=$PWD/recovered" \
+            "$API/Export/UnityProject" \
+            -o /dev/null
+
+          test -d recovered/ExportedProject/Assets
+
+      - name: Check recovered scenes
+        run: |
+          find recovered/ExportedProject/Assets \
+            -name '*.unity' \
+            | sort | tee output/scenes.txt
+
+          test -s output/scenes.txt
+
+          find recovered/ExportedProject/Assets \
+            -name '*.dll' \
+            | sort > output/assemblies.txt
+
+          find recovered/ExportedProject/Assets \
+            -name '*.cs' \
+            | sort > output/scripts.txt
+
+          echo "Recovered scenes:" >> "$GITHUB_STEP_SUMMARY"
+          cat output/scenes.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save recovered project
+        run: |
+          tar -czf output/Odio-Unity-Project.tar.gz \
+            -C recovered ExportedProject
+
+      - name: Upload project and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Odio-el-Chocolate-Recovery
+          path: output/
+          retention-days: 7
