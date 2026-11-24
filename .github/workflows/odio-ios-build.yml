@@ -1,5 +1,5 @@
 
-name: Odio el Chocolate iOS Fix 1
+name: Odio el Chocolate iOS Fix 2
 
 on:
   workflow_dispatch:
@@ -44,7 +44,7 @@ jobs:
           test -d ExportedProject/Assets
           test -s recovered/Assembly-CSharp-original.dll
 
-      - name: Check original scenes and scripts
+      - name: Check original game
         run: |
           set -euo pipefail
 
@@ -54,26 +54,16 @@ jobs:
           find ExportedProject/Assets \
             -name '*.dll' | tee logs/assemblies.txt
 
-          find ExportedProject/Assets \
-            -name '*.cs' > logs/scripts.txt
-
           test -f ExportedProject/Assets/Scene/MainMenu.unity
           test -f ExportedProject/Assets/Scene/School.unity
 
-          DLL=$(find ExportedProject/Assets \
-            -name Assembly-CSharp.dll \
-            -print -quit)
+          test -f ExportedProject/Assets/Plugins/Assembly-CSharp.dll
 
-          test -n "$DLL"
-          test -s "$DLL"
-
-          ls -lh "$DLL"
-
-      - name: Fix 1 - Legacy UNET dependencies
+      - name: Fix 1 - Remove unused UNET library
         run: |
           set -euo pipefail
 
-          python3 - <<'PY' | tee logs/fix1.log
+          python3 - <<'PY' | tee logs/unet-fix.log
           from pathlib import Path
 
           assets = Path("ExportedProject/Assets")
@@ -83,36 +73,25 @@ jobs:
               "recovered/Assembly-CSharp-original.dll"
           ).read_bytes()
 
-          references = [
+          for ref in [
               b"UnityEngine.Networking",
               b"UnityEngine.UNETModule",
               legacy.encode()
-          ]
+          ]:
+              if ref in game:
+                  raise SystemExit(
+                      "Original game has networking dependencies"
+                  )
 
-          if any(ref in game for ref in references):
-              raise SystemExit(
-                  "Original game may use networking. "
-                  "Manual dependency migration required."
-              )
-
-          plugins = list(
-              assets.rglob(legacy + ".dll")
-          )
-
-          for plugin in plugins:
+          for plugin in assets.rglob(legacy + ".dll"):
               for dll in assets.rglob("*.dll"):
-                  if dll == plugin:
-                      continue
+                  if dll != plugin:
+                      if legacy.encode() in dll.read_bytes():
+                          raise SystemExit(
+                              "Dependency found: " + str(dll)
+                          )
 
-                  content = dll.read_bytes()
-
-                  if legacy.encode() in content:
-                      raise SystemExit(
-                          "Networking dependency: " + str(dll)
-                      )
-
-              print("Removing unused plugin:", plugin)
-
+              print("Removing unused library:", plugin)
               plugin.unlink()
 
               meta = Path(str(plugin) + ".meta")
@@ -120,11 +99,116 @@ jobs:
               if meta.exists():
                   meta.unlink()
 
-          print("Original game code preserved")
-          print("Fix 1 completed")
+          print("UNET fix completed")
           PY
 
-          echo "Fix 1 completed" >> "$GITHUB_STEP_SUMMARY"
+      - name: Fix 2 - Prepare modern TextMeshPro
+        run: |
+          set -euo pipefail
+
+          python3 -m venv "$RUNNER_TEMP/odio-python"
+
+          "$RUNNER_TEMP/odio-python/bin/pip" \
+            install pycryptodome
+
+          echo "ODIO_PYTHON=$RUNNER_TEMP/odio-python/bin/python" \
+            >> "$GITHUB_ENV"
+
+          mkdir -p compatibility
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          import re
+          import shutil
+
+          project = Path("ExportedProject")
+          assets = project / "Assets"
+
+          info = {}
+
+          for name in [
+              "Unity.TextMeshPro.dll",
+              "UnityEngine.UI.dll"
+          ]:
+              matches = list(assets.rglob(name))
+
+              if len(matches) > 1:
+                  raise SystemExit(
+                      "Multiple copies found: " + name
+                  )
+
+              for dll in matches:
+                  meta = Path(str(dll) + ".meta")
+
+                  if not meta.exists():
+                      raise SystemExit(
+                          "Missing metadata: " + str(dll)
+                      )
+
+                  guid = re.search(
+                      r"(?m)^guid:\s*([a-f0-9]+)",
+                      meta.read_text()
+                  )
+
+                  if not guid:
+                      raise SystemExit("GUID missing")
+
+                  info[name] = guid.group(1)
+
+                  shutil.copy2(
+                      dll,
+                      Path("compatibility") / name
+                  )
+
+                  shutil.copy2(
+                      meta,
+                      Path("compatibility") / meta.name
+                  )
+
+                  dll.unlink()
+                  meta.unlink()
+
+                  print(
+                      "Legacy plugin backed up:",
+                      name,
+                      guid.group(1)
+                  )
+
+          Path("compatibility/legacy-guids.json").write_text(
+              json.dumps(info, indent=2)
+          )
+
+          manifest = project / "Packages/manifest.json"
+          manifest.parent.mkdir(
+              parents=True,
+              exist_ok=True
+          )
+
+          data = (
+              json.loads(manifest.read_text())
+              if manifest.exists()
+              else {"dependencies": {}}
+          )
+
+          deps = data.setdefault("dependencies", {})
+
+          deps.pop("com.unity.textmeshpro", None)
+          deps.pop("com.unity.multiplayer-hlapi", None)
+
+          deps["com.unity.ugui"] = "2.0.0"
+
+          manifest.write_text(
+              json.dumps(data, indent=2)
+          )
+
+          lock = project / "Packages/packages-lock.json"
+
+          if lock.exists():
+              lock.unlink()
+
+          print("Modern UI package configured")
+          PY
 
       - name: Install Unity and iOS support
         timeout-minutes: 40
@@ -161,13 +245,6 @@ jobs:
             | grep '6000.4.10f1' \
             | head -n 1 || true)
 
-          if [ -z "$UNITY" ]; then
-            UNITY=$(find /Applications \
-              -path '*/Unity.app/Contents/MacOS/Unity' \
-              -type f 2>/dev/null \
-              | head -n 1 || true)
-          fi
-
           test -x "$UNITY"
 
           echo "UNITY_EDITOR=$UNITY" >> "$GITHUB_ENV"
@@ -183,7 +260,202 @@ jobs:
           UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
         run: |
           npm install -g @rage-against-the-pixel/unity-cli@4.2.2
+
           unity-cli activate-license --license personal
+
+      - name: Resolve modern Unity packages
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+
+          "$UNITY_EDITOR" \
+            -batchmode \
+            -nographics \
+            -quit \
+            -projectPath "$PWD/ExportedProject" \
+            -logFile "$PWD/logs/package-import.log"
+
+      - name: Fix 2 - Restore UI script references
+        run: |
+          set -euo pipefail
+
+          "$ODIO_PYTHON" - <<'PY' | tee logs/ui-remap.log
+          from pathlib import Path
+          from Crypto.Hash import MD4
+          import json
+          import struct
+          import re
+
+          project = Path("ExportedProject")
+
+          old = json.loads(
+              Path(
+                  "compatibility/legacy-guids.json"
+              ).read_text()
+          )
+
+          cache = project / "Library/PackageCache"
+
+          package_dirs = list(
+              cache.glob("com.unity.ugui@*")
+          )
+
+          package_dirs += list(
+              cache.glob("com.unity.textmeshpro@*")
+          )
+
+          package_dirs += [
+              project / "Packages/com.unity.ugui",
+              project / "Packages/com.unity.textmeshpro"
+          ]
+
+          package_dirs = [
+              p for p in package_dirs if p.is_dir()
+          ]
+
+          if not package_dirs:
+              raise SystemExit(
+                  "Modern UI package not found"
+              )
+
+          def script_file_id(namespace, name):
+              md = MD4.new()
+
+              md.update(
+                  b"s\x00\x00\x00" +
+                  (namespace + name).encode("utf-8")
+              )
+
+              return struct.unpack(
+                  "<i",
+                  md.digest()[:4]
+              )[0]
+
+          mapping = {}
+
+          for package in package_dirs:
+              for source in package.rglob("*.cs"):
+                  meta = Path(str(source) + ".meta")
+
+                  if not meta.exists():
+                      continue
+
+                  namespace_match = re.search(
+                      r"\bnamespace\s+([\w.]+)",
+                      source.read_text(
+                          errors="ignore"
+                      )
+                  )
+
+                  if not namespace_match:
+                      continue
+
+                  namespace = namespace_match.group(1)
+
+                  if namespace == "TMPro":
+                      assembly = "Unity.TextMeshPro.dll"
+                  elif namespace.startswith("UnityEngine.UI"):
+                      assembly = "UnityEngine.UI.dll"
+                  elif namespace.startswith("UnityEngine.EventSystems"):
+                      assembly = "UnityEngine.UI.dll"
+                  else:
+                      continue
+
+                  if assembly not in old:
+                      continue
+
+                  guid_match = re.search(
+                      r"(?m)^guid:\s*([a-f0-9]+)",
+                      meta.read_text(
+                          errors="ignore"
+                      )
+                  )
+
+                  if not guid_match:
+                      continue
+
+                  old_id = script_file_id(
+                      namespace,
+                      source.stem
+                  )
+
+                  mapping[
+                      (old[assembly], old_id)
+                  ] = guid_match.group(1)
+
+          pattern = re.compile(
+              r"fileID:\s*(-?\d+),\s*"
+              r"guid:\s*([a-f0-9]+),\s*type:\s*3"
+          )
+
+          count = 0
+          unresolved = set()
+
+          for asset in (
+              project / "Assets"
+          ).rglob("*"):
+
+              if asset.suffix not in [
+                  ".unity",
+                  ".prefab",
+                  ".asset",
+                  ".mat"
+              ]:
+                  continue
+
+              if not asset.is_file():
+                  continue
+
+              try:
+                  content = asset.read_text()
+              except UnicodeDecodeError:
+                  continue
+
+              def replace(match):
+                  global count
+
+                  file_id = int(match.group(1))
+                  guid = match.group(2)
+
+                  if guid not in old.values():
+                      return match.group(0)
+
+                  key = (guid, file_id)
+
+                  if key not in mapping:
+                      unresolved.add(key)
+                      return match.group(0)
+
+                  count += 1
+
+                  return (
+                      "fileID: 11500000, guid: " +
+                      mapping[key] +
+                      ", type: 3"
+                  )
+
+              result = pattern.sub(
+                  replace,
+                  content
+              )
+
+              if result != content:
+                  asset.write_text(result)
+
+          print("Available script mappings:", len(mapping))
+          print("Restored references:", count)
+          print("Unresolved references:", len(unresolved))
+
+          for item in sorted(unresolved):
+              print("Unresolved:", item)
+
+          if unresolved:
+              raise SystemExit(
+                  "Some UI references require migration"
+              )
+
+          print("TextMeshPro migration completed")
+          PY
 
       - name: Prepare iOS build script
         run: |
@@ -201,6 +473,8 @@ jobs:
           {
               public static void Export()
               {
+                  AssetDatabase.Refresh();
+
                   string[] scenes = {
                       "Assets/Scene/Warning.unity",
                       "Assets/Scene/MainMenu.unity",
@@ -221,7 +495,10 @@ jobs:
 
                   EditorBuildSettings.scenes = scenes
                       .Select(s =>
-                          new EditorBuildSettingsScene(s, true))
+                          new EditorBuildSettingsScene(
+                              s, true
+                          )
+                      )
                       .ToArray();
 
                   PlayerSettings.productName =
@@ -235,8 +512,8 @@ jobs:
                       "com.odio.chocolate.ios"
                   );
 
-                  PlayerSettings.bundleVersion = "1.0.1";
-                  PlayerSettings.iOS.buildNumber = "2";
+                  PlayerSettings.bundleVersion = "1.0.2";
+                  PlayerSettings.iOS.buildNumber = "3";
 
                   PlayerSettings.iOS.targetOSVersionString =
                       "15.0";
@@ -281,9 +558,7 @@ jobs:
                           if (message.type == LogType.Error ||
                               message.type == LogType.Exception)
                           {
-                              Debug.LogError(
-                                  message.content
-                              );
+                              Debug.LogError(message.content);
                           }
                       }
                   }
@@ -297,12 +572,12 @@ jobs:
                       );
                   }
 
-                  Debug.Log("Odio Fix 1 export successful");
+                  Debug.Log("Odio Fix 2 export successful");
               }
           }
           EOF
 
-      - name: Add startup diagnostic log
+      - name: Add diagnostic logger
         run: |
           mkdir -p ExportedProject/Assets/OdioMobile
 
@@ -325,7 +600,7 @@ jobs:
                       "odio-ios-log.txt"
                   );
 
-                  Write("Odio el Chocolate iOS Fix 1");
+                  Write("Odio el Chocolate iOS Fix 2");
                   Write("Device: " + SystemInfo.deviceModel);
                   Write("Unity: " + Application.unityVersion);
 
@@ -364,6 +639,16 @@ jobs:
           }
           EOF
 
+      - name: Preserve original game code
+        run: |
+          cat > ExportedProject/Assets/link.xml <<'EOF'
+          <linker>
+            <assembly fullname="Assembly-CSharp" preserve="all"/>
+            <assembly fullname="Unity.TextMeshPro" preserve="all"/>
+            <assembly fullname="UnityEngine.UI" preserve="all"/>
+          </linker>
+          EOF
+
       - name: Export Unity project to Xcode
         timeout-minutes: 45
         run: |
@@ -380,17 +665,13 @@ jobs:
             -executeMethod OdioIOSBuild.Export \
             -logFile "$PWD/logs/unity-export.log"; then
 
-            echo "===== MAIN ERRORS ====="
-
             grep -Ei \
               'error|exception|failed to resolve' \
               logs/unity-export.log \
               | cut -c1-1000 \
               | tail -n 100 || true
 
-            echo "===== LAST LOG LINES ====="
-
-            tail -n 150 logs/unity-export.log
+            tail -n 100 logs/unity-export.log
 
             exit 1
           fi
@@ -410,7 +691,10 @@ jobs:
                   data = plistlib.load(f)
 
               data["UIFileSharingEnabled"] = True
-              data["LSSupportsOpeningDocumentsInPlace"] = True
+
+              data[
+                  "LSSupportsOpeningDocumentsInPlace"
+              ] = True
 
               with p.open("wb") as f:
                   plistlib.dump(data, f)
@@ -466,21 +750,22 @@ jobs:
 
           (
             cd package
+
             zip -qry \
-              ../output/Odio-el-Chocolate-iOS-Fix1.ipa \
+              ../output/Odio-el-Chocolate-iOS-Fix2.ipa \
               Payload
           )
 
-          test -s output/Odio-el-Chocolate-iOS-Fix1.ipa
+          test -s output/Odio-el-Chocolate-iOS-Fix2.ipa
 
           ls -lh output/
 
-          echo "IPA Fix 1 created" >> "$GITHUB_STEP_SUMMARY"
+          echo "Fix 2 IPA created" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: Odio-el-Chocolate-iOS-Fix1
+          name: Odio-el-Chocolate-iOS-Fix2
           path: output/*.ipa
           if-no-files-found: error
           retention-days: 14
@@ -489,6 +774,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Odio-iOS-Fix1-Logs
-          path: logs/
+          name: Odio-iOS-Fix2-Logs
+          path: |
+            logs/
+            compatibility/
           retention-days: 14
