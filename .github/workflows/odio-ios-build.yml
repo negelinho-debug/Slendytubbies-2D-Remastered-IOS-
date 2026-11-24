@@ -1,0 +1,383 @@
+
+name: Odio el Chocolate iOS Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build-ios:
+    runs-on: macos-15
+    timeout-minutes: 150
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare folders
+        run: mkdir -p logs recovered output
+
+      - name: Download recovered Unity project
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          RUN_ID=$(gh run list \
+            --workflow odio-recover.yml \
+            --status success \
+            --limit 1 \
+            --json databaseId \
+            --jq '.[0].databaseId')
+
+          test -n "$RUN_ID"
+
+          gh run download "$RUN_ID" \
+            --name Odio-el-Chocolate-Recovery \
+            --dir recovered
+
+          tar -xzf recovered/Odio-Unity-Project.tar.gz
+
+          test -d ExportedProject/Assets
+          test -s recovered/Assembly-CSharp-original.dll
+
+      - name: Check original scenes and scripts
+        run: |
+          set -euo pipefail
+
+          find ExportedProject/Assets \
+            -name '*.unity' | tee logs/scenes.txt
+
+          find ExportedProject/Assets \
+            -name '*.dll' | tee logs/assemblies.txt
+
+          find ExportedProject/Assets \
+            -name '*.cs' > logs/scripts.txt
+
+          test -s logs/scenes.txt
+
+          test -f ExportedProject/Assets/Scene/MainMenu.unity
+          test -f ExportedProject/Assets/Scene/School.unity
+
+          DLL=$(find ExportedProject/Assets \
+            -name Assembly-CSharp.dll \
+            -print -quit)
+
+          if [ -z "$DLL" ]; then
+            echo "Original assembly missing from exported project"
+            exit 1
+          fi
+
+          ls -lh "$DLL"
+
+      - name: Install Unity and iOS support
+        timeout-minutes: 40
+        run: |
+          set -euo pipefail
+
+          test "$(uname -m)" = arm64
+
+          BASE=https://download.unity3d.com/download_unity/feeafc12a938
+
+          curl -fL --retry 3 \
+            "$BASE/MacEditorInstallerArm64/Unity-6000.4.10f1.pkg" \
+            -o "$RUNNER_TEMP/unity.pkg"
+
+          sudo installer \
+            -pkg "$RUNNER_TEMP/unity.pkg" \
+            -target / | tee logs/unity-install.log
+
+          rm -f "$RUNNER_TEMP/unity.pkg"
+
+          curl -fL --retry 3 \
+            "$BASE/MacEditorTargetInstaller/UnitySetup-iOS-Support-for-Editor-6000.4.10f1.pkg" \
+            -o "$RUNNER_TEMP/ios.pkg"
+
+          sudo installer \
+            -pkg "$RUNNER_TEMP/ios.pkg" \
+            -target / | tee -a logs/unity-install.log
+
+          rm -f "$RUNNER_TEMP/ios.pkg"
+
+          UNITY=$(find /Applications \
+            -path '*/Unity.app/Contents/MacOS/Unity' \
+            -type f 2>/dev/null | grep '6000.4.10f1' | head -n 1 || true)
+
+          if [ -z "$UNITY" ]; then
+            UNITY=$(find /Applications \
+              -path '*/Unity.app/Contents/MacOS/Unity' \
+              -type f 2>/dev/null | head -n 1 || true)
+          fi
+
+          test -x "$UNITY"
+
+          echo "UNITY_EDITOR=$UNITY" >> "$GITHUB_ENV"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Activate Unity Personal
+        env:
+          UNITY_USERNAME: ${{ secrets.UNITY_USERNAME || secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        run: |
+          npm install -g @rage-against-the-pixel/unity-cli@4.2.2
+          unity-cli activate-license --license personal
+
+      - name: Prepare iOS build script
+        run: |
+          mkdir -p ExportedProject/Assets/Editor
+
+          cat > ExportedProject/Assets/Editor/OdioIOSBuild.cs <<'EOF'
+          using UnityEngine;
+          using UnityEditor;
+          using UnityEditor.Build.Reporting;
+          using System;
+          using System.IO;
+          using System.Linq;
+
+          public static class OdioIOSBuild
+          {
+              public static void Export()
+              {
+                  string[] scenes = {
+                      "Assets/Scene/Warning.unity",
+                      "Assets/Scene/MainMenu.unity",
+                      "Assets/Scene/School.unity",
+                      "Assets/Scene/GameOver.unity",
+                      "Assets/Scene/Results.unity",
+                      "Assets/Scene/Secret.unity",
+                      "Assets/Scene/TestRoom.unity"
+                  };
+
+                  foreach (string scene in scenes)
+                  {
+                      if (!File.Exists(scene))
+                          throw new Exception("Missing scene: " + scene);
+                  }
+
+                  EditorBuildSettings.scenes = scenes
+                      .Select(s => new EditorBuildSettingsScene(s, true))
+                      .ToArray();
+
+                  PlayerSettings.productName = "Odio el Chocolate";
+                  PlayerSettings.companyName = "Odio Mobile";
+
+                  PlayerSettings.SetApplicationIdentifier(
+                      BuildTargetGroup.iOS,
+                      "com.odio.chocolate.ios"
+                  );
+
+                  PlayerSettings.bundleVersion = "1.0";
+                  PlayerSettings.iOS.buildNumber = "1";
+                  PlayerSettings.iOS.targetOSVersionString = "15.0";
+
+                  PlayerSettings.defaultInterfaceOrientation =
+                      UIOrientation.LandscapeLeft;
+
+                  PlayerSettings.SetScriptingBackend(
+                      BuildTargetGroup.iOS,
+                      ScriptingImplementation.IL2CPP
+                  );
+
+                  PlayerSettings.SetManagedStrippingLevel(
+                      BuildTargetGroup.iOS,
+                      ManagedStrippingLevel.Minimal
+                  );
+
+                  PlayerSettings.iOS.appleEnableAutomaticSigning = false;
+
+                  string destination =
+                      Environment.GetEnvironmentVariable("ODIO_XCODE");
+
+                  BuildPlayerOptions options = new BuildPlayerOptions
+                  {
+                      scenes = scenes,
+                      locationPathName = destination,
+                      target = BuildTarget.iOS,
+                      options = BuildOptions.None
+                  };
+
+                  BuildReport report =
+                      BuildPipeline.BuildPlayer(options);
+
+                  if (report.summary.result != BuildResult.Succeeded)
+                      throw new Exception(
+                          "iOS export failed: " + report.summary.result
+                      );
+              }
+          }
+          EOF
+
+      - name: Add startup diagnostic log
+        run: |
+          mkdir -p ExportedProject/Assets/OdioMobile
+
+          cat > ExportedProject/Assets/OdioMobile/OdioLogger.cs <<'EOF'
+          using UnityEngine;
+          using UnityEngine.SceneManagement;
+          using System;
+          using System.IO;
+
+          public static class OdioLogger
+          {
+              private static string path;
+
+              [RuntimeInitializeOnLoadMethod(
+                  RuntimeInitializeLoadType.BeforeSceneLoad)]
+              private static void Init()
+              {
+                  path = Path.Combine(
+                      Application.persistentDataPath,
+                      "odio-ios-log.txt"
+                  );
+
+                  Write("Odio el Chocolate iOS started");
+                  Write("Device: " + SystemInfo.deviceModel);
+                  Write("Unity: " + Application.unityVersion);
+
+                  Application.logMessageReceived += OnLog;
+
+                  SceneManager.sceneLoaded += (scene, mode) =>
+                      Write("Scene loaded: " + scene.name);
+              }
+
+              private static void OnLog(
+                  string message,
+                  string stack,
+                  LogType type)
+              {
+                  Write(type + ": " + message);
+
+                  if (type == LogType.Exception ||
+                      type == LogType.Error)
+                      Write(stack);
+              }
+
+              private static void Write(string message)
+              {
+                  try
+                  {
+                      File.AppendAllText(
+                          path,
+                          DateTime.Now + " " +
+                          message + "\n"
+                      );
+                  }
+                  catch {}
+              }
+          }
+          EOF
+
+      - name: Export Unity project to Xcode
+        timeout-minutes: 45
+        run: |
+          set -euo pipefail
+
+          export ODIO_XCODE="$PWD/ios-export"
+
+          if ! "$UNITY_EDITOR" \
+            -batchmode \
+            -nographics \
+            -quit \
+            -buildTarget iOS \
+            -projectPath "$PWD/ExportedProject" \
+            -executeMethod OdioIOSBuild.Export \
+            -logFile "$PWD/logs/unity-export.log"; then
+
+            tail -n 150 logs/unity-export.log
+            exit 1
+          fi
+
+          test -s ios-export/Unity-iPhone.xcodeproj/project.pbxproj
+
+      - name: Enable diagnostic file sharing
+        run: |
+          python3 - <<'PY'
+          import plistlib
+          from pathlib import Path
+
+          p = Path("ios-export/Info.plist")
+
+          if p.exists():
+              with p.open("rb") as f:
+                  data = plistlib.load(f)
+
+              data["UIFileSharingEnabled"] = True
+              data["LSSupportsOpeningDocumentsInPlace"] = True
+
+              with p.open("wb") as f:
+                  plistlib.dump(data, f)
+          PY
+
+      - name: Build iOS application
+        timeout-minutes: 45
+        run: |
+          set -euo pipefail
+
+          if ! xcodebuild \
+            -project ios-export/Unity-iPhone.xcodeproj \
+            -scheme Unity-iPhone \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$PWD/derived" \
+            ARCHS=arm64 \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build > logs/xcodebuild.log 2>&1; then
+
+            tail -n 150 logs/xcodebuild.log
+            exit 1
+          fi
+
+      - name: Create IPA
+        run: |
+          set -euo pipefail
+
+          APP=$(find derived/Build/Products/Release-iphoneos \
+            -maxdepth 1 -name '*.app' -print -quit)
+
+          test -n "$APP"
+          test -d "$APP"
+
+          EXE=$(/usr/libexec/PlistBuddy \
+            -c 'Print :CFBundleExecutable' \
+            "$APP/Info.plist")
+
+          xcrun lipo "$APP/$EXE" -verify_arch arm64
+
+          mkdir -p package/Payload
+
+          cp -R "$APP" \
+            package/Payload/Odio.app
+
+          (
+            cd package
+            zip -qry ../output/Odio-el-Chocolate-iOS.ipa Payload
+          )
+
+          test -s output/Odio-el-Chocolate-iOS.ipa
+
+          ls -lh output/
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Odio-el-Chocolate-iOS
+          path: output/*.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Odio-iOS-Build-Logs
+          path: logs/
+          retention-days: 14
