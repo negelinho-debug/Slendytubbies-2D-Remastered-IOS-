@@ -1,0 +1,368 @@
+
+name: Apocalypse Exclusive Alpha - Recovery
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: 'Optional Game Jolt Alpha build ID'
+        required: false
+        type: string
+      download_url:
+        description: 'Optional original RAR URL'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  recovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download original Alpha
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_ID: ${{ inputs.build_id }}
+          DOWNLOAD_URL: ${{ inputs.download_url }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p output windows tools export
+
+          if [ -n "$DOWNLOAD_URL" ]; then
+
+            curl -fLsS --retry 3 \
+              --max-time 600 \
+              "$DOWNLOAD_URL" \
+              -o alpha.rar
+
+          elif gh release download alpha-original \
+            --pattern '*.rar' \
+            --output alpha.rar 2>/dev/null; then
+
+            echo "Original archive downloaded"
+
+          else
+
+            if [ -z "$BUILD_ID" ]; then
+
+              curl -fLsS --retry 3 \
+                -A 'Mozilla/5.0' \
+                'https://gamejolt.com/site-api/web/discover/games/overview/774657?ignore' \
+                -o output/gamejolt.json
+
+              BUILD_ID=$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          data = json.loads(
+              Path("output/gamejolt.json").read_text()
+          )
+
+          def walk(x):
+              if isinstance(x, dict):
+                  yield x
+                  for v in x.values():
+                      yield from walk(v)
+              elif isinstance(x, list):
+                  for v in x:
+                      yield from walk(v)
+
+          records = list(walk(data))
+
+          packages = {
+              str(p["id"]): p
+              for p in records
+              if "id" in p
+              and "title" in p
+              and "game_id" in p
+          }
+
+          releases = {
+              str(r["id"]): r
+              for r in records
+              if "id" in r
+              and "version_number" in r
+          }
+
+          matches = set()
+
+          for b in records:
+              if "id" not in b:
+                  continue
+
+              if not (
+                  b.get("os_windows")
+                  or b.get("os_windows_64")
+              ):
+                  continue
+
+              p = packages.get(
+                  str(b.get("game_package_id")), {}
+              )
+
+              r = releases.get(
+                  str(b.get("game_release_id")), {}
+              )
+
+              title = str(
+                  p.get("title", "")
+              ).lower()
+
+              version = str(
+                  r.get("version_number")
+              )
+
+              if (
+                  "exclusive alpha" in title
+                  or "ch1p1" in title
+              ) and version == "0.1.0":
+
+                  matches.add(str(b["id"]))
+
+          if len(matches) != 1:
+              raise SystemExit(
+                  "Alpha build not uniquely identified. "
+                  "Upload original RAR to release alpha-original "
+                  "or supply build_id."
+              )
+
+          print(matches.pop())
+          PY
+              )
+
+            fi
+
+            API="https://gamejolt.com/site-api/web/discover/games/builds/get-download-url/$BUILD_ID"
+
+            URL=$(curl -fsS --retry 3 \
+              -A 'Mozilla/5.0' \
+              -H 'Content-Type: application/json' \
+              -H "Referer: https://gamejolt.com/get/build?game=774657&build=$BUILD_ID" \
+              --data '{"forceDownload":true}' \
+              "$API" | jq -er '.payload.url')
+
+            curl -fLsS --retry 3 \
+              --max-time 600 \
+              -A 'Mozilla/5.0' \
+              -e 'https://gamejolt.com/' \
+              "$URL" \
+              -o alpha.rar
+
+          fi
+
+          test -s alpha.rar
+
+          echo '24c2399da7baacb814e67cdeb3aa8b775f33e10a42ac7e739f776d75c5e7ec01  alpha.rar' \
+            | sha256sum -c -
+
+          ls -lh alpha.rar
+
+      - name: Extract original Windows game
+        run: |
+          set -euo pipefail
+
+          7z x -y -owindows alpha.rar
+
+          DATA=$(find "$PWD/windows" \
+            -type d \
+            -name '*_Data' \
+            -print -quit)
+
+          test -n "$DATA"
+
+          test -s "$DATA/Managed/Assembly-CSharp.dll"
+
+          test "$(stat -c%s "$DATA/Managed/Assembly-CSharp.dll")" = 608768
+
+          cp "$DATA/Managed/Assembly-CSharp.dll" \
+            output/Assembly-CSharp-original.dll
+
+          echo "GAME_DATA=$DATA" >> "$GITHUB_ENV"
+
+          echo "GAME_ROOT=$(dirname "$DATA")" \
+            >> "$GITHUB_ENV"
+
+      - name: Check original game code
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY' | tee output/game-report.txt
+          from pathlib import Path
+          import os
+          import re
+
+          data = Path(os.environ["GAME_DATA"])
+          root = Path(os.environ["GAME_ROOT"])
+
+          dll = data / "Managed/Assembly-CSharp.dll"
+
+          assert dll.is_file()
+
+          il2cpp = (
+              (root / "GameAssembly.dll").exists()
+              or any(data.rglob("global-metadata.dat"))
+          )
+
+          print("Game: Apocalypse DLC REBOOT")
+          print("Version: Exclusive Alpha 0.1.0")
+          print("Chapter: 1")
+          print("Part: 1")
+          print("Mono: True")
+          print("IL2CPP:", il2cpp)
+          print("Original DLL bytes:", dll.stat().st_size)
+
+          managers = data / "globalgamemanagers"
+
+          if managers.exists():
+              version = re.search(
+                  rb"\d{1,4}\.\d+\.\d+[abfp]\d+",
+                  managers.read_bytes()[:4096]
+              )
+
+              if version:
+                  print("Unity:", version.group().decode())
+
+          if il2cpp:
+              raise SystemExit("Unexpected IL2CPP build")
+          PY
+
+          cat output/game-report.txt \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Download AssetRipper
+        run: |
+          set -euo pipefail
+
+          curl -fLsS --retry 3 \
+            --max-time 300 \
+            https://github.com/AssetRipper/AssetRipper/releases/download/2.0.0/AssetRipper_linux_x64.tar.xz \
+            -o tools/ripper.tar.xz
+
+          mkdir -p tools/ripper
+
+          tar -xJf tools/ripper.tar.xz \
+            -C tools/ripper
+
+      - name: Recover original Unity project
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+
+          RIPPER=$(find "$PWD/tools/ripper" \
+            -type f \
+            -name AssetRipper.GUI.Free \
+            -print -quit)
+
+          test -x "$RIPPER"
+
+          "$RIPPER" \
+            --headless \
+            --port 18926 \
+            > output/assetripper.log 2>&1 &
+
+          PID=$!
+
+          trap 'kill "$PID" 2>/dev/null || true' EXIT
+
+          API=http://127.0.0.1:18926
+
+          curl -fsS \
+            --retry 30 \
+            --retry-connrefused \
+            --retry-delay 2 \
+            "$API/Settings/Edit" \
+            -o /dev/null
+
+          curl -fsS \
+            -d 'ScriptExportMode=DllExportWithRenaming&ScriptContentLevel=Level2' \
+            "$API/Settings/Update" \
+            -o /dev/null
+
+          curl -fsS \
+            --max-time 360 \
+            --data-urlencode "Path=$GAME_ROOT" \
+            "$API/LoadFolder" \
+            -o /dev/null
+
+          curl -fsS \
+            --max-time 900 \
+            --data-urlencode "Path=$PWD/export" \
+            "$API/Export/UnityProject" \
+            -o /dev/null
+
+          test -d export/ExportedProject/Assets
+
+      - name: Verify original Chapter 1 scenes
+        run: |
+          set -euo pipefail
+
+          PROJECT=export/ExportedProject
+
+          find "$PROJECT/Assets" \
+            -name '*.unity' \
+            | sort | tee output/scenes.txt
+
+          find "$PROJECT/Assets" \
+            -name '*.dll' \
+            | sort | tee output/assemblies.txt
+
+          test -s "$PROJECT/Assets/Scenes/DLC/MenuAlpha.unity"
+
+          test -s "$PROJECT/Assets/Scenes/DLC/Alphas/CH1P1.unity"
+
+          test -n "$(find "$PROJECT/Assets" \
+            -name Assembly-CSharp.dll \
+            -print -quit)"
+
+          echo "Original menu confirmed"
+          echo "Original Chapter 1 Part 1 confirmed"
+
+          cat output/scenes.txt \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Preserve original build settings
+        run: |
+          set -euo pipefail
+
+          PROJECT=export/ExportedProject
+
+          cp "$PROJECT/ProjectSettings/EditorBuildSettings.asset" \
+            output/
+
+          cp "$PROJECT/ProjectSettings/ProjectVersion.txt" \
+            output/
+
+          find "$PROJECT/Assets" \
+            -name '*.prefab' \
+            | sort > output/prefabs.txt
+
+          find "$PROJECT/Assets" \
+            -name '*.cs' \
+            | sort > output/scripts.txt
+
+      - name: Package recovered project
+        run: |
+          set -euo pipefail
+
+          tar -czf \
+            output/Apocalypse-Alpha-Unity-Project.tar.gz \
+            -C export ExportedProject
+
+          ls -lh output/
+
+          echo "Exclusive Alpha recovery completed" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Recovery
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Apocalypse-Exclusive-Alpha-Recovery
+          path: output/
+          retention-days: 14
