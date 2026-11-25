@@ -1,4 +1,4 @@
-name: Apocalypse Exclusive Alpha iOS Fix 1
+name: Apocalypse Exclusive Alpha iOS Fix 2
 
 on:
   workflow_dispatch:
@@ -16,52 +16,58 @@ jobs:
       UNITY_EDITOR_PATH: /Applications/Unity/Unity.app/Contents/MacOS/Unity
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
       V1_COMMIT: 7987483d3f5c71816429b62b8aca9e28df8ecc7f
+      FIX1_COMMIT: 631b34e617f6f52d55eb400561ee7f318b410960
 
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: 7987483d3f5c71816429b62b8aca9e28df8ecc7f
+          ref: 631b34e617f6f52d55eb400561ee7f318b410960
 
-      - name: Restore original build scripts
+      - name: Restore Fix 1 scripts
         run: |
           set -euo pipefail
 
-          mkdir -p recovery logs dist .alpha-ci
+          mkdir -p .fix2 logs recovery dist
 
-          git show "$V1_COMMIT:.github/workflows/apocalypse-alpha-ios.yml" \
-            > .alpha-ci/original.yml
+          git fetch --no-tags --depth=1 origin "$V1_COMMIT"
 
-          python3 -m venv "$RUNNER_TEMP/alpha-ci-python"
+          git show "$FIX1_COMMIT:.github/workflows/apocalypse-alpha-ios.yml" \
+            > .fix2/fix1.yml
 
-          "$RUNNER_TEMP/alpha-ci-python/bin/pip" install pyyaml
+          python3 -m venv "$RUNNER_TEMP/fix2-python"
 
-          "$RUNNER_TEMP/alpha-ci-python/bin/python" - <<'PY'
+          "$RUNNER_TEMP/fix2-python/bin/pip" install pyyaml
+
+          "$RUNNER_TEMP/fix2-python/bin/python" - <<'PY'
           import yaml
           from pathlib import Path
 
-          root = Path(".alpha-ci")
+          root = Path(".fix2")
 
           data = yaml.safe_load(
-              (root / "original.yml").read_text()
+              (root / "fix1.yml").read_text()
           )
 
           steps = data["jobs"]["ipa"]["steps"]
 
-          scripts = {
+          names = {
+              "Restore original build scripts": "restore.sh",
+              "Download Alpha Recovery": "download.sh",
               "Install Unity and iOS support": "install.sh",
+              "Fix 1 - Find Unity libraries": "references.sh",
               "Activate Unity Personal": "activate.sh",
               "Prepare English Russian Ukrainian": "languages.sh",
-              "Create mobile input library": "mobile.sh",
-              "Connect mobile input to original scripts": "input.sh",
-              "Repair original Unity script references": "repair.sh",
-              "Create iOS build and validation script": "buildscript.sh",
+              "Build mobile controls Fix 1": "mobile.sh",
+              "Connect controls to original game": "connect.sh",
+              "Repair original script references": "repair.sh",
+              "Prepare original Chapter 1": "prepare.sh",
               "Export Unity to Xcode": "export.sh",
               "Return Unity license": "return.sh",
               "Build ARM64 application": "xcode.sh",
               "Create Exclusive Alpha IPA": "ipa.sh"
           }
 
-          for name, filename in scripts.items():
+          for name, filename in names.items():
               matches = [
                   s for s in steps
                   if s.get("name") == name
@@ -69,63 +75,38 @@ jobs:
 
               if len(matches) != 1:
                   raise SystemExit(
-                      "Missing original step: " + name
+                      "Missing step: " + name
                   )
 
-              script = matches[0]["run"]
-
-              if filename == "mobile.sh":
-                  start = script.index("MANAGED=")
-                  end = script.index("dotnet build", start)
-
-                  script = (
-                      script[:start]
-                      + 'MANAGED="$PWD/.alpha-ci/UnityReferences"\n'
-                      + 'test -s "$MANAGED/UnityEngine.CoreModule.dll"\n\n'
-                      + script[end:]
-                  )
-
-              (root / filename).write_text(script)
+              (root / filename).write_text(
+                  matches[0]["run"]
+              )
 
               print("Restored:", name)
           PY
 
-          for SCRIPT in .alpha-ci/*.sh; do
+          for SCRIPT in .fix2/*.sh; do
             bash -n "$SCRIPT"
           done
 
-      - name: Download Alpha Recovery
+          bash -e .fix2/restore.sh
+
+      - name: Download original Chapter 1
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          RUN=$(gh run list \
-            --workflow apocalypse-alpha-recovery.yml \
-            --status success \
-            --limit 1 \
-            --json databaseId \
-            --jq '.[0].databaseId')
-
-          test -n "$RUN"
-
-          gh run download "$RUN" \
-            --name Apocalypse-Exclusive-Alpha-Recovery \
-            --dir recovery
-
-          tar -xzf \
-            recovery/Apocalypse-Alpha-Unity-Project.tar.gz
-
-          test -s ExportedProject/Assets/Plugins/Assembly-CSharp.dll
+          bash -e .fix2/download.sh
 
           test -s ExportedProject/Assets/Scenes/DLC/MenuAlpha.unity
 
           test -s ExportedProject/Assets/Scenes/DLC/Alphas/CH1P1.unity
 
-      - name: Install Unity and iOS support
+      - name: Install Unity 2021 and iOS support
         timeout-minutes: 40
         run: |
-          bash -e .alpha-ci/install.sh
+          bash -e .fix2/install.sh
 
       - uses: actions/setup-node@v5
         with:
@@ -135,145 +116,103 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Fix 1 - Find Unity libraries
+      - name: Restore Unity reference libraries
         timeout-minutes: 15
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          REFS="$PWD/.alpha-ci/UnityReferences"
+          bash -e .fix2/references.sh
 
-          mkdir -p "$REFS"
+          test -s .alpha-ci/UnityReferences/UnityEngine.CoreModule.dll
 
-          REQUIRED=(
-            UnityEngine.CoreModule.dll
-            UnityEngine.InputLegacyModule.dll
-            UnityEngine.IMGUIModule.dll
-            UnityEngine.TextRenderingModule.dll
-            UnityEngine.JSONSerializeModule.dll
-            UnityEngine.UIModule.dll
+          echo "Unity references available"
+
+      - name: Fix 2 - Repair Mono Cecil resolver
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          file = Path(".alpha-ci/input.sh")
+
+          script = file.read_text()
+
+          marker = "using var game ="
+
+          if script.count(marker) != 1:
+              raise SystemExit(
+                  "Original Cecil reader not found"
+              )
+
+          resolver = '''
+          using var resolver = new DefaultAssemblyResolver();
+
+          resolver.AddSearchDirectory(
+              Path.GetFullPath(dir)
+          );
+
+          resolver.AddSearchDirectory(
+              Path.GetFullPath(
+                  ".alpha-ci/UnityReferences"
+              )
+          );
+
+          string unity = "/Applications/Unity";
+
+          if (Directory.Exists(unity))
+          {
+              foreach (string assembly in
+                  Directory.EnumerateFiles(
+                      unity,
+                      "mscorlib.dll",
+                      SearchOption.AllDirectories
+                  ))
+              {
+                  string folder =
+                      Path.GetDirectoryName(assembly);
+
+                  if (!string.IsNullOrEmpty(folder))
+                      resolver.AddSearchDirectory(folder);
+              }
+          }
+
+          Console.WriteLine(
+              "Mono.Cecil Unity dependencies configured"
+          );
+
+          '''
+
+          script = script.replace(
+              marker,
+              resolver + marker,
+              1
           )
 
-          SOURCE=""
+          old = "new ReaderParameters { InMemory = true }"
 
-          while IFS= read -r DLL; do
-
-            DIR="$(dirname "$DLL")"
-
-            VALID=1
-
-            for NAME in "${REQUIRED[@]}"; do
-              if [ ! -s "$DIR/$NAME" ]; then
-                VALID=0
-              fi
-            done
-
-            if [ "$VALID" = 1 ]; then
-              SOURCE="$DIR"
-              break
-            fi
-
-          done < <(
-            find -L /Applications/Unity \
-              -type f \
-              -name UnityEngine.CoreModule.dll \
-              2>/dev/null
+          new = (
+              "new ReaderParameters { "
+              "InMemory = true, "
+              "AssemblyResolver = resolver "
+              "}"
           )
 
-          if [ -z "$SOURCE" ]; then
+          if script.count(old) != 1:
+              raise SystemExit(
+                  "Original reader parameters not found"
+              )
 
-            echo "Using original Alpha libraries"
+          script = script.replace(old, new, 1)
 
-            mkdir -p original-alpha
+          file.write_text(script)
 
-            if ! gh release download alpha-original \
-              --pattern '*.rar' \
-              --output original-alpha.rar; then
+          print("Mono.Cecil resolver Fix 2 applied")
+          PY
 
-              BUILD_ID=1407557
-
-              API="https://gamejolt.com/site-api/web/discover/games/builds/get-download-url/$BUILD_ID"
-
-              URL=$(curl -fsS --retry 3 \
-                -A 'Mozilla/5.0' \
-                -H 'Content-Type: application/json' \
-                -H "Referer: https://gamejolt.com/get/build?game=774657&build=$BUILD_ID" \
-                --data '{"forceDownload":true}' \
-                "$API" | jq -er '.payload.url')
-
-              curl -fLsS --retry 3 \
-                --max-time 600 \
-                -A 'Mozilla/5.0' \
-                -e 'https://gamejolt.com/' \
-                "$URL" \
-                -o original-alpha.rar
-
-            fi
-
-            echo '24c2399da7baacb814e67cdeb3aa8b775f33e10a42ac7e739f776d75c5e7ec01  original-alpha.rar' \
-              | shasum -a 256 -c -
-
-            if command -v 7z >/dev/null; then
-              ARCHIVER=7z
-            elif command -v 7zz >/dev/null; then
-              ARCHIVER=7zz
-            else
-              brew install sevenzip
-              ARCHIVER=7zz
-            fi
-
-            "$ARCHIVER" x -y \
-              -ooriginal-alpha \
-              original-alpha.rar >/dev/null
-
-            DLL=$(find "$PWD/original-alpha" \
-              -name UnityEngine.CoreModule.dll \
-              -print -quit)
-
-            test -s "$DLL"
-
-            SOURCE="$(dirname "$DLL")"
-
-          fi
-
-          echo "Unity libraries: $SOURCE"
-
-          for DLL in "$SOURCE"/UnityEngine*.dll; do
-            if [ -f "$DLL" ]; then
-              cp "$DLL" "$REFS/"
-            fi
-          done
-
-          if [ ! -s "$REFS/UnityEngine.dll" ]; then
-
-            if [ -s "$SOURCE/../UnityEngine.dll" ]; then
-
-              cp "$SOURCE/../UnityEngine.dll" "$REFS/"
-
-            else
-
-              DLL=$(find -L /Applications/Unity \
-                -type f \
-                -name UnityEngine.dll \
-                -print -quit 2>/dev/null || true)
-
-              test -s "$DLL"
-
-              cp "$DLL" "$REFS/"
-
-            fi
-
-          fi
-
-          for NAME in "${REQUIRED[@]}"; do
-            test -s "$REFS/$NAME"
-          done
-
-          test -s "$REFS/UnityEngine.dll"
-
-          ls -lh "$REFS" \
-            | tee logs/unity-references.txt
+          bash -n .alpha-ci/input.sh
 
       - name: Activate Unity Personal
         id: activate
@@ -282,169 +221,108 @@ jobs:
           UNITY_USERNAME: ${{ secrets.UNITY_USERNAME || secrets.UNITY_EMAIL }}
           UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
         run: |
-          bash -e .alpha-ci/activate.sh
+          bash -e .fix2/activate.sh
 
       - name: Prepare English Russian Ukrainian
         run: |
           set -euo pipefail
 
-          bash -e .alpha-ci/languages.sh \
-            2>&1 | tee logs/languages.txt
+          bash -e .fix2/languages.sh \
+            2>&1 | tee logs/languages-fix2.txt
 
-      - name: Build mobile controls Fix 1
+          test -s ExportedProject/Assets/Resources/AlphaTranslations.json
+
+      - name: Build mobile controls
         timeout-minutes: 15
         run: |
           set -euo pipefail
 
-          python3 - <<'PY'
-          from pathlib import Path
-
-          p = Path(".alpha-ci/mobile.sh")
-
-          script = p.read_text()
-
-          marker = "dotnet build mobile/AlphaMobile.csproj"
-
-          if marker not in script:
-              raise SystemExit("Build command not found")
-
-          extra = r'''
-          python3 - <<'XMLPATCH'
-          from pathlib import Path
-          import xml.etree.ElementTree as ET
-
-          file = Path("mobile/AlphaMobile.csproj")
-          tree = ET.parse(file)
-          root = tree.getroot()
-
-          group = root.find("ItemGroup")
-
-          existing = {
-              node.get("Include")
-              for node in group.findall("Reference")
-          }
-
-          refs = Path(".alpha-ci/UnityReferences")
-
-          for dll in sorted(refs.glob("UnityEngine*.dll")):
-              if dll.stem in existing:
-                  continue
-
-              if dll.name == "UnityEngine.UI.dll":
-                  continue
-
-              node = ET.SubElement(
-                  group,
-                  "Reference",
-                  Include=dll.stem
-              )
-
-              hint = ET.SubElement(node, "HintPath")
-
-              hint.text = str(dll.resolve())
-
-              ET.SubElement(
-                  node, "Private"
-              ).text = "false"
-
-          tree.write(
-              file,
-              encoding="utf-8",
-              xml_declaration=True
-          )
-
-          print("Unity references configured")
-          XMLPATCH
-
-          '''
-
-          script = script.replace(
-              marker,
-              extra + marker,
-              1
-          )
-
-          p.write_text(script)
-          PY
-
-          bash -n .alpha-ci/mobile.sh
-
-          bash -e .alpha-ci/mobile.sh \
-            2>&1 | tee logs/mobile-build.txt
+          bash -e .fix2/mobile.sh
 
           test -s ExportedProject/Assets/Plugins/AlphaMobile.dll
 
-      - name: Connect controls to original game
-        timeout-minutes: 10
+          echo "Mobile controls compiled"
+
+      - name: Connect controls to original game Fix 2
+        timeout-minutes: 15
         run: |
           set -euo pipefail
 
-          bash -e .alpha-ci/input.sh \
-            2>&1 | tee logs/input-patch-full.txt
+          bash -e .fix2/connect.sh \
+            2>&1 | tee logs/cecil-fix2.txt
 
           test -s ExportedProject/Assets/Plugins/ApocalypseAlpha.dll
 
-      - name: Repair original script references
+          echo "Original game input patched successfully"
+
+      - name: Repair original scene references
         run: |
           set -euo pipefail
 
-          bash -e .alpha-ci/repair.sh \
-            2>&1 | tee logs/repair.txt
+          bash -e .fix2/repair.sh
+
+          test -s ExportedProject/Assets/Plugins/ApocalypseAlpha.dll
+
+          test -s ExportedProject/Assets/Plugins/ApocalypseAlpha.dll.meta
+
+          test -s ExportedProject/Assets/link.xml
 
       - name: Prepare original Chapter 1
         run: |
           set -euo pipefail
 
-          bash -e .alpha-ci/buildscript.sh
+          bash -e .fix2/prepare.sh
 
           test -s ExportedProject/Assets/Editor/AlphaCI/BuildAlpha.cs
 
-      - name: Export Unity to Xcode
+      - name: Export Unity project to Xcode
         timeout-minutes: 70
         run: |
           set -euo pipefail
 
-          bash -e .alpha-ci/export.sh
+          bash -e .fix2/export.sh
 
           test -s Xcode/Unity-iPhone.xcodeproj/project.pbxproj
+
+          echo "Unity iOS export successful"
 
       - name: Return Unity license
         if: always() && steps.activate.outcome == 'success'
         continue-on-error: true
         timeout-minutes: 5
         run: |
-          bash -e .alpha-ci/return.sh
+          bash -e .fix2/return.sh
 
       - name: Build ARM64 application
         timeout-minutes: 45
         run: |
           set -euo pipefail
 
-          bash -e .alpha-ci/xcode.sh
+          bash -e .fix2/xcode.sh
 
-      - name: Create Exclusive Alpha IPA
+      - name: Create Exclusive Alpha Fix 2 IPA
         run: |
           set -euo pipefail
 
-          bash -e .alpha-ci/ipa.sh
+          bash -e .fix2/ipa.sh
 
-          test -s dist/Apocalypse-Alpha-CH1P1-iOS.ipa
+          test -s dist/Apocalypse-Alpha-CH1P1-Fix1.ipa
 
-          mv dist/Apocalypse-Alpha-CH1P1-iOS.ipa \
-            dist/Apocalypse-Alpha-CH1P1-Fix1.ipa
+          mv dist/Apocalypse-Alpha-CH1P1-Fix1.ipa \
+            dist/Apocalypse-Alpha-CH1P1-Fix2.ipa
 
           unzip -tq \
-            dist/Apocalypse-Alpha-CH1P1-Fix1.ipa
+            dist/Apocalypse-Alpha-CH1P1-Fix2.ipa
 
           ls -lh dist/
 
-          echo "Exclusive Alpha Fix 1 IPA created" \
+          echo "Exclusive Alpha Fix 2 IPA created" \
             >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload Exclusive Alpha IPA
         uses: actions/upload-artifact@v4
         with:
-          name: Apocalypse-Alpha-CH1P1-Fix1
+          name: Apocalypse-Alpha-CH1P1-Fix2
           path: dist/*.ipa
           if-no-files-found: error
           compression-level: 0
@@ -454,7 +332,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Apocalypse-Alpha-Fix1-Logs
+          name: Apocalypse-Alpha-Fix2-Logs
           path: logs/
           if-no-files-found: warn
           retention-days: 14
