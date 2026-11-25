@@ -1,0 +1,1152 @@
+
+name: Apocalypse Exclusive Alpha iOS V1
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  ipa:
+    runs-on: macos-15
+    timeout-minutes: 150
+
+    env:
+      UNITY_EDITOR_PATH: /Applications/Unity/Unity.app/Contents/MacOS/Unity
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Prepare folders
+        run: mkdir -p recovery logs dist
+
+      - name: Download original recovered Alpha
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          RUN=$(gh run list \
+            --workflow apocalypse-alpha-recovery.yml \
+            --status success \
+            --limit 1 \
+            --json databaseId \
+            --jq '.[0].databaseId')
+
+          test -n "$RUN"
+
+          gh run download "$RUN" \
+            --name Apocalypse-Exclusive-Alpha-Recovery \
+            --dir recovery
+
+          tar -xzf \
+            recovery/Apocalypse-Alpha-Unity-Project.tar.gz
+
+          test -s ExportedProject/Assets/Plugins/Assembly-CSharp.dll
+
+          test -s ExportedProject/Assets/Scenes/DLC/MenuAlpha.unity
+
+          test -s ExportedProject/Assets/Scenes/DLC/Alphas/CH1P1.unity
+
+          echo "Original Chapter 1 Part 1 confirmed"
+
+      - name: Install Unity and iOS support
+        timeout-minutes: 40
+        run: |
+          set -euo pipefail
+
+          BASE=https://download.unity3d.com/download_unity/88f88f591b2e
+
+          curl -fLsS --retry 3 \
+            "$BASE/MacEditorInstallerArm64/Unity-2021.3.45f2.pkg" \
+            -o "$RUNNER_TEMP/unity.pkg"
+
+          sudo installer \
+            -pkg "$RUNNER_TEMP/unity.pkg" \
+            -target /
+
+          rm "$RUNNER_TEMP/unity.pkg"
+
+          curl -fLsS --retry 3 \
+            "$BASE/MacEditorTargetInstaller/UnitySetup-iOS-Support-for-Editor-2021.3.45f2.pkg" \
+            -o "$RUNNER_TEMP/ios.pkg"
+
+          sudo installer \
+            -pkg "$RUNNER_TEMP/ios.pkg" \
+            -target /
+
+          rm "$RUNNER_TEMP/ios.pkg"
+
+          test -x "$UNITY_EDITOR_PATH"
+
+          xcodebuild -version
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Activate Unity Personal
+        id: activate
+        env:
+          UNITY_USERNAME: ${{ secrets.UNITY_USERNAME || secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        run: |
+          npm install -g @rage-against-the-pixel/unity-cli@4.2.2
+          unity-cli activate-license --license personal
+
+      - name: Prepare English Russian Ukrainian
+        run: |
+          set -euo pipefail
+
+          mkdir -p ExportedProject/Assets/Resources
+
+          cp ExportedProject/Assets/Font/LiberationSans.ttf \
+            ExportedProject/Assets/Resources/AlphaMobileFont.ttf
+
+          python3 -m venv "$RUNNER_TEMP/alpha-python"
+
+          "$RUNNER_TEMP/alpha-python/bin/pip" install pyyaml
+
+          "$RUNNER_TEMP/alpha-python/bin/python" - <<'PY'
+          import json
+          import re
+          import yaml
+          from pathlib import Path
+
+          assets = Path("ExportedProject/Assets")
+
+          translations = {
+              "Sig": ["Далее", "Далі"],
+              "Music": ["Музыка и окружение", "Музика й оточення"],
+              "Effects": ["Звуковые эффекты", "Звукові ефекти"],
+              "Res": ["Разрешение", "Роздільна здатність"],
+              "Qual": ["Качество", "Якість"],
+              "Full": ["Полный экран", "Повний екран"],
+              "Post": ["Визуальные эффекты", "Візуальні ефекти"],
+              "Download": ["Спасибо за скачивание!", "Дякуємо за завантаження!"],
+              "Play": ["Играть", "Грати"],
+              "Language": ["Язык: русский", "Мова: українська"],
+              "Options": ["Настройки", "Налаштування"],
+              "Sounds": ["Звуки", "Звуки"],
+              "ExitButton": ["В главное меню", "До головного меню"],
+              "Pause": ["Пауза", "Пауза"],
+              "Quality": ["Качество", "Якість"],
+              "Resolution": ["Разрешение", "Роздільна здатність"],
+              "ESC": ["Нажмите паузу для продолжения", "Натисніть паузу для продовження"],
+              "FullScreen": ["Полный экран", "Повний екран"],
+              "Saveback": ["Сохранить и вернуться", "Зберегти й повернутися"],
+              "action": ["Ударить по мячу Ля-Ли", "Вдарити по м'ячу Ля-Лі"],
+              "dialogo3": ["Хорошо, Дипси, твоя очередь бить по мячу.", "Гаразд, Діпсі, твоя черга бити по м'ячу."],
+              "dialogo4": ["Ты уверен?", "Ти впевнений?"],
+              "dialogo5": ["Просто ударь по мячу, он тебя не обидит.", "Просто вдар по м'ячу, він тебе не скривдить."],
+              "dialogo6": ["Да, Дипси, я не причиню тебе вреда. Это просто мяч.", "Так, Діпсі, я не завдам тобі шкоди. Це просто м'яч."],
+              "dialogo7": ["Давай, Дипси, у тебя получится!", "Давай, Діпсі, у тебе вийде!"],
+              "dialogo8": ["Чёрт! Только не снова!", "Отакої! Тільки не знову!"],
+              "dialogo9": ["Дипси, можешь вернуть мяч?", "Діпсі, можеш повернути м'яч?"],
+              "choice1": ["Хорошо, я и так собирался его вернуть.", "Гаразд, я й так збирався його повернути."],
+              "dialogo1choice1": ["Хорошо, я и так собирался его вернуть...", "Гаразд, я й так збирався його повернути..."],
+              "dialogo2choice1": ["Я скоро вернусь.", "Я скоро повернуся."],
+              "choice2": ["Я говорил, что это плохая идея.", "Я казав, що це погана ідея."],
+              "dialogo1choice2": ["Я говорил, что мне не стоит бить по мячу.", "Я казав, що мені не варто бити по м'ячу."],
+              "dialogo2choice2": ["Не переживай, мы знали, что так получится.", "Не хвилюйся, ми знали, що так станеться."],
+              "dialogo3choice2": ["Ладно, схожу за мячом. Скоро вернусь.", "Гаразд, піду по м'яч. Скоро повернуся."],
+              "c2dialogue1": ["Вот и мяч.", "Ось і м'яч."],
+              "c2dialogue2": ["Странно... Этот камень выглядит необычно.", "Дивно... Цей камінь виглядає незвично."],
+              "c2dialogue3": ["Он... Звучит как металл?", "Він... Звучить як метал?"],
+              "c2dialogue4": ["Что за чертовщина?!", "Що за чортівня?!"],
+              "c2dialogue5": ["Это выглядит жутко...", "Це виглядає моторошно..."],
+              "c2dialogue6": ["Мне нужно быстро добраться до этой штуки...", "Мені потрібно швидко дістатися до цієї штуки..."],
+              "c2dialogue7": ["Что это за место?", "Що це за місце?"],
+              "c3dialogue1": ["Наконец-то я нашёл это!", "Нарешті я знайшов це!"],
+              "c3dialogue2": ["Привет?", "Привіт?"],
+              "c3dialogue3": ["Кто ты?", "Хто ти?"],
+              "c3dialogue4": ["Ты умеешь говорить?", "Ти вмієш говорити?"],
+              "c3dialogue5": ["Ты меня слышишь?", "Ти мене чуєш?"],
+              "c3dialogue6": ["Какого чёрта?", "Якого біса?"],
+              "c3dialogue7": ["Думаю, я оставлю его шляпу...", "Гадаю, я залишу його капелюх..."],
+              "c3dialogue1ALT": ["Что это такое?!", "Що це таке?!"],
+              "c3dialogue2ALT": ["Не могу поверить, что за нами всё это время следили!", "Не можу повірити, що за нами весь цей час стежили!"],
+              "c3dialogue3ALT": ["Нужно срочно уходить!", "Треба негайно йти!"],
+              "c4dialogue1": ["Кто ты?!", "Хто ти?!"],
+              "c4dialogue2": ["Вот ты где.", "Ось ти де."],
+              "c4dialogue3": ["Выйди из меня!", "Вийди з мене!"],
+              "c4dialogue4": ["Вернись сюда!", "Повернися сюди!"],
+              "c4dialogue5": ["Не может быть... Выхода нет.", "Не може бути... Виходу немає."],
+              "c4dialogue6": ["Несколько секунд будет больно...", "Кілька секунд буде боляче..."],
+              "month": ["Одиннадцать месяцев назад...", "Одинадцять місяців тому..."],
+              "Present": ["Одиннадцать месяцев спустя...", "Одинадцять місяців потому..."]
+          }
+
+          rows = []
+
+          def scalar(value):
+              try:
+                  return str(yaml.safe_load(value) or "")
+              except Exception:
+                  return value.strip("'\"")
+
+          for scene in (assets / "Scenes").rglob("*.unity"):
+              text = scene.read_text()
+
+              sections = re.split(
+                  r"(?m)^  - phrase: ",
+                  text
+              )[1:]
+
+              for section in sections:
+                  key = section.splitlines()[0].strip()
+                  key = scalar(key)
+
+                  if key not in translations:
+                      continue
+
+                  en = re.search(
+                      r"(?m)^    - locale: en\n      translation: (.*)$",
+                      section
+                  )
+
+                  es = re.search(
+                      r"(?m)^    - locale: es\n      translation: (.*)$",
+                      section
+                  )
+
+                  if en:
+                      rows.append({
+                          "en": scalar(en.group(1)),
+                          "es": scalar(es.group(1)) if es else "",
+                          "ru": translations[key][0],
+                          "uk": translations[key][1]
+                      })
+
+          extras = [
+              ["You", "You", "Вы", "Ви"],
+              ["Lake", "Lago", "Озеро", "Озеро"],
+              ["Tubby House", "Casa Teletubbie", "Дом телепузиков", "Будинок телепузиків"],
+              ["Dry tree", "Arbol seco", "Сухое дерево", "Сухе дерево"],
+              ["Coming soon...", "Muy Pronto...", "Скоро...", "Незабаром..."],
+              ["Chapter 1 Part 1", "Capítulo 1 Parte 1", "Глава 1, часть 1", "Розділ 1, частина 1"],
+              ["Select language", "Select language/Seleciona un lenguaje", "Выберите язык", "Оберіть мову"],
+              ["Exclusive Public Alpha", "Exclusive Public Alpha", "Эксклюзивная альфа", "Ексклюзивна альфа"],
+              ["Pilot", "Pilot", "Пилот", "Пілот"],
+              ["Where should I search?", "¿A donde deberia ir a buscar?", "Где мне искать?", "Де мені шукати?"],
+              ["I will keep walking...", "Creo que seguire caminando...", "Пожалуй, пойду дальше...", "Мабуть, піду далі..."],
+              ["A custard?", "¿Una papilla?", "Телепузиковый крем?", "Крем телепузиків?"],
+              ["Be careful W.", "Ten cuidado W.", "Будь осторожен, W.", "Будь обережний, W."],
+              ["Hide inventory", 'Presiona "i" para ocultar el inventario', "Скрыть инвентарь", "Приховати інвентар"],
+              ["I need to reach the helicopter!", "¡NECESITO LLEGAR AL HELICOPTERO RAPIDO!", "Нужно срочно добраться до вертолёта!", "Треба негайно дістатися до гелікоптера!"]
+          ]
+
+          for en, es, ru, uk in extras:
+              rows.append(dict(en=en, es=es, ru=ru, uk=uk))
+
+          assert len(rows) > 50
+
+          path = assets / "Resources/AlphaTranslations.json"
+
+          path.write_text(
+              json.dumps({"rows": rows}, ensure_ascii=False),
+              encoding="utf-8"
+          )
+
+          print("Translation entries:", len(rows))
+          PY
+
+      - name: Create mobile input library
+        run: |
+          set -euo pipefail
+
+          mkdir -p mobile
+
+          cat > mobile/AlphaMobile.csproj <<'EOF'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <TargetFramework>netstandard2.1</TargetFramework>
+              <AssemblyName>AlphaMobile</AssemblyName>
+              <LangVersion>latest</LangVersion>
+            </PropertyGroup>
+            <ItemGroup>
+              <Reference Include="UnityEngine">
+                <HintPath>$(UnityManaged)/UnityEngine.dll</HintPath>
+              </Reference>
+              <Reference Include="UnityEngine.CoreModule">
+                <HintPath>$(UnityManaged)/UnityEngine.CoreModule.dll</HintPath>
+              </Reference>
+              <Reference Include="UnityEngine.InputLegacyModule">
+                <HintPath>$(UnityManaged)/UnityEngine.InputLegacyModule.dll</HintPath>
+              </Reference>
+              <Reference Include="UnityEngine.IMGUIModule">
+                <HintPath>$(UnityManaged)/UnityEngine.IMGUIModule.dll</HintPath>
+              </Reference>
+              <Reference Include="UnityEngine.TextRenderingModule">
+                <HintPath>$(UnityManaged)/UnityEngine.TextRenderingModule.dll</HintPath>
+              </Reference>
+              <Reference Include="UnityEngine.JSONSerializeModule">
+                <HintPath>$(UnityManaged)/UnityEngine.JSONSerializeModule.dll</HintPath>
+              </Reference>
+              <Reference Include="UnityEngine.UIModule">
+                <HintPath>$(UnityManaged)/UnityEngine.UIModule.dll</HintPath>
+              </Reference>
+              <Reference Include="UnityEngine.UI">
+                <HintPath>$(OriginalPlugins)/UnityEngine.UI.dll</HintPath>
+              </Reference>
+            </ItemGroup>
+          </Project>
+          EOF
+
+          cat > mobile/Mobile.cs <<'CS'
+          using System;
+          using System.IO;
+          using System.Collections.Generic;
+          using UnityEngine;
+          using UnityEngine.UI;
+          using UnityEngine.SceneManagement;
+
+          public static class AlphaInput
+          {
+              static int frame = -1;
+              static Vector2 move, look;
+              static HashSet<KeyCode> held = new HashSet<KeyCode>();
+              static HashSet<KeyCode> down = new HashSet<KeyCode>();
+              static HashSet<KeyCode> up = new HashSet<KeyCode>();
+
+              public static Vector2 Movement
+              {
+                  get { Poll(); return move; }
+              }
+
+              static bool Mobile =>
+                  Application.platform == RuntimePlatform.IPhonePlayer;
+
+              public static Rect Button(int i)
+              {
+                  float w = Screen.width;
+                  float h = Screen.height;
+
+                  return new Rect(
+                      w * (0.78f + (i % 2) * 0.10f),
+                      h * (0.36f + (i / 2) * 0.17f),
+                      w * 0.095f,
+                      h * 0.15f
+                  );
+              }
+
+              static readonly KeyCode[] keys = {
+                  KeyCode.E, KeyCode.Space,
+                  KeyCode.LeftShift, KeyCode.LeftControl,
+                  KeyCode.I, KeyCode.Escape
+              };
+
+              static void Poll()
+              {
+                  if (frame == Time.frameCount) return;
+                  frame = Time.frameCount;
+
+                  move = Vector2.zero;
+                  look = Vector2.zero;
+
+                  var next = new HashSet<KeyCode>();
+
+                  if (Mobile &&
+                      SceneManager.GetActiveScene().name == "CH1P1")
+                  {
+                      foreach (Touch t in Input.touches)
+                      {
+                          if (t.phase == TouchPhase.Ended ||
+                              t.phase == TouchPhase.Canceled) continue;
+
+                          Vector2 p = new Vector2(
+                              t.position.x,
+                              Screen.height - t.position.y
+                          );
+
+                          bool button = false;
+
+                          for (int i = 0; i < keys.Length; i++)
+                          {
+                              if (Button(i).Contains(p))
+                              {
+                                  next.Add(keys[i]);
+                                  button = true;
+                                  break;
+                              }
+                          }
+
+                          if (button) continue;
+
+                          if (p.x < Screen.width * 0.34f &&
+                              p.y > Screen.height * 0.48f)
+                          {
+                              Vector2 center = new Vector2(
+                                  Screen.width * 0.17f,
+                                  Screen.height * 0.74f
+                              );
+
+                              move = Vector2.ClampMagnitude(
+                                  new Vector2(
+                                      p.x - center.x,
+                                      center.y - p.y
+                                  ) / (Screen.height * 0.17f),
+                                  1f
+                              );
+                          }
+                          else if (p.x > Screen.width * 0.38f &&
+                                   p.x < Screen.width * 0.77f &&
+                                   p.y > Screen.height * 0.22f)
+                          {
+                              look += t.deltaPosition * 0.12f;
+                          }
+                      }
+                  }
+
+                  down = new HashSet<KeyCode>(next);
+                  down.ExceptWith(held);
+
+                  up = new HashSet<KeyCode>(held);
+                  up.ExceptWith(next);
+
+                  held = next;
+              }
+
+              public static float GetAxis(string name)
+              {
+                  if (!Mobile) return Input.GetAxis(name);
+
+                  Poll();
+
+                  switch (name)
+                  {
+                      case "Horizontal": return move.x;
+                      case "Vertical": return move.y;
+                      case "Mouse X": return look.x;
+                      case "Mouse Y": return look.y;
+                      default: return Input.GetAxis(name);
+                  }
+              }
+
+              public static float GetAxisRaw(string name)
+              {
+                  return Mobile
+                      ? GetAxis(name)
+                      : Input.GetAxisRaw(name);
+              }
+
+              public static bool GetKey(KeyCode key)
+              {
+                  Poll();
+                  return held.Contains(key) || Input.GetKey(key);
+              }
+
+              public static bool GetKeyDown(KeyCode key)
+              {
+                  Poll();
+                  return down.Contains(key) || Input.GetKeyDown(key);
+              }
+
+              public static bool GetKeyUp(KeyCode key)
+              {
+                  Poll();
+                  return up.Contains(key) || Input.GetKeyUp(key);
+              }
+
+              static KeyCode Parse(string value)
+              {
+                  KeyCode key;
+                  return Enum.TryParse(
+                      value.Replace(" ", ""),
+                      true,
+                      out key
+                  ) ? key : KeyCode.None;
+              }
+
+              public static bool GetKey(string key)
+              {
+                  return GetKey(Parse(key)) || Input.GetKey(key);
+              }
+
+              public static bool GetKeyDown(string key)
+              {
+                  return GetKeyDown(Parse(key)) || Input.GetKeyDown(key);
+              }
+
+              public static bool GetKeyUp(string key)
+              {
+                  return GetKeyUp(Parse(key)) || Input.GetKeyUp(key);
+              }
+
+              static KeyCode ButtonKey(string name)
+              {
+                  if (name == "Jump") return KeyCode.Space;
+                  if (name == "Fire1") return KeyCode.E;
+                  if (name == "Cancel") return KeyCode.Escape;
+                  if (name == "Submit") return KeyCode.E;
+                  return KeyCode.None;
+              }
+
+              public static bool GetButton(string name)
+              {
+                  return GetKey(ButtonKey(name)) || Input.GetButton(name);
+              }
+
+              public static bool GetButtonDown(string name)
+              {
+                  return GetKeyDown(ButtonKey(name)) ||
+                      Input.GetButtonDown(name);
+              }
+
+              public static bool GetButtonUp(string name)
+              {
+                  return GetKeyUp(ButtonKey(name)) ||
+                      Input.GetButtonUp(name);
+              }
+          }
+
+          [Serializable]
+          public class AlphaTranslation
+          {
+              public string en, es, ru, uk;
+          }
+
+          [Serializable]
+          public class AlphaTranslationList
+          {
+              public AlphaTranslation[] rows;
+          }
+
+          public sealed class AlphaMobile : MonoBehaviour
+          {
+              static string language;
+              static string log;
+              static Font font;
+              static AlphaTranslation[] translations;
+              float nextUpdate;
+
+              [RuntimeInitializeOnLoadMethod(
+                  RuntimeInitializeLoadType.BeforeSceneLoad)]
+              static void Install()
+              {
+                  if (Application.platform !=
+                      RuntimePlatform.IPhonePlayer) return;
+
+                  language = PlayerPrefs.GetString(
+                      "alpha.language", "en"
+                  );
+
+                  log = Path.Combine(
+                      Application.persistentDataPath,
+                      "alpha-ios-log.txt"
+                  );
+
+                  font = Resources.Load<Font>("AlphaMobileFont");
+
+                  var data = Resources.Load<TextAsset>(
+                      "AlphaTranslations"
+                  );
+
+                  if (data != null)
+                      translations = JsonUtility
+                          .FromJson<AlphaTranslationList>(
+                              data.text
+                          ).rows;
+
+                  var root = new GameObject("Alpha Mobile");
+                  DontDestroyOnLoad(root);
+
+                  root.AddComponent<AlphaMobile>();
+
+                  Write("Exclusive Alpha iOS started");
+
+                  SceneManager.sceneLoaded += (scene, mode) =>
+                      Write("Scene loaded: " + scene.name);
+
+                  Application.logMessageReceived +=
+                      (message, stack, type) =>
+                      {
+                          if (type == LogType.Error ||
+                              type == LogType.Exception)
+                              Write(message + "\n" + stack);
+                      };
+              }
+
+              static void Write(string message)
+              {
+                  try
+                  {
+                      File.AppendAllText(
+                          log,
+                          DateTime.Now + " " + message + "\n"
+                      );
+                  }
+                  catch {}
+              }
+
+              static void SetLanguage(string value)
+              {
+                  language = value;
+
+                  PlayerPrefs.SetString(
+                      "alpha.language", value
+                  );
+
+                  PlayerPrefs.Save();
+              }
+
+              string L(string en, string ru, string uk)
+              {
+                  return language == "ru" ? ru :
+                      language == "uk" ? uk : en;
+              }
+
+              void Update()
+              {
+                  if (Time.unscaledTime < nextUpdate) return;
+
+                  nextUpdate = Time.unscaledTime + 0.25f;
+
+                  if (translations == null) return;
+
+                  foreach (Text text in
+                      Resources.FindObjectsOfTypeAll<Text>())
+                  {
+                      if (text == null ||
+                          !text.gameObject.scene.IsValid()) continue;
+
+                      foreach (var row in translations)
+                      {
+                          if (string.IsNullOrEmpty(text.text))
+                              continue;
+
+                          if (text.text != row.en &&
+                              text.text != row.es &&
+                              text.text != row.ru &&
+                              text.text != row.uk) continue;
+
+                          text.text = L(
+                              row.en, row.ru, row.uk
+                          );
+
+                          if (font != null && language != "en")
+                              text.font = font;
+
+                          break;
+                      }
+                  }
+              }
+
+              void OnGUI()
+              {
+                  float w = Screen.width;
+                  float h = Screen.height;
+
+                  if (font != null)
+                      GUI.skin.font = font;
+
+                  GUI.skin.button.fontSize =
+                      Mathf.RoundToInt(h * 0.030f);
+
+                  GUI.skin.box.fontSize =
+                      Mathf.RoundToInt(h * 0.028f);
+
+                  bool playing = SceneManager
+                      .GetActiveScene().name == "CH1P1";
+
+                  if (!playing)
+                  {
+                      if (GUI.Button(new Rect(
+                          w * .65f, h * .025f,
+                          w * .10f, h * .08f), "EN"))
+                          SetLanguage("en");
+
+                      if (GUI.Button(new Rect(
+                          w * .76f, h * .025f,
+                          w * .10f, h * .08f), "RU"))
+                          SetLanguage("ru");
+
+                      if (GUI.Button(new Rect(
+                          w * .87f, h * .025f,
+                          w * .10f, h * .08f), "UA"))
+                          SetLanguage("uk");
+
+                      if (PlayerPrefs.GetInt(
+                          "alpha.checkpoint", 0) == 1)
+                      {
+                          if (GUI.Button(new Rect(
+                              w * .31f, h * .85f,
+                              w * .38f, h * .09f),
+                              L("Continue chapter",
+                                "Продолжить главу",
+                                "Продовжити розділ")))
+                          {
+                              Time.timeScale = 1f;
+                              SceneManager.LoadScene("CH1P1");
+                          }
+                      }
+
+                      return;
+                  }
+
+                  GUI.color = new Color(1, 1, 1, 0.68f);
+
+                  GUI.Box(new Rect(
+                      w * .07f, h * .59f,
+                      w * .20f, h * .30f),
+                      L("MOVE", "ХОДЬБА", "РУХ")
+                  );
+
+                  Vector2 move = AlphaInput.Movement;
+
+                  GUI.Box(new Rect(
+                      w * .145f + move.x * h * .10f,
+                      h * .69f - move.y * h * .10f,
+                      h * .09f, h * .09f), "");
+
+                  string[] labels = {
+                      L("USE", "ДЕЙСТВИЕ", "ДІЯ"),
+                      L("JUMP", "ПРЫЖОК", "СТРИБОК"),
+                      L("RUN", "БЕГ", "БІГ"),
+                      L("CROUCH", "СЕСТЬ", "ПРИСІСТИ"),
+                      L("ITEMS", "ВЕЩИ", "РЕЧІ"),
+                      L("PAUSE", "ПАУЗА", "ПАУЗА")
+                  };
+
+                  for (int i = 0; i < labels.Length; i++)
+                      GUI.Box(AlphaInput.Button(i), labels[i]);
+
+                  GUI.color = Color.white;
+
+                  if (GUI.Button(new Rect(
+                      w * .025f, h * .025f,
+                      w * .22f, h * .08f),
+                      L("Save chapter",
+                        "Сохранить главу",
+                        "Зберегти розділ")))
+                  {
+                      PlayerPrefs.SetInt(
+                          "alpha.checkpoint", 1
+                      );
+
+                      PlayerPrefs.Save();
+                      Write("Chapter-start checkpoint saved");
+                  }
+              }
+          }
+          CS
+
+          MANAGED="$(dirname "$UNITY_EDITOR_PATH")/../Resources/Scripting/Managed/UnityEngine"
+
+          if [ ! -f "$MANAGED/UnityEngine.CoreModule.dll" ]; then
+            MANAGED=$(dirname "$(find \
+              "$(dirname "$UNITY_EDITOR_PATH")/../Resources" \
+              -name UnityEngine.CoreModule.dll \
+              -print -quit)")
+          fi
+
+          test -s "$MANAGED/UnityEngine.CoreModule.dll"
+
+          dotnet build mobile/AlphaMobile.csproj \
+            -c Release \
+            -p:UnityManaged="$MANAGED" \
+            -p:OriginalPlugins="$PWD/ExportedProject/Assets/Plugins"
+
+          cp mobile/bin/Release/netstandard2.1/AlphaMobile.dll \
+            ExportedProject/Assets/Plugins/
+
+      - name: Connect mobile input to original scripts
+        run: |
+          set -euo pipefail
+
+          dotnet new console \
+            -o patcher \
+            --framework net8.0
+
+          dotnet add patcher package Mono.Cecil \
+            --version 0.11.6
+
+          cat > patcher/Program.cs <<'CS'
+          using System;
+          using System.IO;
+          using System.Linq;
+          using System.Collections.Generic;
+          using Mono.Cecil;
+          using Mono.Cecil.Cil;
+
+          string dir = args[0];
+
+          string oldPath = Path.Combine(
+              dir, "Assembly-CSharp.dll"
+          );
+
+          using var game =
+              AssemblyDefinition.ReadAssembly(
+                  oldPath,
+                  new ReaderParameters { InMemory = true }
+              );
+
+          using var mobile =
+              AssemblyDefinition.ReadAssembly(
+                  Path.Combine(dir, "AlphaMobile.dll")
+              );
+
+          var api = mobile.MainModule.Types
+              .Single(t => t.Name == "AlphaInput");
+
+          IEnumerable<TypeDefinition> Walk(
+              IEnumerable<TypeDefinition> list)
+          {
+              foreach (var t in list)
+              {
+                  yield return t;
+
+                  foreach (var nested in Walk(t.NestedTypes))
+                      yield return nested;
+              }
+          }
+
+          int changed = 0;
+
+          foreach (var type in Walk(game.MainModule.Types))
+          foreach (var method in type.Methods)
+          {
+              if (!method.HasBody) continue;
+
+              foreach (var instruction in method.Body.Instructions)
+              {
+                  if (!(instruction.Operand is MethodReference old))
+                      continue;
+
+                  if (old.DeclaringType.FullName !=
+                      "UnityEngine.Input") continue;
+
+                  var replacement = api.Methods.FirstOrDefault(m =>
+                      m.IsStatic &&
+                      m.Name == old.Name &&
+                      m.ReturnType.FullName ==
+                          old.ReturnType.FullName &&
+                      m.Parameters.Select(p =>
+                          p.ParameterType.FullName)
+                      .SequenceEqual(old.Parameters.Select(p =>
+                          p.ParameterType.FullName))
+                  );
+
+                  if (replacement == null) continue;
+
+                  instruction.Operand = game.MainModule
+                      .ImportReference(replacement);
+
+                  instruction.OpCode = OpCodes.Call;
+                  changed++;
+              }
+          }
+
+          if (changed == 0)
+              throw new Exception("No original input calls patched");
+
+          game.Name.Name = "ApocalypseAlpha";
+          game.MainModule.Name = "ApocalypseAlpha.dll";
+
+          game.Write(Path.Combine(
+              dir, "ApocalypseAlpha.dll"
+          ));
+
+          File.Delete(oldPath);
+
+          Console.WriteLine("Original input calls patched: " + changed);
+          CS
+
+          dotnet run --project patcher -- \
+            "$PWD/ExportedProject/Assets/Plugins" \
+            | tee logs/input-patch.txt
+
+      - name: Repair original Unity script references
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          assets = Path("ExportedProject/Assets")
+          plugins = assets / "Plugins"
+
+          old = plugins / "Assembly-CSharp.dll.meta"
+          new = plugins / "ApocalypseAlpha.dll.meta"
+
+          old.rename(new)
+
+          for meta in plugins.glob("*.dll.meta"):
+              source = meta.read_text()
+
+              source = re.sub(
+                  r"(Editor: Editor\r?\n[ \t]+second:\r?\n[ \t]+enabled: )0",
+                  r"\g<1>1",
+                  source
+              )
+
+              meta.write_text(source)
+
+          total = 0
+
+          for path in assets.rglob("*"):
+              if path.suffix not in {
+                  ".unity", ".prefab", ".asset"
+              }:
+                  continue
+
+              source = path.read_bytes()
+
+              updated, count = re.subn(
+                  rb"(m_TargetAssemblyTypeName:[^\r\n]*?,[ \t]*)Assembly-CSharp(?=[ \t\r\n,'\"]|$)",
+                  rb"\g<1>ApocalypseAlpha",
+                  source
+              )
+
+              if count:
+                  path.write_bytes(updated)
+                  total += count
+
+          print("Repaired UnityEvent references:", total)
+          PY
+
+          cat > ExportedProject/Assets/link.xml <<'XML'
+          <linker>
+            <assembly fullname="ApocalypseAlpha" preserve="all"/>
+            <assembly fullname="AlphaMobile" preserve="all"/>
+          </linker>
+          XML
+
+      - name: Create iOS build and validation script
+        run: |
+          set -euo pipefail
+
+          mkdir -p ExportedProject/Assets/Editor/AlphaCI
+
+          cat > ExportedProject/Assets/Editor/AlphaCI/BuildAlpha.cs <<'CS'
+          using System;
+          using UnityEngine;
+          using UnityEngine.Rendering;
+          using UnityEditor;
+          using UnityEditor.Build;
+          using UnityEditor.Build.Reporting;
+          using UnityEditor.SceneManagement;
+
+          public static class BuildAlpha
+          {
+              public static void Run()
+              {
+                  string[] scenes = {
+                      "Assets/Scenes/DLC/MenuAlpha.unity",
+                      "Assets/Scenes/DLC/Alphas/CH1P1.unity"
+                  };
+
+                  EditorBuildSettings.scenes = new[] {
+                      new EditorBuildSettingsScene(scenes[0], true),
+                      new EditorBuildSettingsScene(scenes[1], true)
+                  };
+
+                  foreach (string path in scenes)
+                  {
+                      var scene = EditorSceneManager.OpenScene(path);
+
+                      int missing = 0;
+
+                      foreach (var root in scene.GetRootGameObjects())
+                      foreach (var t in
+                          root.GetComponentsInChildren<Transform>(true))
+                      {
+                          missing += GameObjectUtility
+                              .GetMonoBehavioursWithMissingScriptCount(
+                                  t.gameObject
+                              );
+                      }
+
+                      Debug.Log(
+                          scene.name + ": missing scripts = " + missing
+                      );
+
+                      if (scene.name == "MenuAlpha" && missing > 0)
+                          throw new BuildFailedException(
+                              "Original menu scripts are missing"
+                          );
+                  }
+
+                  PlayerSettings.productName =
+                      "Apocalypse REBOOT Alpha";
+
+                  PlayerSettings.bundleVersion = "0.1.0";
+                  PlayerSettings.iOS.buildNumber = "1";
+
+                  PlayerSettings.SetApplicationIdentifier(
+                      BuildTargetGroup.iOS,
+                      "com.apocalypsereboot.alpha.ios"
+                  );
+
+                  PlayerSettings.iOS.targetOSVersionString = "15.0";
+
+                  PlayerSettings.defaultInterfaceOrientation =
+                      UIOrientation.LandscapeLeft;
+
+                  PlayerSettings.SetScriptingBackend(
+                      BuildTargetGroup.iOS,
+                      ScriptingImplementation.IL2CPP
+                  );
+
+                  PlayerSettings.SetManagedStrippingLevel(
+                      BuildTargetGroup.iOS,
+                      ManagedStrippingLevel.Low
+                  );
+
+                  PlayerSettings.stripEngineCode = false;
+
+                  PlayerSettings.SetUseDefaultGraphicsAPIs(
+                      BuildTarget.iOS, false
+                  );
+
+                  PlayerSettings.SetGraphicsAPIs(
+                      BuildTarget.iOS,
+                      new[] { GraphicsDeviceType.Metal }
+                  );
+
+                  PlayerSettings.iOS.appleEnableAutomaticSigning =
+                      false;
+
+                  string output = Environment.GetEnvironmentVariable(
+                      "ALPHA_XCODE"
+                  );
+
+                  var report = BuildPipeline.BuildPlayer(
+                      scenes,
+                      output,
+                      BuildTarget.iOS,
+                      BuildOptions.None
+                  );
+
+                  if (report.summary.result != BuildResult.Succeeded)
+                      throw new BuildFailedException(
+                          "Alpha iOS export failed: " +
+                          report.summary.result
+                      );
+
+                  Debug.Log("Original Chapter 1 Part 1 exported");
+              }
+          }
+          CS
+
+      - name: Export Unity to Xcode
+        timeout-minutes: 70
+        run: |
+          set -euo pipefail
+
+          export ALPHA_XCODE="$PWD/Xcode"
+
+          LOG="$PWD/logs/unity.log"
+
+          touch "$LOG"
+
+          tail -n +1 -F "$LOG" &
+          PID=$!
+
+          trap 'kill "$PID" 2>/dev/null || true' EXIT
+
+          "$UNITY_EDITOR_PATH" \
+            -quit \
+            -batchmode \
+            -nographics \
+            -buildTarget iOS \
+            -projectPath "$PWD/ExportedProject" \
+            -executeMethod BuildAlpha.Run \
+            -logFile "$LOG"
+
+          test -s Xcode/Unity-iPhone.xcodeproj/project.pbxproj
+
+      - name: Return Unity license
+        if: always() && steps.activate.outcome == 'success'
+        continue-on-error: true
+        run: |
+          unity-cli return-license \
+            --license personal \
+            --when auto
+
+      - name: Build ARM64 application
+        timeout-minutes: 45
+        run: |
+          set -euo pipefail
+
+          xcodebuild \
+            -project Xcode/Unity-iPhone.xcodeproj \
+            -scheme Unity-iPhone \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$PWD/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            ARCHS=arm64 \
+            build | tee logs/xcode.log
+
+      - name: Create Exclusive Alpha IPA
+        run: |
+          set -euo pipefail
+
+          APP=$(find \
+            "$PWD/DerivedData/Build/Products/Release-iphoneos" \
+            -maxdepth 1 \
+            -type d \
+            -name '*.app' \
+            -print -quit)
+
+          test -d "$APP/Data"
+
+          EXE=$(/usr/libexec/PlistBuddy \
+            -c 'Print :CFBundleExecutable' \
+            "$APP/Info.plist")
+
+          lipo "$APP/$EXE" -verify_arch arm64
+
+          PLIST="$APP/Info.plist"
+
+          for KEY in UIFileSharingEnabled LSSupportsOpeningDocumentsInPlace; do
+            /usr/libexec/PlistBuddy \
+              -c "Set :$KEY true" "$PLIST" \
+              2>/dev/null || \
+            /usr/libexec/PlistBuddy \
+              -c "Add :$KEY bool true" "$PLIST"
+          done
+
+          STAGE=$(mktemp -d)
+
+          mkdir -p "$STAGE/Payload"
+
+          ditto "$APP" \
+            "$STAGE/Payload/ApocalypseAlpha.app"
+
+          ditto -c -k --norsrc --keepParent \
+            "$STAGE/Payload" \
+            "$PWD/dist/Apocalypse-Alpha-CH1P1-iOS.ipa"
+
+          unzip -tq \
+            dist/Apocalypse-Alpha-CH1P1-iOS.ipa
+
+          ls -lh dist/
+
+      - name: Upload Exclusive Alpha IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Apocalypse-Alpha-CH1P1-iOS
+          path: dist/*.ipa
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Upload diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Apocalypse-Alpha-iOS-Logs
+          path: logs/
+          retention-days: 14
