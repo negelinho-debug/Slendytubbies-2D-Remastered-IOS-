@@ -1,11 +1,11 @@
 
-name: Coming - Full Recovery V1
+name: Coming - Full Recovery V2
 
 on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   recovery:
@@ -13,15 +13,6 @@ jobs:
     timeout-minutes: 150
 
     steps:
-      - name: Check private repository
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          test "$(gh api "repos/$GITHUB_REPOSITORY" --jq '.private')" = true
-
-      - name: Checkout
-        uses: actions/checkout@v4
-
       - name: Prepare tools
         run: |
           mkdir -p game reports recovered recovered-code
@@ -73,7 +64,7 @@ jobs:
           7z t Coming.zip
           7z x Coming.zip -ogame -y
 
-      - name: Detect original Unity files
+      - name: Detect Unity and Mono
         run: |
           set -euo pipefail
 
@@ -86,13 +77,11 @@ jobs:
           echo "GAME_ROOT=$(dirname "$managers")" >> "$GITHUB_ENV"
           echo "GAME_DLL=$dll" >> "$GITHUB_ENV"
 
-          find game -type f > reports/original-files.txt
-
           {
-            echo "They're Coming Full Recovery"
-            echo "Original Unity: detected 5.4.2f2 in previous run"
+            echo "Coming Full Recovery V2"
+            echo "Original Unity: previously detected 5.4.2f2"
             echo "Original backend: Mono"
-            echo "Gameplay DLL: $dll"
+            echo "Gameplay DLL: found"
           } > reports/summary.txt
 
       - name: Install .NET
@@ -111,17 +100,13 @@ jobs:
             https://github.com/nowl-it/AssetRipperCLI.git \
             "$RUNNER_TEMP/ripper"
 
-          git -C "$RUNNER_TEMP/ripper" rev-parse HEAD \
-            > reports/assetripper-version.txt
-
           dotnet publish \
             "$RUNNER_TEMP/ripper/Source/AssetRipper.GUI.Free/AssetRipper.GUI.Free.csproj" \
             -c Release \
             -r linux-x64 \
             --self-contained true \
             -p:PublishAot=false \
-            -o "$RUNNER_TEMP/ripper-bin" \
-            2>&1 | tee reports/ripper-build.log
+            -o "$RUNNER_TEMP/ripper-bin"
 
       - name: Recover original Unity project
         run: |
@@ -133,17 +118,22 @@ jobs:
             --output "$PWD/recovered" \
             --mode Unity \
             --script-content-level Level0 \
-            2>&1 | tee reports/assetripper.log
+            > reports/assetripper.log 2>&1
 
           version="$(find recovered -name ProjectVersion.txt -print -quit)"
 
-          test -n "$version"
+          if [ -z "$version" ]; then
+            echo "Unity project not found"
+            exit 1
+          fi
 
           project="$(dirname "$(dirname "$version")")"
 
           test -d "$project/Assets"
 
           echo "RECOVERED_PROJECT=$project" >> "$GITHUB_ENV"
+
+          echo "Unity project recovered" >> reports/summary.txt
 
       - name: Install ILSpy
         run: |
@@ -160,14 +150,14 @@ jobs:
             --outputdir recovered-code \
             --referencepath "$(dirname "$GAME_DLL")" \
             "$GAME_DLL" \
-            2>&1 | tee reports/ilspy.log
+            > reports/ilspy.log 2>&1
 
           test -n "$(find recovered-code -name '*.cs' -print -quit)"
 
+          echo "Original gameplay code extracted" >> reports/summary.txt
+
       - name: Restore original scripts
         run: |
-          set -euo pipefail
-
           python3 - <<'PY'
           from pathlib import Path
           from collections import defaultdict
@@ -202,36 +192,27 @@ jobs:
               )
 
               if len(candidates) == 1:
+
                   replacement = candidates[0].read_text(
                       encoding="utf-8-sig",
                       errors="replace"
                   )
 
                   if len(replacement.strip()) > 100:
+
                       file.write_text(
                           replacement,
                           encoding="utf-8"
                       )
 
                       restored += 1
-                      results.append([
-                          str(file),
-                          "Restored"
-                      ])
+                      results.append([str(file), "Restored"])
                       continue
 
               unresolved += 1
-              results.append([
-                  str(file),
-                  "Unresolved"
-              ])
+              results.append([str(file), "Unresolved"])
 
-          with open(
-              "reports/scripts.csv",
-              "w",
-              newline="",
-              encoding="utf-8"
-          ) as file:
+          with open("reports/scripts.csv", "w", newline="") as file:
               writer = csv.writer(file)
               writer.writerow(["Script", "Status"])
               writer.writerows(results)
@@ -260,17 +241,18 @@ jobs:
               )
 
           lines = [
-              "Coming Full Recovery Report",
+              "",
+              "COMING RECOVERY RESULTS",
               f"Scenes: {count('*.unity')}",
               f"Prefabs: {count('*.prefab')}",
               f"Animations: {count('*.anim')}",
-              f"Controllers: {count('*.controller')}",
-              f"Textures: {count('*.png', '*.tga', '*.jpg')}",
+              f"Animators: {count('*.controller')}",
+              f"Textures: {count('*.png', '*.jpg', '*.tga')}",
               f"Materials: {count('*.mat')}",
               f"Shaders: {count('*.shader')}",
               f"Audio: {count('*.wav', '*.ogg', '*.mp3')}",
               f"C# scripts: {count('*.cs')}",
-              "Recovery is not a verified playable iOS port."
+              f"Decompiled scripts: {len(list(Path('recovered-code').rglob('*.cs')))}"
           ]
 
           with open("reports/summary.txt", "a") as report:
@@ -280,7 +262,6 @@ jobs:
 
           if count("*.unity") == 0:
               raise RuntimeError("No original scenes recovered")
-
           PY
 
       - name: Add iPhone runtime logger
@@ -344,68 +325,27 @@ jobs:
           }
           CS
 
-      - name: Prepare Unity Cloud branch
+      - name: Prepare encrypted project archive
+        if: always()
+        env:
+          ARCHIVE_PASSWORD: ${{ secrets.COMING_ARCHIVE_PASSWORD }}
         run: |
           set -euo pipefail
 
-          branch="coming-recovery-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
-
-          git switch -c "$branch"
-
-          mkdir -p Assets ProjectSettings Packages
-
-          cp -a "$RECOVERED_PROJECT/Assets/." Assets/
-          cp -a "$RECOVERED_PROJECT/ProjectSettings/." ProjectSettings/
-
-          if [ -d "$RECOVERED_PROJECT/Packages" ]; then
-            cp -a "$RECOVERED_PROJECT/Packages/." Packages/
+          if [ -z "$ARCHIVE_PASSWORD" ]; then
+            echo "No archive password configured. Report only."
+            exit 0
           fi
 
-          cat >> .gitignore <<'EOF'
-          /Library/
-          /Temp/
-          /Logs/
-          /Obj/
-          /Build/
-          /Builds/
-          /UserSettings/
-          /game/
-          /Coming.zip
-          /recovered/
-          /recovered-code/
-          EOF
+          mkdir -p output
 
-          git lfs install --local
+          7z a -t7z -mhe=on \
+            -p"$ARCHIVE_PASSWORD" \
+            output/Coming-Recovery.7z \
+            recovered/ recovered-code/ reports/ \
+            > /dev/null
 
-          while IFS= read -r -d '' file; do
-            git lfs track --filename "$file"
-          done < <(
-            find Assets ProjectSettings Packages \
-              -type f -size +45M -print0
-          )
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add Assets ProjectSettings .gitignore
-
-          if [ -n "$(find Packages -type f -print -quit)" ]; then
-            git add Packages
-          fi
-
-          if [ -f .gitattributes ]; then
-            git add .gitattributes
-          fi
-
-          git add reports/summary.txt reports/scripts.csv
-
-          git commit -m "Coming Full Recovery V1"
-
-          git push origin "$branch"
-
-          echo "Unity Cloud branch: $branch" >> reports/summary.txt
-
-      - name: Show final recovery report
+      - name: Show final report
         if: always()
         run: |
           if [ -f reports/summary.txt ]; then
@@ -413,19 +353,20 @@ jobs:
             cat reports/summary.txt >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Upload diagnostics
+      - name: Upload recovery report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Coming-Recovery-Diagnostics
-          path: reports/
+          name: Coming-Recovery-Report
+          path: reports/summary.txt
           retention-days: 7
+          if-no-files-found: warn
 
-      - name: Upload recovered project
+      - name: Upload encrypted project
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: Coming-Full-Recovery
-          path: |
-            recovered/
-            recovered-code/
+          path: output/Coming-Recovery.7z
           retention-days: 7
+          if-no-files-found: ignore
