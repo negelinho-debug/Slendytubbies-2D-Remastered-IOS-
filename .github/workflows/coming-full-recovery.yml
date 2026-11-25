@@ -1,0 +1,431 @@
+
+name: Coming - Full Recovery V1
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  recovery:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+
+    steps:
+      - name: Check private repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(gh api "repos/$GITHUB_REPOSITORY" --jq '.private')" = true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare tools
+        run: |
+          mkdir -p game reports recovered recovered-code
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full
+          python3 -m pip install requests beautifulsoup4
+
+      - name: Download original Coming
+        run: |
+          python3 - <<'PY'
+          import requests
+          import zipfile
+          from bs4 import BeautifulSoup
+
+          url = "https://www.mediafire.com/file/dym00pxjpkcc1oz/Coming.zip/file"
+
+          session = requests.Session()
+          session.headers["User-Agent"] = "Mozilla/5.0"
+
+          page = session.get(url, timeout=60)
+          page.raise_for_status()
+
+          soup = BeautifulSoup(page.text, "html.parser")
+          button = soup.select_one("#downloadButton")
+
+          if not button or not button.get("href"):
+              raise RuntimeError("Download link not found")
+
+          with session.get(
+              button["href"],
+              stream=True,
+              timeout=120
+          ) as response:
+              response.raise_for_status()
+
+              with open("Coming.zip", "wb") as file:
+                  for chunk in response.iter_content(1024 * 1024):
+                      file.write(chunk)
+
+          if not zipfile.is_zipfile("Coming.zip"):
+              raise RuntimeError("Invalid ZIP archive")
+
+          print("Coming downloaded successfully")
+          PY
+
+      - name: Extract original game
+        run: |
+          set -euo pipefail
+          7z t Coming.zip
+          7z x Coming.zip -ogame -y
+
+      - name: Detect original Unity files
+        run: |
+          set -euo pipefail
+
+          managers="$(find game -name globalgamemanagers -print -quit)"
+          dll="$(find game -name Assembly-CSharp.dll -print -quit)"
+
+          test -n "$managers"
+          test -n "$dll"
+
+          echo "GAME_ROOT=$(dirname "$managers")" >> "$GITHUB_ENV"
+          echo "GAME_DLL=$dll" >> "$GITHUB_ENV"
+
+          find game -type f > reports/original-files.txt
+
+          {
+            echo "They're Coming Full Recovery"
+            echo "Original Unity: detected 5.4.2f2 in previous run"
+            echo "Original backend: Mono"
+            echo "Gameplay DLL: $dll"
+          } > reports/summary.txt
+
+      - name: Install .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
+
+      - name: Build AssetRipper CLI
+        run: |
+          set -euo pipefail
+
+          git clone --depth 1 \
+            https://github.com/nowl-it/AssetRipperCLI.git \
+            "$RUNNER_TEMP/ripper"
+
+          git -C "$RUNNER_TEMP/ripper" rev-parse HEAD \
+            > reports/assetripper-version.txt
+
+          dotnet publish \
+            "$RUNNER_TEMP/ripper/Source/AssetRipper.GUI.Free/AssetRipper.GUI.Free.csproj" \
+            -c Release \
+            -r linux-x64 \
+            --self-contained true \
+            -p:PublishAot=false \
+            -o "$RUNNER_TEMP/ripper-bin" \
+            2>&1 | tee reports/ripper-build.log
+
+      - name: Recover original Unity project
+        run: |
+          set -euo pipefail
+
+          dotnet "$RUNNER_TEMP/ripper-bin/AssetRipper.GUI.Free.dll" \
+            --cli \
+            --input "$GAME_ROOT" \
+            --output "$PWD/recovered" \
+            --mode Unity \
+            --script-content-level Level0 \
+            2>&1 | tee reports/assetripper.log
+
+          version="$(find recovered -name ProjectVersion.txt -print -quit)"
+
+          test -n "$version"
+
+          project="$(dirname "$(dirname "$version")")"
+
+          test -d "$project/Assets"
+
+          echo "RECOVERED_PROJECT=$project" >> "$GITHUB_ENV"
+
+      - name: Install ILSpy
+        run: |
+          dotnet tool install ilspycmd \
+            --tool-path "$RUNNER_TEMP/tools" \
+            --version 9.1.0.7988
+
+      - name: Recover original gameplay code
+        run: |
+          set -euo pipefail
+
+          "$RUNNER_TEMP/tools/ilspycmd" \
+            --project \
+            --outputdir recovered-code \
+            --referencepath "$(dirname "$GAME_DLL")" \
+            "$GAME_DLL" \
+            2>&1 | tee reports/ilspy.log
+
+          test -n "$(find recovered-code -name '*.cs' -print -quit)"
+
+      - name: Restore original scripts
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+          from collections import defaultdict
+          import os
+          import csv
+
+          project = Path(os.environ["RECOVERED_PROJECT"])
+          code = Path("recovered-code")
+          assets = project / "Assets"
+
+          sources = defaultdict(list)
+
+          for file in code.rglob("*.cs"):
+              sources[file.name.casefold()].append(file)
+
+          restored = 0
+          unresolved = 0
+          results = []
+
+          for file in assets.rglob("*.cs"):
+
+              text = file.read_text(
+                  encoding="utf-8-sig",
+                  errors="replace"
+              )
+
+              if "Dummy class. This could have happened" not in text:
+                  continue
+
+              candidates = sources.get(
+                  file.name.casefold(), []
+              )
+
+              if len(candidates) == 1:
+                  replacement = candidates[0].read_text(
+                      encoding="utf-8-sig",
+                      errors="replace"
+                  )
+
+                  if len(replacement.strip()) > 100:
+                      file.write_text(
+                          replacement,
+                          encoding="utf-8"
+                      )
+
+                      restored += 1
+                      results.append([
+                          str(file),
+                          "Restored"
+                      ])
+                      continue
+
+              unresolved += 1
+              results.append([
+                  str(file),
+                  "Unresolved"
+              ])
+
+          with open(
+              "reports/scripts.csv",
+              "w",
+              newline="",
+              encoding="utf-8"
+          ) as file:
+              writer = csv.writer(file)
+              writer.writerow(["Script", "Status"])
+              writer.writerows(results)
+
+          with open("reports/summary.txt", "a") as report:
+              report.write(f"\nRestored scripts: {restored}\n")
+              report.write(f"Unresolved scripts: {unresolved}\n")
+
+          print("Restored:", restored)
+          print("Unresolved:", unresolved)
+          PY
+
+      - name: Audit original resources
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+
+          project = Path(os.environ["RECOVERED_PROJECT"])
+          assets = project / "Assets"
+
+          def count(*patterns):
+              return sum(
+                  len(list(assets.rglob(pattern)))
+                  for pattern in patterns
+              )
+
+          lines = [
+              "Coming Full Recovery Report",
+              f"Scenes: {count('*.unity')}",
+              f"Prefabs: {count('*.prefab')}",
+              f"Animations: {count('*.anim')}",
+              f"Controllers: {count('*.controller')}",
+              f"Textures: {count('*.png', '*.tga', '*.jpg')}",
+              f"Materials: {count('*.mat')}",
+              f"Shaders: {count('*.shader')}",
+              f"Audio: {count('*.wav', '*.ogg', '*.mp3')}",
+              f"C# scripts: {count('*.cs')}",
+              "Recovery is not a verified playable iOS port."
+          ]
+
+          with open("reports/summary.txt", "a") as report:
+              report.write("\n".join(lines) + "\n")
+
+          print("\n".join(lines))
+
+          if count("*.unity") == 0:
+              raise RuntimeError("No original scenes recovered")
+
+          PY
+
+      - name: Add iPhone runtime logger
+        run: |
+          mkdir -p "$RECOVERED_PROJECT/Assets/Scripts"
+
+          cat > "$RECOVERED_PROJECT/Assets/Scripts/ComingRuntimeLog.cs" <<'CS'
+          using System;
+          using System.IO;
+          using UnityEngine;
+
+          public static class ComingRuntimeLog
+          {
+              private static string logPath;
+              private static readonly object Gate = new object();
+
+              [RuntimeInitializeOnLoadMethod]
+              private static void Init()
+              {
+                  try
+                  {
+                      logPath = Path.Combine(
+                          Application.persistentDataPath,
+                          "ComingDebug.txt"
+                      );
+
+                      File.AppendAllText(
+                          logPath,
+                          "\n===== Coming launch =====\n"
+                      );
+
+                      Application.logMessageReceivedThreaded += WriteLog;
+                  }
+                  catch {}
+              }
+
+              private static void WriteLog(
+                  string message,
+                  string stack,
+                  LogType type
+              )
+              {
+                  try
+                  {
+                      lock (Gate)
+                      {
+                          if (new FileInfo(logPath).Length > 2097152)
+                              File.WriteAllText(logPath, "");
+
+                          File.AppendAllText(
+                              logPath,
+                              DateTime.UtcNow.ToString("HH:mm:ss")
+                              + " " + type
+                              + ": " + message + "\n"
+                              + stack + "\n"
+                          );
+                      }
+                  }
+                  catch {}
+              }
+          }
+          CS
+
+      - name: Prepare Unity Cloud branch
+        run: |
+          set -euo pipefail
+
+          branch="coming-recovery-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
+
+          git switch -c "$branch"
+
+          mkdir -p Assets ProjectSettings Packages
+
+          cp -a "$RECOVERED_PROJECT/Assets/." Assets/
+          cp -a "$RECOVERED_PROJECT/ProjectSettings/." ProjectSettings/
+
+          if [ -d "$RECOVERED_PROJECT/Packages" ]; then
+            cp -a "$RECOVERED_PROJECT/Packages/." Packages/
+          fi
+
+          cat >> .gitignore <<'EOF'
+          /Library/
+          /Temp/
+          /Logs/
+          /Obj/
+          /Build/
+          /Builds/
+          /UserSettings/
+          /game/
+          /Coming.zip
+          /recovered/
+          /recovered-code/
+          EOF
+
+          git lfs install --local
+
+          while IFS= read -r -d '' file; do
+            git lfs track --filename "$file"
+          done < <(
+            find Assets ProjectSettings Packages \
+              -type f -size +45M -print0
+          )
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add Assets ProjectSettings .gitignore
+
+          if [ -n "$(find Packages -type f -print -quit)" ]; then
+            git add Packages
+          fi
+
+          if [ -f .gitattributes ]; then
+            git add .gitattributes
+          fi
+
+          git add reports/summary.txt reports/scripts.csv
+
+          git commit -m "Coming Full Recovery V1"
+
+          git push origin "$branch"
+
+          echo "Unity Cloud branch: $branch" >> reports/summary.txt
+
+      - name: Show final recovery report
+        if: always()
+        run: |
+          if [ -f reports/summary.txt ]; then
+            cat reports/summary.txt
+            cat reports/summary.txt >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Coming-Recovery-Diagnostics
+          path: reports/
+          retention-days: 7
+
+      - name: Upload recovered project
+        uses: actions/upload-artifact@v4
+        with:
+          name: Coming-Full-Recovery
+          path: |
+            recovered/
+            recovered-code/
+          retention-days: 7
