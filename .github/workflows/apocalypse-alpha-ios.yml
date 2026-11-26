@@ -1,4 +1,5 @@
-name: Apocalypse Exclusive Alpha iOS Fix 3
+
+name: Apocalypse Alpha Fix 4 - Location Selection IPA
 
 on:
   workflow_dispatch:
@@ -18,67 +19,70 @@ jobs:
       V1_COMMIT: 7987483d3f5c71816429b62b8aca9e28df8ecc7f
       FIX1_COMMIT: 631b34e617f6f52d55eb400561ee7f318b410960
       FIX2_COMMIT: 6a9f9200b8165370e9917f352c5988be57a95700
+      FIX3_COMMIT: 9b3bdc3644ed0597b42077e5069ffbabde97b17c
 
     steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: 6a9f9200b8165370e9917f352c5988be57a95700
+      - name: Checkout
+        uses: actions/checkout@v5
 
-      - name: Restore complete Fix 2
+      - name: Restore working Fix 3
         run: |
           set -euo pipefail
 
-          mkdir -p .fix3 logs recovery dist
+          mkdir -p "$RUNNER_TEMP/location-fix"
 
-          git fetch --no-tags --depth=1 origin "$FIX1_COMMIT"
-          git fetch --no-tags --depth=1 origin "$V1_COMMIT"
+          git fetch --no-tags --depth=1 origin "$FIX3_COMMIT"
 
-          git show "$FIX2_COMMIT:.github/workflows/apocalypse-alpha-ios.yml" \
-            > .fix3/fix2.yml
+          git show "$FIX3_COMMIT:.github/workflows/apocalypse-alpha-ios.yml" \
+            > "$RUNNER_TEMP/location-fix/fix3.yml"
 
-          python3 -m venv "$RUNNER_TEMP/fix3-python"
+          python3 -m venv "$RUNNER_TEMP/location-python"
 
-          "$RUNNER_TEMP/fix3-python/bin/pip" install pyyaml
+          "$RUNNER_TEMP/location-python/bin/pip" install pyyaml
 
-          "$RUNNER_TEMP/fix3-python/bin/python" - <<'PY'
+          "$RUNNER_TEMP/location-python/bin/python" - <<'PY'
+          import os
           import yaml
           from pathlib import Path
 
-          root = Path(".fix3")
+          root = Path(os.environ["RUNNER_TEMP"]) / "location-fix"
 
-          data = yaml.safe_load(
-              (root / "fix2.yml").read_text()
+          workflow = yaml.safe_load(
+              (root / "fix3.yml").read_text()
           )
 
-          steps = data["jobs"]["ipa"]["steps"]
+          steps = workflow["jobs"]["ipa"]["steps"]
 
           scripts = {
-              "Restore Fix 1 scripts": "restore.sh",
-              "Download original Chapter 1": "download.sh",
-              "Install Unity 2021 and iOS support": "install.sh",
-              "Restore Unity reference libraries": "references.sh",
-              "Fix 2 - Repair Mono Cecil resolver": "resolver.sh",
+              "Restore complete Fix 2": "restore.sh",
+              "Download original Alpha Recovery": "download.sh",
+              "Install Unity and iOS support": "install.sh",
+              "Restore Unity libraries": "references.sh",
+              "Preserve Mono Cecil Fix 2": "resolver.sh",
               "Activate Unity Personal": "activate.sh",
-              "Prepare English Russian Ukrainian": "languages.sh",
-              "Build mobile controls": "mobile.sh",
-              "Connect controls to original game Fix 2": "connect.sh",
+              "Prepare three languages": "languages.sh",
+              "Compile original mobile controls": "mobile.sh",
+              "Connect mobile controls": "connect.sh",
               "Repair original scene references": "repair.sh",
+              "Fix 3 - Repair TextCore and TextMeshPro": "textcore.sh",
+              "Check original scene integrity": "integrity.sh",
               "Prepare original Chapter 1": "prepare.sh",
               "Export Unity project to Xcode": "export.sh",
               "Return Unity license": "return.sh",
               "Build ARM64 application": "xcode.sh",
-              "Create Exclusive Alpha Fix 2 IPA": "ipa.sh"
+              "Create Exclusive Alpha Fix 3 IPA": "ipa.sh"
           }
 
           for name, filename in scripts.items():
+
               matches = [
                   s for s in steps
                   if s.get("name") == name
               ]
 
               if len(matches) != 1:
-                  raise SystemExit(
-                      "Missing previous step: " + name
+                  raise RuntimeError(
+                      "Missing Fix 3 step: " + name
                   )
 
               (root / filename).write_text(
@@ -89,30 +93,36 @@ jobs:
 
           PY
 
-          for SCRIPT in .fix3/*.sh; do
+          for SCRIPT in "$RUNNER_TEMP/location-fix/"*.sh; do
             bash -n "$SCRIPT"
           done
 
-          bash -e .fix3/restore.sh
+          git fetch --no-tags --depth=1 origin "$FIX2_COMMIT"
 
-      - name: Download original Alpha Recovery
+          git checkout --detach "$FIX2_COMMIT"
+
+          bash -e "$RUNNER_TEMP/location-fix/restore.sh"
+
+      - name: Download existing Alpha project
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          bash -e .fix3/download.sh
+          bash -e "$RUNNER_TEMP/location-fix/download.sh"
 
           test -s ExportedProject/Assets/Scenes/DLC/MenuAlpha.unity
 
           test -s ExportedProject/Assets/Scenes/DLC/Alphas/CH1P1.unity
 
-          echo "Original Chapter 1 Part 1 confirmed"
+          echo "Existing original Alpha project loaded"
 
-      - name: Install Unity and iOS support
+          echo "No new Recovery required"
+
+      - name: Install Unity 2021 and iOS support
         timeout-minutes: 40
         run: |
-          bash -e .fix3/install.sh
+          bash -e "$RUNNER_TEMP/location-fix/install.sh"
 
       - uses: actions/setup-node@v5
         with:
@@ -122,22 +132,15 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Restore Unity libraries
-        timeout-minutes: 15
+      - name: Restore Unity references
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
+          bash -e "$RUNNER_TEMP/location-fix/references.sh"
 
-          bash -e .fix3/references.sh
-
-          test -s .alpha-ci/UnityReferences/UnityEngine.CoreModule.dll
-
-      - name: Preserve Mono Cecil Fix 2
+      - name: Preserve Mono Cecil resolver
         run: |
-          set -euo pipefail
-
-          bash -e .fix3/resolver.sh
+          bash -e "$RUNNER_TEMP/location-fix/resolver.sh"
 
       - name: Activate Unity Personal
         id: activate
@@ -146,296 +149,578 @@ jobs:
           UNITY_USERNAME: ${{ secrets.UNITY_USERNAME || secrets.UNITY_EMAIL }}
           UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
         run: |
-          bash -e .fix3/activate.sh
+          bash -e "$RUNNER_TEMP/location-fix/activate.sh"
 
-      - name: Prepare three languages
+      - name: Preserve English Russian Ukrainian
         run: |
-          set -euo pipefail
+          bash -e "$RUNNER_TEMP/location-fix/languages.sh"
 
-          bash -e .fix3/languages.sh
-
-          test -s ExportedProject/Assets/Resources/AlphaTranslations.json
-
-      - name: Compile original mobile controls
-        timeout-minutes: 15
+      - name: Preserve mobile controls
         run: |
-          set -euo pipefail
+          bash -e "$RUNNER_TEMP/location-fix/mobile.sh"
 
-          bash -e .fix3/mobile.sh
-
-          test -s ExportedProject/Assets/Plugins/AlphaMobile.dll
-
-      - name: Connect mobile controls
-        timeout-minutes: 15
+      - name: Connect original game controls
         run: |
-          set -euo pipefail
+          bash -e "$RUNNER_TEMP/location-fix/connect.sh"
 
-          bash -e .fix3/connect.sh
-
-          test -s ExportedProject/Assets/Plugins/ApocalypseAlpha.dll
-
-      - name: Repair original scene references
+      - name: Repair original references
         run: |
-          set -euo pipefail
+          bash -e "$RUNNER_TEMP/location-fix/repair.sh"
 
-          bash -e .fix3/repair.sh
-
-      - name: Fix 3 - Repair TextCore and TextMeshPro
-        timeout-minutes: 15
+      - name: Preserve TextCore Fix 3
         run: |
-          set -euo pipefail
+          bash -e "$RUNNER_TEMP/location-fix/textcore.sh"
 
-          dotnet new console \
-            -o textcorefix \
-            --framework net8.0
-
-          dotnet add textcorefix package Mono.Cecil \
-            --version 0.11.6
-
-          cat > textcorefix/Program.cs <<'CS'
-          using System;
-          using System.IO;
-          using System.Linq;
-          using System.Collections.Generic;
-          using Mono.Cecil;
-
-          string plugins = Path.GetFullPath(args[0]);
-          string references = Path.GetFullPath(args[1]);
-
-          const string oldModule =
-              "UnityEngine.TextCoreModule";
-
-          using var resolver =
-              new DefaultAssemblyResolver();
-
-          resolver.AddSearchDirectory(plugins);
-          resolver.AddSearchDirectory(references);
-
-          foreach (string path in Directory.EnumerateFiles(
-              "/Applications/Unity",
-              "mscorlib.dll",
-              SearchOption.AllDirectories))
-          {
-              string folder = Path.GetDirectoryName(path);
-
-              if (!string.IsNullOrEmpty(folder))
-                  resolver.AddSearchDirectory(folder);
-          }
-
-          var parameters = new ReaderParameters
-          {
-              InMemory = true,
-              AssemblyResolver = resolver
-          };
-
-          var destinations =
-              new Dictionary<string, string>();
-
-          var modules = Directory
-              .GetFiles(references, "UnityEngine.TextCore*Module.dll")
-              .Where(p =>
-                  Path.GetFileNameWithoutExtension(p) !=
-                  oldModule)
-              .ToArray();
-
-          if (modules.Length == 0)
-              throw new Exception(
-                  "Modern TextCore modules not found"
-              );
-
-          foreach (string file in modules)
-          {
-              using var engine =
-                  AssemblyDefinition.ReadAssembly(
-                      file, parameters
-                  );
-
-              foreach (var type in engine.MainModule.Types)
-              {
-                  destinations[type.FullName] =
-                      engine.Name.FullName;
-              }
-
-              Console.WriteLine(
-                  "Modern module: " + engine.Name.Name
-              );
-          }
-
-          int total = 0;
-          int patchedAssemblies = 0;
-
-          foreach (string path in
-              Directory.GetFiles(plugins, "*.dll"))
-          {
-              using var assembly =
-                  AssemblyDefinition.ReadAssembly(
-                      path, parameters
-                  );
-
-              var module = assembly.MainModule;
-
-              var obsolete = module.AssemblyReferences
-                  .Where(a => a.Name == oldModule)
-                  .ToArray();
-
-              if (obsolete.Length == 0)
-                  continue;
-
-              var types = module.GetTypeReferences()
-                  .Where(t =>
-                      t.Scope is AssemblyNameReference a &&
-                      a.Name == oldModule)
-                  .ToArray();
-
-              int changed = 0;
-
-              foreach (var type in types)
-              {
-                  if (!destinations.TryGetValue(
-                      type.FullName,
-                      out string destination))
-                  {
-                      throw new Exception(
-                          "Unresolved TextCore type: " +
-                          type.FullName +
-                          " in " + assembly.Name.Name
-                      );
-                  }
-
-                  var parsed =
-                      AssemblyNameReference.Parse(
-                          destination
-                      );
-
-                  var target =
-                      module.AssemblyReferences
-                      .FirstOrDefault(a =>
-                          a.Name == parsed.Name
-                      );
-
-                  if (target == null)
-                  {
-                      target = parsed;
-                      module.AssemblyReferences.Add(
-                          target
-                      );
-                  }
-
-                  type.Scope = target;
-
-                  Console.WriteLine(
-                      type.FullName + " -> " +
-                      target.Name
-                  );
-
-                  changed++;
-              }
-
-              foreach (var reference in obsolete)
-                  module.AssemblyReferences.Remove(
-                      reference
-                  );
-
-              string temporary = path + ".patched";
-
-              assembly.Write(temporary);
-
-              using (var check =
-                  AssemblyDefinition.ReadAssembly(
-                      temporary,
-                      parameters
-                  ))
-              {
-                  if (check.MainModule.AssemblyReferences
-                      .Any(a => a.Name == oldModule))
-                  {
-                      throw new Exception(
-                          "Legacy TextCore reference remains"
-                      );
-                  }
-              }
-
-              File.Move(temporary, path, true);
-
-              Console.WriteLine(
-                  "Patched: " +
-                  Path.GetFileName(path) +
-                  " | types: " + changed
-              );
-
-              total += changed;
-              patchedAssemblies++;
-          }
-
-          if (patchedAssemblies == 0)
-              throw new Exception(
-                  "Expected legacy TextCore references"
-              );
-
-          Console.WriteLine(
-              "Patched assemblies: " +
-              patchedAssemblies
-          );
-
-          Console.WriteLine(
-              "Total TextCore references repaired: " +
-              total
-          );
-
-          CS
-
-          dotnet run --project textcorefix -- \
-            "$PWD/ExportedProject/Assets/Plugins" \
-            "$PWD/.alpha-ci/UnityReferences" \
-            2>&1 | tee logs/textcore-fix3.txt
-
-          test -s ExportedProject/Assets/Plugins/Unity.TextMeshPro.dll
-
-          test -s ExportedProject/Assets/Plugins/ApocalypseAlpha.dll
-
-          echo "TextCore migration completed" \
-            >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Check original scene integrity
+      - name: Verify original scenes
         run: |
-          set -euo pipefail
-
-          python3 - <<'PY' | tee logs/scene-integrity.txt
-          from pathlib import Path
-          import re
-
-          project = Path("ExportedProject")
-
-          scenes = [
-              project / "Assets/Scenes/DLC/MenuAlpha.unity",
-              project / "Assets/Scenes/DLC/Alphas/CH1P1.unity"
-          ]
-
-          for scene in scenes:
-              content = scene.read_text()
-
-              missing = len(re.findall(
-                  r"(?m)^\s*m_Script:\s*\{fileID: 0\}",
-                  content
-              ))
-
-              print(
-                  scene.name,
-                  "Original empty references:",
-                  missing
-              )
-
-          print(
-              "Original scene objects preserved."
-          )
-          PY
+          bash -e "$RUNNER_TEMP/location-fix/integrity.sh"
 
       - name: Prepare original Chapter 1
         run: |
+          bash -e "$RUNNER_TEMP/location-fix/prepare.sh"
+
+      - name: Fix 4 - Custard Location Selection
+        run: |
           set -euo pipefail
 
-          bash -e .fix3/prepare.sh
+          mkdir -p ExportedProject/Assets/AlphaLocationFix
 
+          cat > ExportedProject/Assets/AlphaLocationFix/AlphaLocations.cs <<'CS'
+          using System;
+          using System.IO;
+          using System.Collections.Generic;
+          using System.Text.RegularExpressions;
+          using UnityEngine;
+          using UnityEngine.UI;
+          using UnityEngine.SceneManagement;
+          using TMPro;
+
+          public sealed class AlphaLocations : MonoBehaviour
+          {
+              private static AlphaLocations instance;
+
+              private Font font;
+
+              private GUIStyle labelStyle;
+
+              private float nextScan;
+
+              private string logPath;
+
+              private readonly HashSet<string> logged =
+                  new HashSet<string>();
+
+              private readonly Dictionary<int, Transform> markers =
+                  new Dictionary<int, Transform>();
+
+              private static readonly string[,] names = {
+                  {
+                      "Lake",
+                      "Tubby House",
+                      "Dry tree"
+                  },
+                  {
+                      "Озеро",
+                      "Дом телепузиков",
+                      "Сухое дерево"
+                  },
+                  {
+                      "Озеро",
+                      "Будинок телепузиків",
+                      "Сухе дерево"
+                  }
+              };
+
+              [RuntimeInitializeOnLoadMethod(
+                  RuntimeInitializeLoadType.BeforeSceneLoad)]
+              private static void Install()
+              {
+                  if (Application.platform !=
+                      RuntimePlatform.IPhonePlayer)
+                      return;
+
+                  if (instance != null)
+                      return;
+
+                  GameObject root =
+                      new GameObject("Alpha Location Fix 4");
+
+                  DontDestroyOnLoad(root);
+
+                  instance =
+                      root.AddComponent<AlphaLocations>();
+              }
+
+              private void Awake()
+              {
+                  font = Resources.Load<Font>(
+                      "AlphaMobileFont"
+                  );
+
+                  logPath = Path.Combine(
+                      Application.persistentDataPath,
+                      "AlphaLocationFix.txt"
+                  );
+
+                  Write("Location Fix 4 installed");
+              }
+
+              private void Write(string message)
+              {
+                  try
+                  {
+                      if (File.Exists(logPath) &&
+                          new FileInfo(logPath).Length > 1048576)
+                      {
+                          File.WriteAllText(logPath, "");
+                      }
+
+                      File.AppendAllText(
+                          logPath,
+                          DateTime.Now +
+                          " " + message + "\n"
+                      );
+                  }
+                  catch {}
+              }
+
+              private string Normalize(string value)
+              {
+                  if (string.IsNullOrEmpty(value))
+                      return "";
+
+                  value = Regex.Replace(
+                      value,
+                      "<[^>]+>",
+                      ""
+                  );
+
+                  value = value.Trim().ToLowerInvariant();
+
+                  return Regex.Replace(
+                      value,
+                      @"[\s_\-]+",
+                      ""
+                  );
+              }
+
+              private int LocationId(string value)
+              {
+                  value = Normalize(value);
+
+                  switch (value)
+                  {
+                      case "lake":
+                      case "lago":
+                      case "озеро":
+                          return 0;
+
+                      case "tubbyhouse":
+                      case "casateletubbie":
+                      case "домтелепузиков":
+                      case "будиноктелепузиків":
+                          return 1;
+
+                      case "drytree":
+                      case "arbolseco":
+                      case "árbolseco":
+                      case "сухоедерево":
+                      case "сухедерево":
+                          return 2;
+                  }
+
+                  return -1;
+              }
+
+              private int LocationFromObject(
+                  Transform target
+              )
+              {
+                  for (int i = 0;
+                       i < 3 && target != null;
+                       i++)
+                  {
+                      int id = LocationId(target.name);
+
+                      if (id >= 0)
+                          return id;
+
+                      target = target.parent;
+                  }
+
+                  return -1;
+              }
+
+              private bool IsActive(Component component)
+              {
+                  if (component == null ||
+                      !component.gameObject.activeInHierarchy)
+                      return false;
+
+                  foreach (CanvasGroup group in
+                      component.GetComponentsInParent<CanvasGroup>())
+                  {
+                      if (group.alpha < 0.02f)
+                          return false;
+
+                      if (group.ignoreParentGroups)
+                          break;
+                  }
+
+                  return true;
+              }
+
+              private void Register(
+                  Component component,
+                  string text
+              )
+              {
+                  if (!IsActive(component))
+                      return;
+
+                  string key =
+                      component.GetType().Name + "/" +
+                      component.gameObject.name + "/" +
+                      text;
+
+                  if (logged.Add(key))
+                  {
+                      Write("Active label: " + key);
+                  }
+
+                  int id = LocationId(text);
+
+                  if (id < 0)
+                  {
+                      id = LocationFromObject(
+                          component.transform
+                      );
+                  }
+
+                  if (id < 0)
+                      return;
+
+                  if (!markers.ContainsKey(id))
+                  {
+                      markers.Add(
+                          id,
+                          component.transform
+                      );
+                  }
+              }
+
+              private void Update()
+              {
+                  if (Time.unscaledTime < nextScan)
+                      return;
+
+                  nextScan = Time.unscaledTime + 0.25f;
+
+                  markers.Clear();
+
+                  Scene scene =
+                      SceneManager.GetActiveScene();
+
+                  if (!scene.isLoaded ||
+                      scene.name != "CH1P1")
+                      return;
+
+                  foreach (GameObject root in
+                      scene.GetRootGameObjects())
+                  {
+                      if (!root.activeInHierarchy)
+                          continue;
+
+                      foreach (Text text in
+                          root.GetComponentsInChildren<Text>(false))
+                      {
+                          if (text.isActiveAndEnabled)
+                              Register(text, text.text);
+                      }
+
+                      foreach (TMP_Text text in
+                          root.GetComponentsInChildren<TMP_Text>(false))
+                      {
+                          if (text.isActiveAndEnabled)
+                              Register(text, text.text);
+                      }
+
+                      foreach (TextMesh text in
+                          root.GetComponentsInChildren<TextMesh>(false))
+                      {
+                          Register(text, text.text);
+                      }
+
+                      foreach (Button button in
+                          root.GetComponentsInChildren<Button>(false))
+                      {
+                          if (!button.isActiveAndEnabled)
+                              continue;
+
+                          if (!button.interactable)
+                              continue;
+
+                          Register(button, button.name);
+
+                          foreach (Text label in
+                              button.GetComponentsInChildren<Text>(true))
+                          {
+                              Register(button, label.text);
+                          }
+
+                          foreach (TMP_Text label in
+                              button.GetComponentsInChildren<TMP_Text>(true))
+                          {
+                              Register(button, label.text);
+                          }
+                      }
+                  }
+
+                  if (markers.Count >= 2 &&
+                      logged.Add("Location selection detected"))
+                  {
+                      Write("Original location selection detected");
+                  }
+              }
+
+              private int Language()
+              {
+                  string language = PlayerPrefs.GetString(
+                      "alpha.language",
+                      "en"
+                  );
+
+                  if (language == "ru")
+                      return 1;
+
+                  if (language == "uk" ||
+                      language == "ua")
+                      return 2;
+
+                  return 0;
+              }
+
+              private Camera FindCamera()
+              {
+                  Camera camera = Camera.main;
+
+                  if (camera != null &&
+                      camera.isActiveAndEnabled)
+                      return camera;
+
+                  foreach (Camera item in Camera.allCameras)
+                  {
+                      if (item.isActiveAndEnabled &&
+                          item.cameraType == CameraType.Game)
+                          return item;
+                  }
+
+                  return null;
+              }
+
+              private bool ScreenPosition(
+                  Transform target,
+                  out Vector2 point
+              )
+              {
+                  point = Vector2.zero;
+
+                  if (target == null ||
+                      !target.gameObject.activeInHierarchy)
+                      return false;
+
+                  RectTransform rect =
+                      target as RectTransform;
+
+                  Canvas canvas =
+                      target.GetComponentInParent<Canvas>();
+
+                  if (rect != null && canvas != null)
+                  {
+                      Camera camera = null;
+
+                      if (canvas.renderMode !=
+                          RenderMode.ScreenSpaceOverlay)
+                      {
+                          camera = canvas.worldCamera;
+
+                          if (camera == null)
+                              camera = FindCamera();
+
+                          if (camera == null)
+                              return false;
+                      }
+
+                      Vector3 world =
+                          rect.TransformPoint(
+                              rect.rect.center
+                          );
+
+                      if (camera != null &&
+                          camera.WorldToScreenPoint(world).z <= 0)
+                          return false;
+
+                      point =
+                          RectTransformUtility.WorldToScreenPoint(
+                              camera,
+                              world
+                          );
+                  }
+                  else
+                  {
+                      Camera camera = FindCamera();
+
+                      if (camera == null)
+                          return false;
+
+                      Vector3 screen =
+                          camera.WorldToScreenPoint(
+                              target.position
+                          );
+
+                      if (screen.z <= 0)
+                          return false;
+
+                      point = new Vector2(
+                          screen.x,
+                          screen.y
+                      );
+                  }
+
+                  point.y = Screen.height - point.y;
+
+                  return point.x >= 0 &&
+                         point.x <= Screen.width &&
+                         point.y >= 0 &&
+                         point.y <= Screen.height;
+              }
+
+              private void OnGUI()
+              {
+                  if (SceneManager.GetActiveScene().name
+                      != "CH1P1")
+                      return;
+
+                  if (markers.Count < 2)
+                      return;
+
+                  if (Event.current.type != EventType.Repaint)
+                      return;
+
+                  int oldDepth = GUI.depth;
+
+                  Color oldColor = GUI.color;
+
+                  GUI.depth = -1000;
+
+                  if (labelStyle == null)
+                  {
+                      labelStyle =
+                          new GUIStyle(GUI.skin.label);
+
+                      labelStyle.alignment =
+                          TextAnchor.MiddleCenter;
+
+                      labelStyle.normal.textColor =
+                          Color.white;
+
+                      labelStyle.fontStyle =
+                          FontStyle.Bold;
+
+                      labelStyle.wordWrap = true;
+                  }
+
+                  if (font != null)
+                      labelStyle.font = font;
+
+                  labelStyle.fontSize = Mathf.Clamp(
+                      Mathf.RoundToInt(
+                          Screen.height * 0.038f
+                      ),
+                      16,
+                      42
+                  );
+
+                  int language = Language();
+
+                  foreach (var entry in markers)
+                  {
+                      Vector2 point;
+
+                      if (!ScreenPosition(
+                          entry.Value,
+                          out point))
+                          continue;
+
+                      float width =
+                          Screen.width * 0.23f;
+
+                      float height =
+                          Screen.height * 0.075f;
+
+                      Rect safe = Screen.safeArea;
+
+                      float safeTop =
+                          Screen.height - safe.yMax;
+
+                      float safeBottom =
+                          Screen.height - safe.yMin;
+
+                      float x = Mathf.Clamp(
+                          point.x - width / 2,
+                          safe.xMin,
+                          safe.xMax - width
+                      );
+
+                      float y = Mathf.Clamp(
+                          point.y - height,
+                          safeTop,
+                          safeBottom - height
+                      );
+
+                      Rect box = new Rect(
+                          x, y, width, height
+                      );
+
+                      GUI.color = new Color(
+                          0f, 0f, 0f, 0.75f
+                      );
+
+                      GUI.DrawTexture(
+                          box,
+                          Texture2D.whiteTexture
+                      );
+
+                      GUI.color = Color.white;
+
+                      GUI.Label(
+                          box,
+                          names[language, entry.Key],
+                          labelStyle
+                      );
+                  }
+
+                  GUI.color = oldColor;
+
+                  GUI.depth = oldDepth;
+              }
+          }
+          CS
+
+          cat > ExportedProject/Assets/AlphaLocationFix/link.xml <<'XML'
+          <linker>
+            <assembly fullname="Unity.TextMeshPro" preserve="all"/>
+          </linker>
+          XML
+
+          echo "Custard location label fix added"
+
+          echo "Original dialogue untouched"
+
+          echo "Original location events untouched"
+
+      - name: Set Fix 4 version
+        run: |
           python3 - <<'PY'
           from pathlib import Path
 
@@ -444,137 +729,89 @@ jobs:
               "AlphaCI/BuildAlpha.cs"
           )
 
-          source = file.read_text()
+          text = file.read_text()
 
-          old = '''
-                      missing += GameObjectUtility
-                          .GetMonoBehavioursWithMissingScriptCount(
-                              t.gameObject
-                          );
-          '''
-
-          new = '''
-                      int count = GameObjectUtility
-                          .GetMonoBehavioursWithMissingScriptCount(
-                              t.gameObject
-                          );
-
-                      if (count > 0)
-                          Debug.LogWarning(
-                              "Missing original component: " +
-                              scene.name + "/" +
-                              t.gameObject.name +
-                              " count=" + count
-                          );
-
-                      missing += count;
-          '''
-
-          if old.strip() in source:
-              source = source.replace(
-                  old.strip(),
-                  new.strip(),
-                  1
-              )
-
-          marker = 'PlayerSettings.productName ='
-
-          if marker not in source:
-              raise SystemExit(
-                  "Original build settings not found"
-              )
-
-          source = source.replace(
-              marker,
-              '''
-              EditorSceneManager.NewScene(
-                  NewSceneSetup.EmptyScene,
-                  NewSceneMode.Single
-              );
-
-              ''' + marker,
-              1
+          text = text.replace(
+              'PlayerSettings.bundleVersion = "0.1.0";',
+              'PlayerSettings.bundleVersion = "0.1.4";'
           )
 
-          file.write_text(source)
+          text = text.replace(
+              'PlayerSettings.iOS.buildNumber = "1";',
+              'PlayerSettings.iOS.buildNumber = "4";'
+          )
 
-          print("Scene diagnostics prepared")
+          file.write_text(text)
+
+          print("Location Fix 4 prepared")
+
           PY
 
-          test -s ExportedProject/Assets/Editor/AlphaCI/BuildAlpha.cs
-
-      - name: Export Unity project to Xcode
+      - name: Export Unity IL2CPP to Xcode
         timeout-minutes: 70
         run: |
           set -euo pipefail
 
-          if ! bash -e .fix3/export.sh; then
-
-            echo "===== UNITY ERRORS ====="
-
-            if [ -f logs/unity.log ]; then
-              grep -Ei \
-                'error|exception|failed|missing scripts' \
-                logs/unity.log \
-                | cut -c1-1500 \
-                | tail -n 100 || true
-            fi
-
-            exit 1
-          fi
+          bash -e "$RUNNER_TEMP/location-fix/export.sh"
 
           test -s Xcode/Unity-iPhone.xcodeproj/project.pbxproj
 
-          echo "Unity export completed" \
-            >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Return Unity license
+      - name: Return Unity License
         if: always() && steps.activate.outcome == 'success'
         continue-on-error: true
         timeout-minutes: 5
         run: |
-          bash -e .fix3/return.sh
+          bash -e "$RUNNER_TEMP/location-fix/return.sh"
 
       - name: Build ARM64 application
         timeout-minutes: 45
         run: |
           set -euo pipefail
 
-          bash -e .fix3/xcode.sh
+          bash -e "$RUNNER_TEMP/location-fix/xcode.sh"
 
-      - name: Create Exclusive Alpha Fix 3 IPA
+      - name: Create Location Fix IPA
         run: |
           set -euo pipefail
 
-          bash -e .fix3/ipa.sh
+          bash -e "$RUNNER_TEMP/location-fix/ipa.sh"
 
-          test -s dist/Apocalypse-Alpha-CH1P1-Fix2.ipa
+          test -s dist/Apocalypse-Alpha-CH1P1-Fix3.ipa
 
-          mv dist/Apocalypse-Alpha-CH1P1-Fix2.ipa \
-            dist/Apocalypse-Alpha-CH1P1-Fix3.ipa
+          mv dist/Apocalypse-Alpha-CH1P1-Fix3.ipa \
+            dist/Apocalypse-Alpha-Location-Fix4.ipa
 
           unzip -tq \
-            dist/Apocalypse-Alpha-CH1P1-Fix3.ipa
+            dist/Apocalypse-Alpha-Location-Fix4.ipa
 
           ls -lh dist/
 
-          echo "Exclusive Alpha Fix 3 IPA created" \
-            >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "ALPHA LOCATION FIX 4"
+            echo "IPA CREATED"
+            echo "Original Chapter 1 Part 1"
+            echo "Location selection overlay"
+            echo "English Russian Ukrainian"
+            echo "Original dialogue preserved"
+            echo "ARM64 IL2CPP"
+            echo "No new Recovery"
+            echo "Device testing required"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload Exclusive Alpha IPA
+      - name: Upload Location Fix IPA
         uses: actions/upload-artifact@v4
         with:
-          name: Apocalypse-Alpha-CH1P1-Fix3
-          path: dist/*.ipa
-          if-no-files-found: error
+          name: Apocalypse-Alpha-Location-Fix4
+          path: dist/Apocalypse-Alpha-Location-Fix4.ipa
           compression-level: 0
           retention-days: 14
+          if-no-files-found: error
 
       - name: Upload diagnostic logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Apocalypse-Alpha-Fix3-Logs
+          name: Apocalypse-Alpha-Location-Fix4-Logs
           path: logs/
-          if-no-files-found: warn
           retention-days: 14
+          if-no-files-found: warn
