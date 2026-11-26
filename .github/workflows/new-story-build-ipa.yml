@@ -1,0 +1,1332 @@
+
+name: Slendytubbies A New Story iOS V1
+
+on:
+  workflow_dispatch:
+    inputs:
+      recovery_run:
+        description: "Recovery run ID (optional)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  ipa:
+    runs-on: macos-15
+    timeout-minutes: 150
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RECOVERY_RUN: ${{ inputs.recovery_run }}
+      UNITY_EDITOR_PATH: /Applications/Unity/Unity.app/Contents/MacOS/Unity
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Prepare folders
+        run: |
+          mkdir -p recovery logs dist refs
+
+          df -h
+
+      - name: Download existing A New Story Recovery
+        run: |
+          set -euo pipefail
+
+          RUN="$RECOVERY_RUN"
+
+          if [ -z "$RUN" ]; then
+
+            RUN=$(gh run list \
+              --workflow new-story-recovery.yml \
+              --status success \
+              --limit 1 \
+              --json databaseId \
+              --jq '.[0].databaseId')
+
+          fi
+
+          test -n "$RUN"
+
+          gh run download "$RUN" \
+            --name A-New-Story-Recovery \
+            --dir recovery
+
+          test -s recovery/A-New-Story-Unity-Project.tar.gz
+
+          tar -xzf \
+            recovery/A-New-Story-Unity-Project.tar.gz
+
+          test -s ExportedProject/Assets/Menu.unity
+
+          test -s ExportedProject/ProjectSettings/EditorBuildSettings.asset
+
+          cat ExportedProject/ProjectSettings/ProjectVersion.txt
+
+          echo "Existing Recovery loaded"
+
+          echo "No new Recovery"
+
+          rm recovery/A-New-Story-Unity-Project.tar.gz
+
+      - name: Install Unity 2021.3.45f2
+        timeout-minutes: 40
+        run: |
+          set -euo pipefail
+
+          BASE=https://download.unity3d.com/download_unity/88f88f591b2e
+
+          curl -fLsS --retry 3 \
+            "$BASE/MacEditorInstallerArm64/Unity-2021.3.45f2.pkg" \
+            -o "$RUNNER_TEMP/unity.pkg"
+
+          sudo installer \
+            -pkg "$RUNNER_TEMP/unity.pkg" \
+            -target /
+
+          rm "$RUNNER_TEMP/unity.pkg"
+
+          curl -fLsS --retry 3 \
+            "$BASE/MacEditorTargetInstaller/UnitySetup-iOS-Support-for-Editor-2021.3.45f2.pkg" \
+            -o "$RUNNER_TEMP/ios.pkg"
+
+          sudo installer \
+            -pkg "$RUNNER_TEMP/ios.pkg" \
+            -target /
+
+          rm "$RUNNER_TEMP/ios.pkg"
+
+          test -x "$UNITY_EDITOR_PATH"
+
+          xcodebuild -version
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Find Unity reference libraries
+        run: |
+          set -euo pipefail
+
+          SOURCE=""
+
+          while IFS= read -r DLL; do
+
+            DIR="$(dirname "$DLL")"
+
+            if [ -s "$DIR/UnityEngine.InputLegacyModule.dll" ] &&
+               [ -s "$DIR/UnityEngine.IMGUIModule.dll" ] &&
+               [ -s "$DIR/UnityEngine.TextRenderingModule.dll" ]; then
+
+              SOURCE="$DIR"
+
+              break
+
+            fi
+
+          done < <(
+            find -L /Applications/Unity \
+              -type f \
+              -name UnityEngine.CoreModule.dll \
+              2>/dev/null
+          )
+
+          test -n "$SOURCE"
+
+          cp "$SOURCE"/UnityEngine*.dll refs/
+
+          echo "Unity references: $SOURCE"
+
+          echo "UNITY_MANAGED=$SOURCE" >> "$GITHUB_ENV"
+
+          ls refs/ > logs/unity-references.txt
+
+      - name: Create mobile input library
+        run: |
+          set -euo pipefail
+
+          mkdir -p mobile
+
+          cat > mobile/StoryMobile.csproj <<'XML'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <TargetFramework>netstandard2.0</TargetFramework>
+              <AssemblyName>StoryMobile</AssemblyName>
+              <LangVersion>latest</LangVersion>
+            </PropertyGroup>
+            <ItemGroup>
+              <Reference Include="UnityEngine.CoreModule">
+                <HintPath>$(UnityManaged)/UnityEngine.CoreModule.dll</HintPath>
+              </Reference>
+              <Reference Include="UnityEngine.InputLegacyModule">
+                <HintPath>$(UnityManaged)/UnityEngine.InputLegacyModule.dll</HintPath>
+              </Reference>
+              <Reference Include="UnityEngine.IMGUIModule">
+                <HintPath>$(UnityManaged)/UnityEngine.IMGUIModule.dll</HintPath>
+              </Reference>
+              <Reference Include="UnityEngine.TextRenderingModule">
+                <HintPath>$(UnityManaged)/UnityEngine.TextRenderingModule.dll</HintPath>
+              </Reference>
+            </ItemGroup>
+          </Project>
+          XML
+
+          cat > mobile/StoryInput.cs <<'CS'
+          using System;
+          using System.Collections.Generic;
+          using UnityEngine;
+          using UnityEngine.SceneManagement;
+
+          public static class StoryInput
+          {
+              static int frame = -1;
+
+              static Vector2 move;
+              static Vector2 look;
+
+              static HashSet<KeyCode> held =
+                  new HashSet<KeyCode>();
+
+              static HashSet<KeyCode> down =
+                  new HashSet<KeyCode>();
+
+              static HashSet<KeyCode> up =
+                  new HashSet<KeyCode>();
+
+              public static readonly KeyCode[] Keys = {
+                  KeyCode.E,
+                  KeyCode.Space,
+                  KeyCode.LeftShift,
+                  KeyCode.LeftControl,
+                  KeyCode.F,
+                  KeyCode.Escape,
+                  KeyCode.I,
+                  KeyCode.Mouse0
+              };
+
+              static bool Mobile =>
+                  Application.platform ==
+                  RuntimePlatform.IPhonePlayer;
+
+              public static bool InGame()
+              {
+                  string name = SceneManager
+                      .GetActiveScene()
+                      .name.ToLowerInvariant();
+
+                  return !name.Contains("menu")
+                      && !name.Contains("loading")
+                      && !name.Contains("credits")
+                      && !name.Contains("intro");
+              }
+
+              public static Rect Button(int i)
+              {
+                  return new Rect(
+                      Screen.width *
+                          (0.77f + i % 2 * 0.105f),
+
+                      Screen.height *
+                          (0.25f + i / 2 * 0.17f),
+
+                      Screen.width * 0.095f,
+
+                      Screen.height * 0.145f
+                  );
+              }
+
+              static void Poll()
+              {
+                  if (frame == Time.frameCount)
+                      return;
+
+                  frame = Time.frameCount;
+
+                  move = Vector2.zero;
+
+                  look = Vector2.zero;
+
+                  var next = new HashSet<KeyCode>();
+
+                  if (Mobile && InGame())
+                  {
+                      foreach (Touch t in Input.touches)
+                      {
+                          if (
+                              t.phase == TouchPhase.Ended ||
+                              t.phase == TouchPhase.Canceled
+                          )
+                              continue;
+
+                          Vector2 p = new Vector2(
+                              t.position.x,
+                              Screen.height - t.position.y
+                          );
+
+                          bool used = false;
+
+                          for (int i = 0; i < Keys.Length; i++)
+                          {
+                              if (Button(i).Contains(p))
+                              {
+                                  next.Add(Keys[i]);
+
+                                  used = true;
+
+                                  break;
+                              }
+                          }
+
+                          if (used)
+                              continue;
+
+                          if (
+                              p.x < Screen.width * 0.35f &&
+                              p.y > Screen.height * 0.48f
+                          )
+                          {
+                              Vector2 center = new Vector2(
+                                  Screen.width * 0.17f,
+                                  Screen.height * 0.74f
+                              );
+
+                              move = Vector2.ClampMagnitude(
+                                  new Vector2(
+                                      p.x - center.x,
+                                      center.y - p.y
+                                  ) / (
+                                      Screen.height * 0.17f
+                                  ),
+                                  1f
+                              );
+                          }
+                          else if (
+                              p.x >= Screen.width * 0.35f &&
+                              p.x < Screen.width * 0.77f
+                          )
+                          {
+                              look +=
+                                  t.deltaPosition * 0.12f;
+                          }
+                      }
+
+                      if (move.y > 0.2f)
+                          next.Add(KeyCode.W);
+
+                      if (move.y < -0.2f)
+                          next.Add(KeyCode.S);
+
+                      if (move.x > 0.2f)
+                          next.Add(KeyCode.D);
+
+                      if (move.x < -0.2f)
+                          next.Add(KeyCode.A);
+                  }
+
+                  down = new HashSet<KeyCode>(next);
+
+                  down.ExceptWith(held);
+
+                  up = new HashSet<KeyCode>(held);
+
+                  up.ExceptWith(next);
+
+                  held = next;
+              }
+
+              public static Vector2 Movement
+              {
+                  get
+                  {
+                      Poll();
+
+                      return move;
+                  }
+              }
+
+              public static float GetAxis(string name)
+              {
+                  if (!Mobile || !InGame())
+                      return Input.GetAxis(name);
+
+                  Poll();
+
+                  switch (name.ToLowerInvariant())
+                  {
+                      case "horizontal":
+                          return move.x;
+
+                      case "vertical":
+                          return move.y;
+
+                      case "mouse x":
+                          return look.x;
+
+                      case "mouse y":
+                          return look.y;
+
+                      default:
+                          return Input.GetAxis(name);
+                  }
+              }
+
+              public static float GetAxisRaw(string name)
+              {
+                  if (!Mobile || !InGame())
+                      return Input.GetAxisRaw(name);
+
+                  return GetAxis(name);
+              }
+
+              public static bool GetKey(KeyCode key)
+              {
+                  Poll();
+
+                  return held.Contains(key) ||
+                      Input.GetKey(key);
+              }
+
+              public static bool GetKeyDown(KeyCode key)
+              {
+                  Poll();
+
+                  return down.Contains(key) ||
+                      Input.GetKeyDown(key);
+              }
+
+              public static bool GetKeyUp(KeyCode key)
+              {
+                  Poll();
+
+                  return up.Contains(key) ||
+                      Input.GetKeyUp(key);
+              }
+
+              static KeyCode Parse(string key)
+              {
+                  KeyCode value;
+
+                  return Enum.TryParse(
+                      key.Replace(" ", ""),
+                      true,
+                      out value
+                  ) ? value : KeyCode.None;
+              }
+
+              public static bool GetKey(string key)
+              {
+                  return GetKey(Parse(key)) ||
+                      Input.GetKey(key);
+              }
+
+              public static bool GetKeyDown(string key)
+              {
+                  return GetKeyDown(Parse(key)) ||
+                      Input.GetKeyDown(key);
+              }
+
+              public static bool GetKeyUp(string key)
+              {
+                  return GetKeyUp(Parse(key)) ||
+                      Input.GetKeyUp(key);
+              }
+
+              static KeyCode ButtonKey(string name)
+              {
+                  switch (name.ToLowerInvariant())
+                  {
+                      case "jump":
+                          return KeyCode.Space;
+
+                      case "fire1":
+                          return KeyCode.Mouse0;
+
+                      case "submit":
+                      case "interact":
+                      case "use":
+                          return KeyCode.E;
+
+                      case "cancel":
+                          return KeyCode.Escape;
+
+                      case "sprint":
+                          return KeyCode.LeftShift;
+
+                      case "crouch":
+                          return KeyCode.LeftControl;
+
+                      case "flashlight":
+                          return KeyCode.F;
+
+                      default:
+                          return KeyCode.None;
+                  }
+              }
+
+              public static bool GetButton(string name)
+              {
+                  return GetKey(ButtonKey(name)) ||
+                      Input.GetButton(name);
+              }
+
+              public static bool GetButtonDown(string name)
+              {
+                  return GetKeyDown(ButtonKey(name)) ||
+                      Input.GetButtonDown(name);
+              }
+
+              public static bool GetButtonUp(string name)
+              {
+                  return GetKeyUp(ButtonKey(name)) ||
+                      Input.GetButtonUp(name);
+              }
+
+              public static bool GetMouseButton(int index)
+              {
+                  if (!Mobile || !InGame())
+                      return Input.GetMouseButton(index);
+
+                  Poll();
+
+                  return held.Contains(
+                      (KeyCode)((int)KeyCode.Mouse0 + index)
+                  );
+              }
+
+              public static bool GetMouseButtonDown(int index)
+              {
+                  if (!Mobile || !InGame())
+                      return Input.GetMouseButtonDown(index);
+
+                  Poll();
+
+                  return down.Contains(
+                      (KeyCode)((int)KeyCode.Mouse0 + index)
+                  );
+              }
+
+              public static bool GetMouseButtonUp(int index)
+              {
+                  if (!Mobile || !InGame())
+                      return Input.GetMouseButtonUp(index);
+
+                  Poll();
+
+                  return up.Contains(
+                      (KeyCode)((int)KeyCode.Mouse0 + index)
+                  );
+              }
+          }
+
+          public sealed class StoryHUD : MonoBehaviour
+          {
+              static StoryHUD instance;
+
+              static readonly string[] Labels = {
+                  "USE",
+                  "JUMP",
+                  "RUN",
+                  "CROUCH",
+                  "LIGHT",
+                  "PAUSE",
+                  "ITEMS",
+                  "ACTION"
+              };
+
+              GUIStyle style;
+
+              [RuntimeInitializeOnLoadMethod(
+                  RuntimeInitializeLoadType.BeforeSceneLoad)]
+              static void Install()
+              {
+                  if (Application.platform !=
+                      RuntimePlatform.IPhonePlayer)
+                      return;
+
+                  if (instance != null)
+                      return;
+
+                  GameObject root = new GameObject(
+                      "A New Story Mobile HUD"
+                  );
+
+                  DontDestroyOnLoad(root);
+
+                  instance = root.AddComponent<StoryHUD>();
+              }
+
+              void OnGUI()
+              {
+                  if (!StoryInput.InGame())
+                      return;
+
+                  if (Event.current.type != EventType.Repaint)
+                      return;
+
+                  GUI.depth = -100;
+
+                  Color old = GUI.color;
+
+                  GUI.color = new Color(
+                      1f, 1f, 1f, 0.45f
+                  );
+
+                  if (style == null)
+                  {
+                      style = new GUIStyle(
+                          GUI.skin.box
+                      );
+
+                      style.alignment =
+                          TextAnchor.MiddleCenter;
+                  }
+
+                  style.fontSize = Mathf.Clamp(
+                      Screen.height / 30,
+                      12,
+                      30
+                  );
+
+                  float radius =
+                      Screen.height * 0.17f;
+
+                  float x =
+                      Screen.width * 0.17f;
+
+                  float y =
+                      Screen.height * 0.74f;
+
+                  GUI.Box(
+                      new Rect(
+                          x - radius,
+                          y - radius,
+                          radius * 2,
+                          radius * 2
+                      ),
+                      ""
+                  );
+
+                  Vector2 move = StoryInput.Movement;
+
+                  float knob =
+                      radius * 0.40f;
+
+                  GUI.Box(
+                      new Rect(
+                          x + move.x * radius - knob / 2,
+                          y - move.y * radius - knob / 2,
+                          knob,
+                          knob
+                      ),
+                      ""
+                  );
+
+                  for (int i = 0; i < Labels.Length; i++)
+                  {
+                      GUI.Box(
+                          StoryInput.Button(i),
+                          Labels[i],
+                          style
+                      );
+                  }
+
+                  GUI.color = old;
+              }
+          }
+          CS
+
+          dotnet build mobile \
+            -c Release \
+            -p:UnityManaged="$UNITY_MANAGED"
+
+          mkdir -p ExportedProject/Assets/Plugins
+
+          cp mobile/bin/Release/netstandard2.0/StoryMobile.dll \
+            ExportedProject/Assets/Plugins/
+
+      - name: Connect mobile controls to original game
+        run: |
+          set -euo pipefail
+
+          dotnet new console \
+            -o patcher \
+            --framework net8.0
+
+          dotnet add patcher package Mono.Cecil \
+            --version 0.11.6
+
+          cat > patcher/Program.cs <<'CS'
+          using System;
+          using System.IO;
+          using System.Linq;
+          using System.Collections.Generic;
+          using Mono.Cecil;
+          using Mono.Cecil.Cil;
+
+          string path = Path.GetFullPath(args[0]);
+
+          string mobilePath =
+              Path.GetFullPath(args[1]);
+
+          string refs =
+              Path.GetFullPath(args[2]);
+
+          string plugins =
+              Path.GetDirectoryName(path)!;
+
+          using var resolver =
+              new DefaultAssemblyResolver();
+
+          resolver.AddSearchDirectory(plugins);
+
+          resolver.AddSearchDirectory(refs);
+
+          foreach (string dll in Directory.EnumerateFiles(
+              "/Applications/Unity",
+              "mscorlib.dll",
+              SearchOption.AllDirectories))
+          {
+              resolver.AddSearchDirectory(
+                  Path.GetDirectoryName(dll)!
+              );
+          }
+
+          var parameters = new ReaderParameters
+          {
+              InMemory = true,
+
+              AssemblyResolver = resolver
+          };
+
+          using var game =
+              AssemblyDefinition.ReadAssembly(
+                  path, parameters
+              );
+
+          using var mobile =
+              AssemblyDefinition.ReadAssembly(
+                  mobilePath, parameters
+              );
+
+          var api = mobile.MainModule.Types
+              .Single(t => t.Name == "StoryInput");
+
+          IEnumerable<TypeDefinition> Walk(
+              IEnumerable<TypeDefinition> types)
+          {
+              foreach (var type in types)
+              {
+                  yield return type;
+
+                  foreach (var nested in
+                      Walk(type.NestedTypes))
+                  {
+                      yield return nested;
+                  }
+              }
+          }
+
+          int patched = 0;
+
+          var unsupported =
+              new HashSet<string>();
+
+          foreach (var type in
+              Walk(game.MainModule.Types))
+          foreach (var method in type.Methods)
+          {
+              if (!method.HasBody)
+                  continue;
+
+              foreach (var instruction in
+                  method.Body.Instructions)
+              {
+                  if (!(instruction.Operand
+                      is MethodReference old))
+                      continue;
+
+                  if (old.DeclaringType.FullName !=
+                      "UnityEngine.Input")
+                      continue;
+
+                  var replacement =
+                      api.Methods.FirstOrDefault(m =>
+                          m.IsStatic &&
+                          m.Name == old.Name &&
+                          m.ReturnType.FullName ==
+                              old.ReturnType.FullName &&
+                          m.Parameters.Select(
+                              p => p.ParameterType.FullName
+                          ).SequenceEqual(
+                              old.Parameters.Select(
+                                  p => p.ParameterType.FullName
+                              )
+                          )
+                      );
+
+                  if (replacement == null)
+                  {
+                      unsupported.Add(old.FullName);
+
+                      continue;
+                  }
+
+                  instruction.Operand =
+                      game.MainModule.ImportReference(
+                          replacement
+                      );
+
+                  instruction.OpCode = OpCodes.Call;
+
+                  patched++;
+              }
+          }
+
+          Console.WriteLine(
+              "Original input calls patched: " +
+              patched
+          );
+
+          foreach (string method in unsupported)
+          {
+              Console.WriteLine(
+                  "Original unpatched input: " +
+                  method
+              );
+          }
+
+          if (patched == 0)
+              throw new Exception(
+                  "No supported input calls found"
+              );
+
+          game.Name.Name = "NewStoryGame";
+
+          game.MainModule.Name =
+              "NewStoryGame.dll";
+
+          game.Write(
+              Path.Combine(
+                  plugins,
+                  "NewStoryGame.dll"
+              )
+          );
+          CS
+
+          DLL=$(find ExportedProject/Assets \
+            -type f \
+            -name Assembly-CSharp.dll \
+            -print -quit)
+
+          test -n "$DLL"
+
+          test -s "$DLL.meta"
+
+          dotnet run --project patcher -- \
+            "$DLL" \
+            ExportedProject/Assets/Plugins/StoryMobile.dll \
+            "$PWD/refs" \
+            2>&1 | tee logs/input-patch.txt
+
+          mv "$DLL.meta" \
+            "$(dirname "$DLL")/NewStoryGame.dll.meta"
+
+          rm "$DLL"
+
+      - name: Repair original assembly references
+        run: |
+          set -euo pipefail
+
+          dotnet new console \
+            -o legacyfix \
+            --framework net8.0
+
+          dotnet add legacyfix package Mono.Cecil \
+            --version 0.11.6
+
+          cat > legacyfix/Program.cs <<'CS'
+          using System;
+          using System.IO;
+          using System.Linq;
+          using Mono.Cecil;
+
+          string assets = args[0];
+
+          foreach (string path in Directory.GetFiles(
+              assets,
+              "*.dll",
+              SearchOption.AllDirectories))
+          {
+              AssemblyDefinition assembly;
+
+              try
+              {
+                  assembly =
+                      AssemblyDefinition.ReadAssembly(
+                          path,
+                          new ReaderParameters
+                          {
+                              InMemory = true
+                          }
+                      );
+              }
+              catch (BadImageFormatException)
+              {
+                  continue;
+              }
+
+              using (assembly)
+              {
+                  int changed = 0;
+
+                  foreach (var reference in
+                      assembly.MainModule.AssemblyReferences)
+                  {
+                      if (reference.Name ==
+                          "Assembly-CSharp")
+                      {
+                          reference.Name =
+                              "NewStoryGame";
+
+                          changed++;
+                      }
+                  }
+
+                  if (changed == 0)
+                      continue;
+
+                  assembly.Write(path + ".fixed");
+
+                  File.Move(
+                      path + ".fixed",
+                      path,
+                      true
+                  );
+
+                  Console.WriteLine(
+                      path + " | Fixed references: " +
+                      changed
+                  );
+              }
+          }
+          CS
+
+          dotnet run --project legacyfix -- \
+            ExportedProject/Assets \
+            2>&1 | tee logs/assembly-references.txt
+
+      - name: Preserve original Unity scenes
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          assets = Path("ExportedProject/Assets")
+
+          total = 0
+
+          for path in assets.rglob("*"):
+
+              if path.suffix not in {
+                  ".unity",
+                  ".prefab",
+                  ".asset"
+              }:
+                  continue
+
+              source = path.read_bytes()
+
+              updated, count = re.subn(
+                  rb"(m_TargetAssemblyTypeName:[^\r\n]*?,[ \t]*)Assembly-CSharp(?=[ \t\r\n,'\"]|$)",
+                  rb"\g<1>NewStoryGame",
+                  source
+              )
+
+              if count:
+
+                  path.write_bytes(updated)
+
+                  total += count
+
+          for meta in assets.rglob("*.dll.meta"):
+
+              source = meta.read_text(
+                  errors="replace"
+              )
+
+              updated = re.sub(
+                  r"(Editor: Editor\r?\n[ \t]+second:\r?\n[ \t]+enabled: )0",
+                  r"\g<1>1",
+                  source
+              )
+
+              if updated != source:
+                  meta.write_text(updated)
+
+          print("UnityEvent references repaired:", total)
+
+          print("Original scene order preserved")
+
+          PY
+
+          cat > ExportedProject/Assets/StoryLink.xml <<'XML'
+          <linker>
+            <assembly fullname="NewStoryGame" preserve="all"/>
+            <assembly fullname="StoryMobile" preserve="all"/>
+          </linker>
+          XML
+
+      - name: Prepare A New Story iOS build
+        run: |
+          set -euo pipefail
+
+          mkdir -p ExportedProject/Assets/Editor
+
+          cat > ExportedProject/Assets/Editor/BuildStory.cs <<'CS'
+          using System;
+          using System.IO;
+          using System.Linq;
+          using UnityEngine;
+          using UnityEngine.Rendering;
+          using UnityEditor;
+          using UnityEditor.Build;
+          using UnityEditor.Build.Reporting;
+          using UnityEditor.SceneManagement;
+
+          public static class BuildStory
+          {
+              public static void Run()
+              {
+                  string[] scenes =
+                      EditorBuildSettings.scenes
+                          .Where(s => s.enabled)
+                          .Select(s => s.path)
+                          .ToArray();
+
+                  if (scenes.Length == 0)
+                      throw new BuildFailedException(
+                          "Original scene order missing"
+                      );
+
+                  if (!scenes.Contains("Assets/Menu.unity"))
+                      throw new BuildFailedException(
+                          "Original menu absent from build settings"
+                      );
+
+                  int missing = 0;
+
+                  foreach (string path in scenes)
+                  {
+                      if (!File.Exists(path))
+                          throw new BuildFailedException(
+                              "Original scene missing: " +
+                              path
+                          );
+
+                      var scene =
+                          EditorSceneManager.OpenScene(path);
+
+                      int sceneMissing = 0;
+
+                      foreach (var root in
+                          scene.GetRootGameObjects())
+                      foreach (var t in
+                          root.GetComponentsInChildren<Transform>(
+                              true
+                          ))
+                      {
+                          int count =
+                              GameObjectUtility
+                                  .GetMonoBehavioursWithMissingScriptCount(
+                                      t.gameObject
+                                  );
+
+                          if (count > 0)
+                          {
+                              Debug.LogWarning(
+                                  "Missing original component: " +
+                                  path + "/" +
+                                  t.name + " = " +
+                                  count
+                              );
+
+                              sceneMissing += count;
+                          }
+                      }
+
+                      missing += sceneMissing;
+
+                      Debug.Log(
+                          "Original scene: " +
+                          path +
+                          " | Missing scripts: " +
+                          sceneMissing
+                      );
+                  }
+
+                  Debug.Log(
+                      "Total original scenes: " +
+                      scenes.Length
+                  );
+
+                  if (missing > 0)
+                      throw new BuildFailedException(
+                          "Missing original components: " +
+                          missing
+                      );
+
+                  EditorSceneManager.NewScene(
+                      NewSceneSetup.EmptyScene,
+                      NewSceneMode.Single
+                  );
+
+                  PlayerSettings.productName =
+                      "Slendytubbies A New Story";
+
+                  PlayerSettings.bundleVersion =
+                      "1.2";
+
+                  PlayerSettings.iOS.buildNumber =
+                      "1";
+
+                  PlayerSettings.SetApplicationIdentifier(
+                      BuildTargetGroup.iOS,
+                      "com.slendytubbies.newstory.ios"
+                  );
+
+                  PlayerSettings.iOS.targetOSVersionString =
+                      "15.0";
+
+                  PlayerSettings.defaultInterfaceOrientation =
+                      UIOrientation.LandscapeLeft;
+
+                  PlayerSettings.SetScriptingBackend(
+                      BuildTargetGroup.iOS,
+                      ScriptingImplementation.IL2CPP
+                  );
+
+                  PlayerSettings.SetManagedStrippingLevel(
+                      BuildTargetGroup.iOS,
+                      ManagedStrippingLevel.Low
+                  );
+
+                  PlayerSettings.stripEngineCode =
+                      false;
+
+                  PlayerSettings.SetUseDefaultGraphicsAPIs(
+                      BuildTarget.iOS,
+                      false
+                  );
+
+                  PlayerSettings.SetGraphicsAPIs(
+                      BuildTarget.iOS,
+                      new[] {
+                          GraphicsDeviceType.Metal
+                      }
+                  );
+
+                  PlayerSettings.iOS.appleEnableAutomaticSigning =
+                      false;
+
+                  QualitySettings.vSyncCount = 0;
+
+                  var report =
+                      BuildPipeline.BuildPlayer(
+                          scenes,
+                          Environment.GetEnvironmentVariable(
+                              "STORY_XCODE"
+                          ),
+                          BuildTarget.iOS,
+                          BuildOptions.None
+                      );
+
+                  if (report.summary.result !=
+                      BuildResult.Succeeded)
+                  {
+                      throw new BuildFailedException(
+                          "A New Story export failed: " +
+                          report.summary.result
+                      );
+                  }
+
+                  Debug.Log(
+                      "A New Story iOS export completed"
+                  );
+              }
+          }
+          CS
+
+      - name: Preserve prepared project
+        run: |
+          set -euo pipefail
+
+          tar -cf - ExportedProject \
+            | gzip -1 \
+            > A-New-Story-Prepared-V1.tar.gz
+
+      - name: Upload reusable prepared project
+        uses: actions/upload-artifact@v4
+        with:
+          name: A-New-Story-Prepared-V1
+          path: A-New-Story-Prepared-V1.tar.gz
+          compression-level: 0
+          retention-days: 14
+
+      - name: Activate Unity Personal
+        id: activate
+        timeout-minutes: 10
+        env:
+          UNITY_USERNAME: ${{ secrets.UNITY_USERNAME || secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        run: |
+          npm install -g \
+            @rage-against-the-pixel/unity-cli@4.2.2
+
+          unity-cli activate-license \
+            --license personal
+
+      - name: Export original game to Xcode
+        timeout-minutes: 70
+        run: |
+          set -euo pipefail
+
+          export STORY_XCODE="$PWD/Xcode"
+
+          LOG="$PWD/logs/unity.log"
+
+          touch "$LOG"
+
+          tail -n +1 -F "$LOG" &
+
+          PID=$!
+
+          trap 'kill "$PID" 2>/dev/null || true' EXIT
+
+          if ! "$UNITY_EDITOR_PATH" \
+            -quit \
+            -batchmode \
+            -nographics \
+            -buildTarget iOS \
+            -projectPath "$PWD/ExportedProject" \
+            -executeMethod BuildStory.Run \
+            -logFile "$LOG"; then
+
+            grep -Ei \
+              'error|exception|failed|missing' \
+              "$LOG" | tail -100 || true
+
+            exit 1
+
+          fi
+
+          test -s Xcode/Unity-iPhone.xcodeproj/project.pbxproj
+
+      - name: Return Unity license
+        if: always() && steps.activate.outcome == 'success'
+        continue-on-error: true
+        run: |
+          unity-cli return-license \
+            --license personal \
+            --when auto
+
+      - name: Build ARM64 application
+        timeout-minutes: 45
+        run: |
+          set -euo pipefail
+
+          xcodebuild \
+            -project Xcode/Unity-iPhone.xcodeproj \
+            -scheme Unity-iPhone \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$PWD/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            ARCHS=arm64 \
+            build 2>&1 | tee logs/xcode.log
+
+      - name: Create A New Story IPA
+        run: |
+          set -euo pipefail
+
+          APP=$(find \
+            "$PWD/DerivedData/Build/Products/Release-iphoneos" \
+            -maxdepth 1 \
+            -type d \
+            -name '*.app' \
+            -print -quit)
+
+          test -d "$APP"
+
+          EXE=$(/usr/libexec/PlistBuddy \
+            -c 'Print :CFBundleExecutable' \
+            "$APP/Info.plist")
+
+          lipo "$APP/$EXE" \
+            -verify_arch arm64
+
+          for KEY in UIFileSharingEnabled LSSupportsOpeningDocumentsInPlace; do
+
+            /usr/libexec/PlistBuddy \
+              -c "Set :$KEY true" \
+              "$APP/Info.plist" 2>/dev/null || \
+            /usr/libexec/PlistBuddy \
+              -c "Add :$KEY bool true" \
+              "$APP/Info.plist"
+
+          done
+
+          STAGE=$(mktemp -d)
+
+          mkdir -p "$STAGE/Payload"
+
+          ditto "$APP" \
+            "$STAGE/Payload/ANewStory.app"
+
+          ditto -c -k --norsrc --keepParent \
+            "$STAGE/Payload" \
+            "$PWD/dist/A-New-Story-1.2-iOS-V1.ipa"
+
+          unzip -tq \
+            dist/A-New-Story-1.2-iOS-V1.ipa
+
+          ls -lh dist/
+
+          {
+            echo "# A New Story iOS V1"
+            echo ""
+            echo "Original game version: 1.2"
+            echo "Unity 2021.3.45f2"
+            echo "ARM64 IL2CPP"
+            echo "Mobile input patched"
+            echo "Original scene order preserved"
+            echo "No new Recovery"
+            echo "Device testing required"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload A New Story IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: A-New-Story-iOS-V1
+          path: dist/*.ipa
+          compression-level: 0
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A-New-Story-iOS-Logs
+          path: logs/
+          retention-days: 14
+          if-no-files-found: warn
