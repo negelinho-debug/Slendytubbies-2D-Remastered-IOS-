@@ -1,66 +1,125 @@
 
-name: Coming - Create IPA V1
+name: Coming - Mega Fix V2
 
 on:
   workflow_dispatch:
+  workflow_call:
+    secrets:
+      COMING_ARCHIVE_PASSWORD:
+        required: true
 
 permissions:
   contents: read
-  actions: read
 
 jobs:
-  recovery:
-    uses: ./.github/workflows/coming-mega-fix.yml
-    secrets:
-      COMING_ARCHIVE_PASSWORD: ${{ secrets.COMING_ARCHIVE_PASSWORD }}
-
-  create-ipa:
-    needs: recovery
-    runs-on: macos-15
-    timeout-minutes: 180
+  mega-fix:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Check archive password
-        env:
-          PASSWORD: ${{ secrets.COMING_ARCHIVE_PASSWORD }}
-        run: |
-          if [ -z "$PASSWORD" ]; then
-            echo "COMING_ARCHIVE_PASSWORD is missing"
-            exit 1
-          fi
-
       - name: Prepare tools
         run: |
-          mkdir -p incoming restored ComingProject output reports
+          mkdir -p game reports recovered recovered-code output
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full
+          python3 -m pip install requests beautifulsoup4
 
-          if ! command -v 7zz >/dev/null 2>&1; then
-            brew install sevenzip
-          fi
+      - name: Download original Coming
+        run: |
+          python3 - <<'PY'
+          import requests
+          import zipfile
+          from bs4 import BeautifulSoup
 
-          xcodebuild -version
+          url = "https://www.mediafire.com/file/dym00pxjpkcc1oz/Coming.zip/file"
 
-      - name: Download Mega Fix project
-        uses: actions/download-artifact@v4
-        with:
-          name: Coming-Mega-Fix
-          path: incoming
+          session = requests.Session()
+          session.headers["User-Agent"] = "Mozilla/5.0"
 
-      - name: Extract recovered project
-        env:
-          PASSWORD: ${{ secrets.COMING_ARCHIVE_PASSWORD }}
+          page = session.get(url, timeout=60)
+          page.raise_for_status()
+
+          soup = BeautifulSoup(page.text, "html.parser")
+          button = soup.select_one("#downloadButton")
+
+          if not button or not button.get("href"):
+              raise RuntimeError("Download link not found")
+
+          with session.get(
+              button["href"],
+              stream=True,
+              timeout=120
+          ) as response:
+              response.raise_for_status()
+
+              with open("Coming.zip", "wb") as file:
+                  for chunk in response.iter_content(1024 * 1024):
+                      file.write(chunk)
+
+          if not zipfile.is_zipfile("Coming.zip"):
+              raise RuntimeError("Invalid ZIP archive")
+
+          print("Coming downloaded successfully")
+          PY
+
+      - name: Extract original game
+        run: |
+          set -euo pipefail
+          7z t Coming.zip
+          7z x Coming.zip -ogame -y
+
+      - name: Detect Unity
         run: |
           set -euo pipefail
 
-          7zz x incoming/Coming-Mega-Fix.7z \
-            -p"$PASSWORD" \
-            -orestored \
-            -y > /dev/null
+          managers="$(find game -name globalgamemanagers -print -quit)"
+          dll="$(find game -name Assembly-CSharp.dll -print -quit)"
 
-          version="$(find restored \
-            -name ProjectVersion.txt -print -quit)"
+          test -n "$managers"
+          test -n "$dll"
+
+          echo "GAME_ROOT=$(dirname "$managers")" >> "$GITHUB_ENV"
+          echo "GAME_DLL=$dll" >> "$GITHUB_ENV"
+
+          echo "COMING MEGA FIX V2" > reports/summary.txt
+
+      - name: Install .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
+
+      - name: Build AssetRipper
+        run: |
+          set -euo pipefail
+
+          git clone --depth 1 \
+            https://github.com/nowl-it/AssetRipperCLI.git \
+            "$RUNNER_TEMP/ripper"
+
+          dotnet publish \
+            "$RUNNER_TEMP/ripper/Source/AssetRipper.GUI.Free/AssetRipper.GUI.Free.csproj" \
+            -c Release \
+            -r linux-x64 \
+            --self-contained true \
+            -p:PublishAot=false \
+            -o "$RUNNER_TEMP/ripper-bin"
+
+      - name: Full Recovery
+        run: |
+          set -euo pipefail
+
+          dotnet "$RUNNER_TEMP/ripper-bin/AssetRipper.GUI.Free.dll" \
+            --cli \
+            --input "$GAME_ROOT" \
+            --output "$PWD/recovered" \
+            --mode Unity \
+            --script-content-level Level0 \
+            > reports/assetripper.log 2>&1
+
+          version="$(find recovered -name ProjectVersion.txt -print -quit)"
 
           test -n "$version"
 
@@ -68,327 +127,629 @@ jobs:
 
           test -d "$project/Assets"
 
-          rsync -a "$project/" ComingProject/
+          echo "RECOVERED_PROJECT=$project" >> "$GITHUB_ENV"
 
-          echo "Original project extracted"
+      - name: Install ILSpy
+        run: |
+          dotnet tool install ilspycmd \
+            --tool-path "$RUNNER_TEMP/tools" \
+            --version 9.1.0.7988
 
-      - name: Prepare Unity 2022
+      - name: Recover additional gameplay assemblies
         run: |
           set -euo pipefail
 
-          mkdir -p ComingProject/ProjectSettings
-          mkdir -p ComingProject/Packages
+          managed="$(dirname "$GAME_DLL")"
 
-          echo "m_EditorVersion: 2022.3.62f3" \
-            > ComingProject/ProjectSettings/ProjectVersion.txt
+          find "$managed" -maxdepth 1 -name '*.dll' \
+            > reports/assemblies.txt
 
+          for dll in "$managed"/Assembly-*.dll; do
+
+            [ -f "$dll" ] || continue
+
+            name="$(basename "$dll" .dll)"
+
+            mkdir -p "recovered-code/$name"
+
+            if ! "$RUNNER_TEMP/tools/ilspycmd" \
+              --project \
+              --outputdir "recovered-code/$name" \
+              --referencepath "$managed" \
+              "$dll" \
+              > "reports/$name.log" 2>&1; then
+
+              echo "Decompilation failed: $name" >> reports/summary.txt
+
+            fi
+
+          done
+
+          test -n "$(find recovered-code -name '*.cs' -print -quit)"
+
+      - name: Advanced script recovery
+        run: |
           python3 - <<'PY'
-          import json
           from pathlib import Path
+          from collections import defaultdict
+          import os
+          import csv
+          import re
 
-          manifest = Path(
-              "ComingProject/Packages/manifest.json"
-          )
+          project = Path(os.environ["RECOVERED_PROJECT"])
+          assets = project / "Assets"
+          code = Path("recovered-code")
 
-          if not manifest.exists():
-              manifest.write_text(
-                  json.dumps({
-                      "dependencies": {
-                          "com.unity.ugui": "1.0.0",
-                          "com.unity.modules.audio": "1.0.0",
-                          "com.unity.modules.animation": "1.0.0",
-                          "com.unity.modules.physics": "1.0.0",
-                          "com.unity.modules.physics2d": "1.0.0",
-                          "com.unity.modules.ui": "1.0.0",
-                          "com.unity.modules.imgui": "1.0.0",
-                          "com.unity.modules.ai": "1.0.0",
-                          "com.unity.modules.particlesystem": "1.0.0",
-                          "com.unity.modules.unitywebrequest": "1.0.0",
-                          "com.unity.modules.video": "1.0.0"
-                      }
-                  }, indent=2)
+          sources = defaultdict(list)
+
+          for file in code.rglob("*.cs"):
+              sources[file.name.casefold()].append(file)
+
+          restored = 0
+          unresolved = 0
+          results = []
+
+          for file in assets.rglob("*.cs"):
+
+              text = file.read_text(
+                  encoding="utf-8-sig",
+                  errors="replace"
               )
 
-          print("Unity project prepared")
+              if "Dummy class. This could have happened" not in text:
+                  continue
+
+              candidates = sources.get(file.name.casefold(), [])
+
+              if len(candidates) > 1:
+                  namespace = re.search(
+                      r'\bnamespace\s+([\w.]+)',
+                      text
+                  )
+
+                  if namespace:
+                      expected = namespace.group(1)
+
+                      candidates = [
+                          p for p in candidates
+                          if re.search(
+                              r'\bnamespace\s+' +
+                              re.escape(expected) +
+                              r'\s*[{;]',
+                              p.read_text(errors="replace")
+                          )
+                      ]
+
+              if len(candidates) == 1:
+
+                  replacement = candidates[0].read_text(
+                      encoding="utf-8-sig",
+                      errors="replace"
+                  )
+
+                  if replacement.strip():
+
+                      file.write_text(
+                          replacement,
+                          encoding="utf-8"
+                      )
+
+                      restored += 1
+                      results.append([str(file), "Restored"])
+                      continue
+
+              unresolved += 1
+              results.append([str(file), "Unresolved"])
+
+          with open("reports/scripts.csv", "w", newline="") as report:
+              writer = csv.writer(report)
+              writer.writerow(["Script", "Status"])
+              writer.writerows(results)
+
+          with open("reports/summary.txt", "a") as report:
+              report.write(f"\nRestored scripts: {restored}\n")
+              report.write(f"Unresolved scripts: {unresolved}\n")
+
+          print("Restored:", restored)
+          print("Unresolved:", unresolved)
           PY
 
-      - name: Create iOS build script
+      - name: Install mobile input bridge
         run: |
-          mkdir -p ComingProject/Assets/Editor
+          mkdir -p "$RECOVERED_PROJECT/Assets/Plugins/ComingMobile"
 
-          cat > ComingProject/Assets/Editor/ComingIOSBuild.cs <<'CS'
-          using System;
-          using System.IO;
-          using System.Linq;
+          cat > "$RECOVERED_PROJECT/Assets/Plugins/ComingMobile/ComingTouch.cs" <<'CS'
           using UnityEngine;
-          using UnityEditor;
-          using UnityEditor.Build.Reporting;
 
-          public static class ComingIOSBuild
+          public class ComingTouch : MonoBehaviour
           {
-              private static string GetArgument(string name)
+              private static bool enabledTouch;
+              private static int frame = -1;
+              private static int held;
+              private static int previous;
+              private static Vector2 movement;
+              private static Vector2 look;
+
+              private static int language;
+
+              private static readonly Rect joystick =
+                  new Rect(20, 360, 220, 220);
+
+              private static readonly Rect[] buttons = {
+                  new Rect(860, 370, 120, 90),
+                  new Rect(720, 480, 120, 90),
+                  new Rect(860, 480, 120, 90),
+                  new Rect(720, 370, 120, 90),
+                  new Rect(570, 480, 130, 90),
+                  new Rect(570, 370, 130, 90)
+              };
+
+              private static readonly string[,] labels = {
+                  {"Jump", "Run", "Crouch", "Use", "Light", "Pause"},
+                  {"Стрибок", "Біг", "Присісти", "Дія", "Світло", "Пауза"},
+                  {"Прыжок", "Бег", "Присесть", "Действие", "Свет", "Пауза"}
+              };
+
+              [RuntimeInitializeOnLoadMethod]
+              private static void Init()
               {
-                  string[] args =
-                      Environment.GetCommandLineArgs();
-
-                  int index = Array.IndexOf(args, name);
-
-                  if (index >= 0 && index + 1 < args.Length)
-                      return args[index + 1];
-
-                  return null;
-              }
-
-              public static void Build()
-              {
-                  PlayerSettings.productName =
-                      "Slendytubbies They're Coming";
-
-                  PlayerSettings.companyName =
-                      "Coming Mobile";
-
-                  PlayerSettings.SetApplicationIdentifier(
-                      BuildTargetGroup.iOS,
-                      "com.coming.mobile"
-                  );
-
-                  PlayerSettings.bundleVersion = "1.0.0";
-
-                  PlayerSettings.iOS.buildNumber = "1";
-
-                  PlayerSettings.iOS.targetOSVersionString =
-                      "15.0";
-
-                  PlayerSettings.defaultInterfaceOrientation =
-                      UIOrientation.LandscapeLeft;
-
-                  PlayerSettings.SetScriptingBackend(
-                      BuildTargetGroup.iOS,
-                      ScriptingImplementation.IL2CPP
-                  );
-
-                  PlayerSettings.SetManagedStrippingLevel(
-                      BuildTargetGroup.iOS,
-                      ManagedStrippingLevel.Low
-                  );
-
-                  PlayerSettings.iOS.sdkVersion =
-                      iOSSdkVersion.DeviceSDK;
-
-                  PlayerSettings.SetGraphicsAPIs(
-                      BuildTarget.iOS,
-                      new[] {
-                          UnityEngine.Rendering.GraphicsDeviceType.Metal
-                      }
-                  );
-
-                  PlayerSettings.SetUseDefaultGraphicsAPIs(
-                      BuildTarget.iOS,
-                      false
-                  );
-
-                  string[] scenes =
-                      EditorBuildSettings.scenes
-                      .Where(s => s.enabled &&
-                          File.Exists(s.path))
-                      .Select(s => s.path)
-                      .ToArray();
-
-                  if (scenes.Length == 0)
-                  {
-                      throw new Exception(
-                          "Original scene order missing. " +
-                          "Restore EditorBuildSettings first."
-                      );
-                  }
-
-                  foreach (string scene in scenes)
-                      Debug.Log("BUILD SCENE: " + scene);
-
-                  string output =
-                      GetArgument("-customBuildPath");
-
-                  if (string.IsNullOrEmpty(output))
-                      output = Path.GetFullPath("ComingXcode");
-
-                  BuildPlayerOptions options =
-                      new BuildPlayerOptions();
-
-                  options.scenes = scenes;
-
-                  options.locationPathName = output;
-
-                  options.target = BuildTarget.iOS;
-
-                  options.options = BuildOptions.None;
-
-                  BuildReport report =
-                      BuildPipeline.BuildPlayer(options);
-
-                  if (report.summary.result !=
-                      BuildResult.Succeeded)
-                  {
-                      throw new Exception(
-                          "Unity iOS build failed: " +
-                          report.summary.result
-                      );
-                  }
-
-                  Debug.Log("COMING XCODE EXPORT SUCCESS");
-              }
-          }
-          CS
-
-      - name: Enable iPhone Files access
-        run: |
-          cat > ComingProject/Assets/Editor/ComingFiles.cs <<'CS'
-          #if UNITY_IOS
-          using System.IO;
-          using UnityEditor;
-          using UnityEditor.Callbacks;
-          using UnityEditor.iOS.Xcode;
-
-          public static class ComingFiles
-          {
-              [PostProcessBuild(100)]
-              public static void Enable(
-                  BuildTarget target,
-                  string output
-              )
-              {
-                  if (target != BuildTarget.iOS)
+                  if (!Application.isMobilePlatform)
                       return;
 
-                  string path =
-                      Path.Combine(output, "Info.plist");
+                  GameObject obj =
+                      new GameObject("Coming Mobile");
 
-                  PlistDocument plist =
-                      new PlistDocument();
+                  DontDestroyOnLoad(obj);
+                  obj.AddComponent<ComingTouch>();
 
-                  plist.ReadFromFile(path);
+                  language = Mathf.Clamp(
+                      PlayerPrefs.GetInt("ComingLanguage", 0),
+                      0, 2
+                  );
+              }
 
-                  plist.root.SetBoolean(
-                      "UIFileSharingEnabled", true
+              private static void ReadTouch()
+              {
+                  if (frame == Time.frameCount)
+                      return;
+
+                  frame = Time.frameCount;
+                  previous = held;
+                  held = 0;
+                  movement = Vector2.zero;
+                  look = Vector2.zero;
+
+                  if (!Application.isMobilePlatform)
+                      return;
+
+                  foreach (Touch t in Input.touches)
+                  {
+                      if (t.phase == TouchPhase.Ended ||
+                          t.phase == TouchPhase.Canceled)
+                          continue;
+
+                      Vector2 p = new Vector2(
+                          t.position.x * 1000f / Screen.width,
+                          (Screen.height - t.position.y) *
+                          600f / Screen.height
+                      );
+
+                      if (t.phase == TouchPhase.Began)
+                      {
+                          if (new Rect(10, 10, 150, 50).Contains(p))
+                          {
+                              enabledTouch = !enabledTouch;
+                              continue;
+                          }
+
+                          if (new Rect(180, 10, 100, 50).Contains(p))
+                          {
+                              language = (language + 1) % 3;
+                              PlayerPrefs.SetInt(
+                                  "ComingLanguage", language
+                              );
+                              PlayerPrefs.Save();
+                              continue;
+                          }
+                      }
+
+                      if (!enabledTouch)
+                          continue;
+
+                      if (joystick.Contains(p))
+                      {
+                          movement = Vector2.ClampMagnitude(
+                              new Vector2(
+                                  (p.x - joystick.center.x) / 90f,
+                                  (joystick.center.y - p.y) / 90f
+                              ), 1f
+                          );
+                          continue;
+                      }
+
+                      bool button = false;
+
+                      for (int i = 0; i < buttons.Length; i++)
+                      {
+                          if (buttons[i].Contains(p))
+                          {
+                              held |= 1 << i;
+                              button = true;
+                          }
+                      }
+
+                      if (!button && p.x > 400 && p.y > 70)
+                      {
+                          look += new Vector2(
+                              t.deltaPosition.x * 1000f / Screen.width,
+                              t.deltaPosition.y * 600f / Screen.height
+                          ) * 0.12f;
+                      }
+                  }
+              }
+
+              private void Update()
+              {
+                  ReadTouch();
+              }
+
+              private void OnGUI()
+              {
+                  Matrix4x4 old = GUI.matrix;
+
+                  GUI.matrix = Matrix4x4.TRS(
+                      Vector3.zero,
+                      Quaternion.identity,
+                      new Vector3(
+                          Screen.width / 1000f,
+                          Screen.height / 600f,
+                          1f
+                      )
                   );
 
-                  plist.root.SetBoolean(
-                      "LSSupportsOpeningDocumentsInPlace", true
+                  GUI.skin.box.fontSize = 20;
+
+                  GUI.Box(
+                      new Rect(10, 10, 150, 50),
+                      enabledTouch ? "Touch ON" : "Touch OFF"
                   );
 
-                  plist.WriteToFile(path);
+                  GUI.Box(
+                      new Rect(180, 10, 100, 50),
+                      language == 0 ? "EN" :
+                      language == 1 ? "UA" : "RU"
+                  );
+
+                  if (enabledTouch)
+                  {
+                      GUI.Box(joystick, "+");
+
+                      GUI.Box(
+                          new Rect(
+                              joystick.center.x + movement.x * 65 - 25,
+                              joystick.center.y - movement.y * 65 - 25,
+                              50, 50
+                          ),
+                          "O"
+                      );
+
+                      for (int i = 0; i < buttons.Length; i++)
+                          GUI.Box(buttons[i], labels[language, i]);
+                  }
+
+                  GUI.matrix = old;
+              }
+
+              private static bool Axis(string name, out float value)
+              {
+                  ReadTouch();
+                  value = 0;
+
+                  if (!enabledTouch)
+                      return false;
+
+                  switch (name.ToLowerInvariant())
+                  {
+                      case "horizontal":
+                          value = movement.x;
+                          return true;
+
+                      case "vertical":
+                          value = movement.y;
+                          return true;
+
+                      case "mouse x":
+                          value = look.x;
+                          return true;
+
+                      case "mouse y":
+                          value = look.y;
+                          return true;
+                  }
+
+                  return false;
+              }
+
+              public static float GetAxis(string name)
+              {
+                  float value;
+                  return Axis(name, out value)
+                      ? value : Input.GetAxis(name);
+              }
+
+              public static float GetAxisRaw(string name)
+              {
+                  float value;
+                  return Axis(name, out value)
+                      ? value : Input.GetAxisRaw(name);
+              }
+
+              private static int Mask(string name)
+              {
+                  switch (name.ToLowerInvariant())
+                  {
+                      case "space":
+                      case "jump": return 1;
+
+                      case "leftshift":
+                      case "left shift":
+                      case "sprint":
+                      case "run": return 2;
+
+                      case "leftcontrol":
+                      case "left ctrl":
+                      case "c":
+                      case "crouch": return 4;
+
+                      case "e":
+                      case "interact":
+                      case "use": return 8;
+
+                      case "f":
+                      case "flashlight": return 16;
+
+                      case "escape":
+                      case "pause":
+                      case "cancel": return 32;
+                  }
+
+                  return 0;
+              }
+
+              private static bool VirtualKey(string key, int mode)
+              {
+                  ReadTouch();
+
+                  int mask = Mask(key);
+
+                  if (!enabledTouch || mask == 0)
+                      return false;
+
+                  if (mode == 1)
+                      return (held & mask) != 0 &&
+                             (previous & mask) == 0;
+
+                  if (mode == 2)
+                      return (held & mask) == 0 &&
+                             (previous & mask) != 0;
+
+                  return (held & mask) != 0;
+              }
+
+              public static bool GetKey(KeyCode key)
+              {
+                  return VirtualKey(key.ToString(), 0) ||
+                         Input.GetKey(key);
+              }
+
+              public static bool GetKeyDown(KeyCode key)
+              {
+                  return VirtualKey(key.ToString(), 1) ||
+                         Input.GetKeyDown(key);
+              }
+
+              public static bool GetKeyUp(KeyCode key)
+              {
+                  return VirtualKey(key.ToString(), 2) ||
+                         Input.GetKeyUp(key);
+              }
+
+              public static bool GetKey(string key)
+              {
+                  return VirtualKey(key, 0) || Input.GetKey(key);
+              }
+
+              public static bool GetKeyDown(string key)
+              {
+                  return VirtualKey(key, 1) || Input.GetKeyDown(key);
+              }
+
+              public static bool GetKeyUp(string key)
+              {
+                  return VirtualKey(key, 2) || Input.GetKeyUp(key);
+              }
+
+              public static bool GetButton(string key)
+              {
+                  return VirtualKey(key, 0) || Input.GetButton(key);
+              }
+
+              public static bool GetButtonDown(string key)
+              {
+                  return VirtualKey(key, 1) || Input.GetButtonDown(key);
+              }
+
+              public static bool GetButtonUp(string key)
+              {
+                  return VirtualKey(key, 2) || Input.GetButtonUp(key);
               }
           }
-          #endif
           CS
 
-      - name: Unity IL2CPP iOS export
-        uses: game-ci/unity-builder@v4
-        env:
-          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
-          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
-          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
-          UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
-        with:
-          projectPath: ComingProject
-          unityVersion: 2022.3.62f3
-          targetPlatform: iOS
-          buildName: Coming
-          buildsPath: build
-          buildMethod: ComingIOSBuild.Build
-          allowDirtyBuild: true
-          versioning: None
+      - name: Connect mobile controls to original scripts
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          import re
 
-      - name: Find generated Xcode project
+          assets = Path(os.environ["RECOVERED_PROJECT"]) / "Assets"
+
+          pattern = re.compile(
+              r'(?<![\w.])(?:UnityEngine\.)?Input\.'
+              r'(GetAxisRaw|GetAxis|GetKeyDown|GetKeyUp|GetKey|'
+              r'GetButtonDown|GetButtonUp|GetButton)\s*\('
+          )
+
+          patched = 0
+
+          for file in assets.rglob("*.cs"):
+
+              if "ComingMobile" in file.parts:
+                  continue
+
+              text = file.read_text(errors="replace")
+
+              if "Dummy class. This could have happened" in text:
+                  continue
+
+              if "using UnityEngine;" not in text:
+                  continue
+
+              if re.search(r'using\s+Input\s*=', text):
+                  continue
+
+              updated, count = pattern.subn(
+                  lambda m: "ComingTouch." + m.group(1) + "(",
+                  text
+              )
+
+              if count:
+                  file.write_text(updated, encoding="utf-8")
+                  patched += 1
+
+          with open("reports/summary.txt", "a") as report:
+              report.write(f"Input scripts patched: {patched}\n")
+              report.write("Experimental touch controls added\n")
+              report.write("Touch interface languages: EN / UA / RU\n")
+
+          print("Input scripts patched:", patched)
+          PY
+
+      - name: Check textures shaders and scenes
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+
+          assets = Path(os.environ["RECOVERED_PROJECT"]) / "Assets"
+
+          lines = [
+              "",
+              "MEGA FIX RESULTS",
+              f"Scenes: {len(list(assets.rglob('*.unity')))}",
+              f"Animations: {len(list(assets.rglob('*.anim')))}",
+              f"Materials: {len(list(assets.rglob('*.mat')))}",
+              f"Shaders: {len(list(assets.rglob('*.shader')))}",
+              f"Scripts: {len(list(assets.rglob('*.cs')))}",
+              "Original scenes and materials preserved",
+              "Unity compilation not tested",
+              "Shader compatibility not verified",
+              "Full campaign translation not implemented"
+          ]
+
+          with open("reports/summary.txt", "a") as report:
+              report.write("\n".join(lines) + "\n")
+
+          print("\n".join(lines))
+          PY
+
+      - name: Add runtime debug log
+        run: |
+          cat > "$RECOVERED_PROJECT/Assets/Plugins/ComingMobile/ComingLog.cs" <<'CS'
+          using UnityEngine;
+          using System.IO;
+
+          public static class ComingLog
+          {
+              private static string path;
+
+              [RuntimeInitializeOnLoadMethod]
+              private static void Init()
+              {
+                  path = Path.Combine(
+                      Application.persistentDataPath,
+                      "ComingDebug.txt"
+                  );
+
+                  Application.logMessageReceived += Save;
+              }
+
+              private static void Save(
+                  string message,
+                  string stack,
+                  LogType type
+              )
+              {
+                  try
+                  {
+                      if (File.Exists(path) &&
+                          new FileInfo(path).Length > 2097152)
+                          File.WriteAllText(path, "");
+
+                      File.AppendAllText(
+                          path,
+                          type + ": " + message + "\n" +
+                          stack + "\n"
+                      );
+                  }
+                  catch {}
+              }
+          }
+          CS
+
+      - name: Save recovered project
+        env:
+          ARCHIVE_PASSWORD: ${{ secrets.COMING_ARCHIVE_PASSWORD }}
         run: |
           set -euo pipefail
 
-          project="$(find build ComingProject \
-            -name Unity-iPhone.xcodeproj \
-            -type d -print -quit)"
-
-          if [ -z "$project" ]; then
-            echo "Xcode project not found"
+          if [ -z "$ARCHIVE_PASSWORD" ]; then
+            echo "WARNING: COMING_ARCHIVE_PASSWORD is missing." >> reports/summary.txt
+            echo "Project cannot be passed to Create IPA."
             exit 1
           fi
 
-          echo "XCODE_PROJECT=$project" >> "$GITHUB_ENV"
-
-      - name: Compile iOS ARM64 application
-        run: |
-          set -euo pipefail
-
-          xcodebuild \
-            -project "$XCODE_PROJECT" \
-            -scheme Unity-iPhone \
-            -configuration Release \
-            -sdk iphoneos \
-            -destination 'generic/platform=iOS' \
-            -derivedDataPath "$PWD/derived" \
-            ARCHS=arm64 \
-            IPHONEOS_DEPLOYMENT_TARGET=15.0 \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            build \
-            > reports/xcode.log 2>&1 || {
-              tail -100 reports/xcode.log
-              exit 1
-            }
-
-          echo "Xcode build successful"
-
-      - name: Create IPA
-        run: |
-          set -euo pipefail
-
-          app="$(find derived/Build/Products \
-            -maxdepth 3 \
-            -name '*.app' \
-            -type d -print -quit)"
-
-          test -n "$app"
-
-          mkdir -p Payload
-
-          ditto "$app" "Payload/Coming.app"
-
-          ditto -c -k --keepParent \
-            Payload \
-            output/Coming-iOS-V1.ipa
-
-          unzip -t output/Coming-iOS-V1.ipa
-
-          echo "IPA created successfully"
-
-          du -h output/Coming-iOS-V1.ipa
-
-      - name: Encrypt IPA for personal testing
-        env:
-          PASSWORD: ${{ secrets.COMING_ARCHIVE_PASSWORD }}
-        run: |
-          7zz a -t7z -mhe=on \
-            -p"$PASSWORD" \
-            output/Coming-iOS-V1.7z \
-            output/Coming-iOS-V1.ipa \
+          7z a -t7z -mhe=on \
+            -p"$ARCHIVE_PASSWORD" \
+            output/Coming-Mega-Fix.7z \
+            recovered/ recovered-code/ \
             > /dev/null
 
-      - name: Upload IPA
-        uses: actions/upload-artifact@v4
-        with:
-          name: Coming-iOS-V1
-          path: output/Coming-iOS-V1.7z
-          retention-days: 7
-          if-no-files-found: error
+          test -s output/Coming-Mega-Fix.7z
 
-      - name: Final summary
+          echo "Encrypted project saved successfully" >> reports/summary.txt
+
+      - name: Show results
         if: always()
         run: |
-          if [ -f output/Coming-iOS-V1.7z ]; then
-            echo "COMING IPA CREATED" >> "$GITHUB_STEP_SUMMARY"
-            echo "Architecture: ARM64" >> "$GITHUB_STEP_SUMMARY"
-            echo "Backend: IL2CPP" >> "$GITHUB_STEP_SUMMARY"
-            echo "Minimum iOS: 15.0" >> "$GITHUB_STEP_SUMMARY"
-            echo "Signing: required before installation" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "IPA build not completed" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f reports/summary.txt ]; then
+            cat reports/summary.txt
+            cat reports/summary.txt >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Coming-Mega-Fix-Report
+          path: reports/summary.txt
+          retention-days: 7
+
+      - name: Upload encrypted project
+        uses: actions/upload-artifact@v4
+        with:
+          name: Coming-Mega-Fix
+          path: output/Coming-Mega-Fix.7z
+          if-no-files-found: error
+          retention-days: 7
