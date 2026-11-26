@@ -1,4 +1,4 @@
-name: Coming - Create IPA V5 CSharp Fix
+name: Coming - Create IPA V6 Mega Fix
 
 on:
   workflow_dispatch:
@@ -21,26 +21,124 @@ jobs:
     env:
       UNITY_VERSION: 2022.3.62f3
       UNITY_CHANGESET: 96770f904ca7
+      V5_COMMIT: 8a04934116be64bd441023ed302aef4f16212005
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore complete V5
+        run: |
+          set -euo pipefail
+
+          mkdir -p .coming-v6 reports
+
+          python3 -m venv .coming-v6/venv
+
+          .coming-v6/venv/bin/pip install \
+            pyyaml requests beautifulsoup4
+
+          git show \
+            "$V5_COMMIT:.github/workflows/coming-build-v5.yml" \
+            > .coming-v6/v5.yml
+
+          git show \
+            "$V5_COMMIT:.github/workflows/coming-create-ipa.yml" \
+            > .coming-v6/recovery.yml
+
+          .coming-v6/venv/bin/python - <<'PY'
+          import yaml
+          from pathlib import Path
+
+          root = Path(".coming-v6")
+
+          data = yaml.safe_load(
+              (root / "v5.yml").read_text()
+          )
+
+          steps = data["jobs"]["build-ipa"]["steps"]
+
+          mapping = {
+              "Prepare tools": "tools",
+              "Extract recovered project": "extract",
+              "V5 Fix CSharp 10 to CSharp 9": "csharp",
+              "Prepare Unity project": "prepare",
+              "Create Unity iOS builder": "builder",
+              "Enable iPhone Files access": "files",
+              "Install Unity CLI V4": "cli",
+              "Install Unity and iOS module": "install",
+              "Verify Unity installation": "verify",
+              "Activate Unity Personal": "activate",
+              "Unity iOS IL2CPP export": "export",
+              "Return Unity License": "return",
+              "Find Xcode project": "find",
+              "Compile ARM64 iOS application": "xcode",
+              "Create real IPA V5": "ipa",
+              "Protect IPA": "protect",
+              "Final summary": "summary"
+          }
+
+          found = set()
+
+          for step in steps:
+              name = step.get("name")
+
+              if name not in mapping:
+                  continue
+
+              script = step["run"]
+
+              script = script.replace(
+                  "Coming-iOS-V5",
+                  "Coming-iOS-V6"
+              )
+
+              script = script.replace(
+                  "COMING V5 IPA",
+                  "COMING V6 IPA"
+              )
+
+              if name == "Create Unity iOS builder":
+                  script = script.replace(
+                      '"5";',
+                      '"6";'
+                  )
+
+              path = root / (
+                  mapping[name] + ".sh"
+              )
+
+              path.write_text(script)
+              found.add(name)
+
+          missing = set(mapping) - found
+
+          if missing:
+              raise RuntimeError(str(missing))
+
+          recovery = yaml.safe_load(
+              (root / "recovery.yml").read_text()
+          )
+
+          download = next(
+              s["run"]
+              for s in recovery["jobs"]["mega-fix"]["steps"]
+              if s.get("name") == "Download original Coming"
+          )
+
+          (root / "download-original.sh").write_text(
+              download
+          )
+
+          print("V5 restored successfully")
+          PY
 
       - name: Prepare tools
         env:
           PASSWORD: ${{ secrets.COMING_ARCHIVE_PASSWORD }}
-        run: |
-          set -euo pipefail
-
-          test -n "$PASSWORD"
-
-          mkdir -p incoming restored ComingProject output reports
-
-          if ! command -v 7zz >/dev/null 2>&1; then
-            brew install sevenzip
-          fi
-
-          xcodebuild -version
+        run: bash .coming-v6/tools.sh
 
       - name: Download recovered project
         uses: actions/download-artifact@v4
@@ -51,28 +149,359 @@ jobs:
       - name: Extract recovered project
         env:
           PASSWORD: ${{ secrets.COMING_ARCHIVE_PASSWORD }}
+        run: bash .coming-v6/extract.sh
+
+      - name: V6 Restore original dependencies
         run: |
           set -euo pipefail
 
-          7zz x incoming/Coming-Mega-Fix.7z \
-            -p"$PASSWORD" \
-            -orestored \
-            -y > /dev/null
+          python3 - <<'PY'
+          from pathlib import Path
+          import shutil
+          import re
 
-          version="$(find restored/recovered \
-            -name ProjectVersion.txt -print -quit)"
+          assets = Path("ComingProject/Assets")
+          plugins = assets / "Plugins"
 
-          test -n "$version"
+          sources = Path("restored/recovered-code")
 
-          project="$(dirname "$(dirname "$version")")"
+          if not sources.is_dir():
+              raise RuntimeError(
+                  "Recovered original code not found"
+              )
 
-          test -d "$project/Assets"
+          groups = {
+              "Assembly-CSharp-firstpass": [
+                  "AAMode",
+                  "TweakMode34",
+                  "BloomScreenBlendMode",
+                  "HDRBloomMode",
+                  "LensflareStyle34",
+                  "WaterQuality",
+                  "RenderTextureUtility"
+              ],
 
-          rsync -a "$project/" ComingProject/
+              "Assembly-UnityScript-firstpass": [
+                  "CharacterMotorMovement",
+                  "CharacterMotorJumping",
+                  "CharacterMotorMovingPlatform",
+                  "CharacterMotorSliding",
+                  "CharacterState",
+                  "DofBlurriness",
+                  "Dof34QualitySetting",
+                  "DofResolution",
+                  "BokehDestination",
+                  "EdgeDetectMode",
+                  "AAMode",
+                  "TweakMode34",
+                  "BloomScreenBlendMode",
+                  "HDRBloomMode",
+                  "LensflareStyle34",
+                  "PostEffectsBase"
+              ]
+          }
 
-          echo "Original project ready"
+          restored = 0
+          added = 0
+          unresolved = []
 
-      - name: V5 Fix CSharp 10 to CSharp 9
+          def read(path):
+              return path.read_text(
+                  encoding="utf-8-sig"
+              )
+
+          def is_dummy(text):
+              return (
+                  "Dummy class. This could have happened"
+                  in text
+              )
+
+          for assembly in groups:
+              source = sources / assembly
+              target = plugins / assembly
+
+              if not source.is_dir():
+                  unresolved.append(assembly)
+                  continue
+
+              target.mkdir(
+                  parents=True,
+                  exist_ok=True
+              )
+
+              index = {}
+
+              for file in source.rglob("*.cs"):
+                  index.setdefault(
+                      file.name.casefold(),
+                      []
+                  ).append(file)
+
+              for file in list(target.rglob("*.cs")):
+                  text = read(file)
+
+                  if not is_dummy(text):
+                      continue
+
+                  candidates = index.get(
+                      file.name.casefold(),
+                      []
+                  )
+
+                  if len(candidates) != 1:
+                      continue
+
+                  original = read(candidates[0])
+
+                  if is_dummy(original):
+                      continue
+
+                  file.write_text(
+                      original,
+                      encoding="utf-8"
+                  )
+
+                  restored += 1
+
+                  print("RESTORED:", file)
+
+              for name in groups[assembly]:
+                  declaration = re.compile(
+                      r'\b(?:class|struct|enum|interface)'
+                      r'\s+' + re.escape(name) +
+                      r'\b'
+                  )
+
+                  existing = []
+
+                  for file in target.rglob("*.cs"):
+                      if declaration.search(read(file)):
+                          existing.append(file)
+
+                  candidates = [
+                      p for p in index.get(
+                          (name + ".cs").casefold(),
+                          []
+                      )
+                      if declaration.search(read(p))
+                  ]
+
+                  if len(candidates) != 1:
+                      if not existing:
+                          unresolved.append(
+                              assembly + ": " + name
+                          )
+                      continue
+
+                  original = candidates[0]
+
+                  if existing:
+
+                      for file in existing:
+                          if (
+                              is_dummy(read(file))
+                              or name == "PostEffectsBase"
+                          ):
+                              if file.stem == name:
+                                  file.write_text(
+                                      read(original),
+                                      encoding="utf-8"
+                                  )
+                                  restored += 1
+
+                                  print(
+                                      "REPAIRED:",
+                                      file
+                                  )
+
+                      continue
+
+                  destination = (
+                      target /
+                      original.relative_to(source)
+                  )
+
+                  if destination.exists():
+                      unresolved.append(
+                          str(destination)
+                      )
+                      continue
+
+                  destination.parent.mkdir(
+                      parents=True,
+                      exist_ok=True
+                  )
+
+                  shutil.copyfile(
+                      original,
+                      destination
+                  )
+
+                  added += 1
+                  print("ADDED:", destination)
+
+          report = [
+              f"Restored scripts: {restored}",
+              f"Added original types: {added}",
+              f"Unresolved types: {len(unresolved)}"
+          ]
+
+          report.extend(unresolved)
+
+          Path("reports/v6-dependencies.txt").write_text(
+              "\n".join(report) + "\n"
+          )
+
+          print("\n".join(report))
+          PY
+
+      - name: Restore Boo and UnityScript libraries
+        run: |
+          set -euo pipefail
+
+          export PATH="$PWD/.coming-v6/venv/bin:$PATH"
+
+          bash .coming-v6/download-original.sh
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import zipfile
+
+          assets = Path("ComingProject/Assets")
+
+          target = assets / "Plugins/ComingLegacy"
+
+          target.mkdir(
+              parents=True,
+              exist_ok=True
+          )
+
+          wanted = {
+              "boo.lang.dll",
+              "unityscript.lang.dll"
+          }
+
+          existing = {
+              p.name.lower()
+              for p in assets.rglob("*.dll")
+          }
+
+          with zipfile.ZipFile("Coming.zip") as archive:
+
+              for member in archive.namelist():
+
+                  name = Path(member).name
+
+                  if name.lower() not in wanted:
+                      continue
+
+                  if name.lower() in existing:
+                      continue
+
+                  if "/managed/" not in (
+                      "/" + member.lower()
+                  ):
+                      continue
+
+                  (target / name).write_bytes(
+                      archive.read(member)
+                  )
+
+                  existing.add(name.lower())
+
+                  print("RESTORED DLL:", name)
+
+          missing = wanted - existing
+
+          print(
+              "Missing legacy libraries:",
+              sorted(missing)
+          )
+
+          Path("reports/v6-libraries.txt").write_text(
+              "Missing: " + str(sorted(missing))
+          )
+          PY
+
+          rm -f Coming.zip
+
+      - name: V6 Fix NavMesh and legacy GUI
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          assets = Path("ComingProject/Assets")
+
+          fixed = 0
+
+          for file in assets.rglob("*.cs"):
+
+              text = file.read_text(
+                  encoding="utf-8-sig"
+              )
+
+              old = text
+
+              if file.name == "AICharacterControl.cs":
+
+                  if "using UnityEngine.AI;" not in text:
+
+                      text = (
+                          "using UnityEngine.AI;\n"
+                          + text
+                      )
+
+              if file.name in [
+                  "FPSCounter.cs",
+                  "SimpleActivatorMenu.cs",
+                  "ForcedReset.cs"
+              ]:
+
+                  if re.search(r'\bGUIText\b', text):
+
+                      text = text.replace(
+                          "UnityEngine.GUIText",
+                          "UnityEngine.UI.Text"
+                      )
+
+                      text = (
+                          "using GUIText = "
+                          "UnityEngine.UI.Text;\n"
+                          + text
+                      )
+
+                  if re.search(r'\bGUITexture\b', text):
+
+                      text = text.replace(
+                          "UnityEngine.GUITexture",
+                          "UnityEngine.UI.RawImage"
+                      )
+
+                      text = (
+                          "using GUITexture = "
+                          "UnityEngine.UI.RawImage;\n"
+                          + text
+                      )
+
+              if old != text:
+
+                  file.write_text(
+                      text,
+                      encoding="utf-8"
+                  )
+
+                  fixed += 1
+
+                  print("COMPATIBILITY FIX:", file)
+
+          print("Compatibility files fixed:", fixed)
+          PY
+
+      - name: Preserve V5 CSharp fix
+        run: bash .coming-v6/csharp.sh
+
+      - name: Reconnect mobile controls
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -81,542 +510,162 @@ jobs:
           assets = Path("ComingProject/Assets")
 
           pattern = re.compile(
-              r'^([ \t]*)namespace[ \t]+'
-              r'([\w.]+)[ \t]*;[ \t]*'
-              r'(?://[^\n]*)?$',
-              re.MULTILINE
+              r'(?<![\w.])(?:UnityEngine\.)?Input\.'
+              r'(GetAxisRaw|GetAxis|GetKeyDown|GetKeyUp|'
+              r'GetKey|GetButtonDown|GetButtonUp|'
+              r'GetButton)\s*\('
           )
 
           fixed = 0
 
           for file in assets.rglob("*.cs"):
-              text = file.read_text(
-                  encoding="utf-8-sig"
-              )
 
-              matches = list(pattern.finditer(text))
-
-              if not matches:
+              if "ComingMobile" in file.parts:
                   continue
 
-              if len(matches) != 1:
-                  raise RuntimeError(
-                      "Unexpected namespace: " + str(file)
-                  )
-
-              match = matches[0]
-
-              replacement = (
-                  match.group(1) +
-                  "namespace " +
-                  match.group(2) +
-                  "\n" +
-                  match.group(1) +
-                  "{"
-              )
-
-              text = (
-                  text[:match.start()] +
-                  replacement +
-                  text[match.end():]
-              )
-
-              text = text.rstrip() + "\n}\n"
-
-              file.write_text(
-                  text,
-                  encoding="utf-8"
-              )
-
-              fixed += 1
-              print("FIXED:", file)
-
-          remaining = []
-
-          for file in assets.rglob("*.cs"):
               text = file.read_text(
                   encoding="utf-8-sig"
               )
 
-              if pattern.search(text):
-                  remaining.append(str(file))
+              if "Dummy class. This could have happened" in text:
+                  continue
 
-          print("Namespaces fixed:", fixed)
-          print("Remaining:", len(remaining))
+              if "using UnityEngine;" not in text:
+                  continue
 
-          if remaining:
-              raise RuntimeError(
-                  "\n".join(remaining)
+              if re.search(
+                  r'using\s+Input\s*=',
+                  text
+              ):
+                  continue
+
+              updated, count = pattern.subn(
+                  lambda m: (
+                      "ComingTouch."
+                      + m.group(1)
+                      + "("
+                  ),
+                  text
               )
 
-          Path("reports/csharp-fix.txt").write_text(
-              f"Namespaces fixed: {fixed}\n"
-              f"Remaining: {len(remaining)}\n"
-          )
+              if count:
 
-          print("CS8773 namespace patch completed")
+                  file.write_text(
+                      updated,
+                      encoding="utf-8"
+                  )
+
+                  fixed += count
+
+          print("Mobile input calls patched:", fixed)
           PY
 
       - name: Prepare Unity project
-        run: |
-          set -euo pipefail
-
-          mkdir -p ComingProject/Packages
-          mkdir -p ComingProject/Assets/Editor
-          mkdir -p ComingProject/ProjectSettings
-
-          echo "m_EditorVersion: $UNITY_VERSION" \
-            > ComingProject/ProjectSettings/ProjectVersion.txt
-
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-
-          project = Path("ComingProject")
-          manifest = project / "Packages/manifest.json"
-
-          if manifest.exists():
-              data = json.loads(manifest.read_text())
-          else:
-              data = {}
-
-          deps = data.setdefault("dependencies", {})
-
-          deps.setdefault("com.unity.ugui", "1.0.0")
-
-          modules = [
-              "ai",
-              "animation",
-              "audio",
-              "physics",
-              "physics2d",
-              "particlesystem",
-              "imgui",
-              "ui",
-              "uielements",
-              "terrain",
-              "terrainphysics",
-              "imageconversion",
-              "jsonserialize",
-              "unitywebrequest",
-              "unitywebrequestaudio",
-              "unitywebrequesttexture",
-              "video"
-          ]
-
-          for module in modules:
-              deps.setdefault(
-                  "com.unity.modules." + module,
-                  "1.0.0"
-              )
-
-          manifest.write_text(
-              json.dumps(data, indent=2)
-          )
-
-          for file in (project / "Assets").rglob("ComingTouch.cs"):
-              text = file.read_text(encoding="utf-8")
-
-              text = text.replace(
-                  "private static bool enabledTouch;",
-                  "private static bool enabledTouch = true;"
-              )
-
-              file.write_text(
-                  text,
-                  encoding="utf-8"
-              )
-
-          print("Project prepared")
-          print("Mobile controls enabled")
-          PY
+        run: bash .coming-v6/prepare.sh
 
       - name: Create Unity iOS builder
-        run: |
-          cat > ComingProject/Assets/Editor/ComingIOSBuilder.cs <<'CS'
-          using System;
-          using System.IO;
-          using System.Linq;
-          using UnityEngine;
-          using UnityEditor;
-          using UnityEditor.Build.Reporting;
-
-          public static class ComingIOSBuilder
-          {
-              public static void Build()
-              {
-                  PlayerSettings.productName =
-                      "Slendytubbies Coming";
-
-                  PlayerSettings.companyName =
-                      "Coming Mobile";
-
-                  PlayerSettings.SetApplicationIdentifier(
-                      BuildTargetGroup.iOS,
-                      "com.coming.mobile"
-                  );
-
-                  PlayerSettings.bundleVersion =
-                      "1.0.0";
-
-                  PlayerSettings.iOS.buildNumber =
-                      "5";
-
-                  PlayerSettings.iOS.targetOSVersionString =
-                      "15.0";
-
-                  PlayerSettings.defaultInterfaceOrientation =
-                      UIOrientation.LandscapeLeft;
-
-                  PlayerSettings.SetScriptingBackend(
-                      BuildTargetGroup.iOS,
-                      ScriptingImplementation.IL2CPP
-                  );
-
-                  PlayerSettings.SetManagedStrippingLevel(
-                      BuildTargetGroup.iOS,
-                      ManagedStrippingLevel.Low
-                  );
-
-                  PlayerSettings.iOS.sdkVersion =
-                      iOSSdkVersion.DeviceSDK;
-
-                  PlayerSettings.SetUseDefaultGraphicsAPIs(
-                      BuildTarget.iOS,
-                      false
-                  );
-
-                  PlayerSettings.SetGraphicsAPIs(
-                      BuildTarget.iOS,
-                      new[] {
-                          UnityEngine.Rendering.GraphicsDeviceType.Metal
-                      }
-                  );
-
-                  string[] scenes =
-                      EditorBuildSettings.scenes
-                      .Where(s => s.enabled &&
-                          File.Exists(s.path))
-                      .Select(s => s.path)
-                      .ToArray();
-
-                  if (scenes.Length == 0)
-                  {
-                      throw new Exception(
-                          "Original scene order missing"
-                      );
-                  }
-
-                  foreach (string scene in scenes)
-                  {
-                      Debug.Log("BUILD SCENE: " + scene);
-                  }
-
-                  string root =
-                      Directory.GetParent(
-                          Application.dataPath
-                      ).FullName;
-
-                  string output =
-                      Path.Combine(root, "ComingXcode");
-
-                  BuildPlayerOptions options =
-                      new BuildPlayerOptions();
-
-                  options.scenes = scenes;
-
-                  options.locationPathName =
-                      output;
-
-                  options.target =
-                      BuildTarget.iOS;
-
-                  options.options =
-                      BuildOptions.None;
-
-                  BuildReport report =
-                      BuildPipeline.BuildPlayer(options);
-
-                  if (report.summary.result !=
-                      BuildResult.Succeeded)
-                  {
-                      throw new Exception(
-                          "Unity build failed: " +
-                          report.summary.result
-                      );
-                  }
-
-                  Debug.Log("COMING XCODE EXPORT SUCCESS");
-              }
-          }
-          CS
+        run: bash .coming-v6/builder.sh
 
       - name: Enable iPhone Files access
+        run: bash .coming-v6/files.sh
+
+      - name: Check original scenes
         run: |
-          cat > ComingProject/Assets/Editor/ComingFiles.cs <<'CS'
-          #if UNITY_IOS
-          using System.IO;
-          using UnityEditor;
-          using UnityEditor.Callbacks;
-          using UnityEditor.iOS.Xcode;
+          python3 - <<'PY'
+          from pathlib import Path
 
-          public static class ComingFiles
-          {
-              [PostProcessBuild(100)]
-              public static void Enable(
-                  BuildTarget target,
-                  string output
+          assets = Path("ComingProject/Assets")
+
+          scenes = list(assets.rglob("*.unity"))
+          animations = list(assets.rglob("*.anim"))
+
+          if not scenes:
+              raise RuntimeError(
+                  "Original scenes missing"
               )
-              {
-                  if (target != BuildTarget.iOS)
-                      return;
 
-                  string path =
-                      Path.Combine(output, "Info.plist");
+          print("Original scenes:", len(scenes))
+          print("Animations:", len(animations))
 
-                  PlistDocument plist =
-                      new PlistDocument();
+          for scene in scenes:
+              print("SCENE:", scene)
 
-                  plist.ReadFromFile(path);
-
-                  plist.root.SetBoolean(
-                      "UIFileSharingEnabled", true
-                  );
-
-                  plist.root.SetBoolean(
-                      "LSSupportsOpeningDocumentsInPlace",
-                      true
-                  );
-
-                  plist.WriteToFile(path);
-              }
-          }
-          #endif
-          CS
+          Path("reports/v6-scenes.txt").write_text(
+              f"Scenes: {len(scenes)}\n"
+              f"Animations: {len(animations)}\n"
+          )
+          PY
 
       - name: Install Node.js 24
         uses: actions/setup-node@v4
         with:
           node-version: '24'
 
-      - name: Install Unity CLI V4
-        run: |
-          set -euo pipefail
+      - name: Install Unity CLI
+        run: bash .coming-v6/cli.sh
 
-          npm install -g \
-            @rage-against-the-pixel/unity-cli@4.0.3
+      - name: Install Unity iOS module
+        run: bash .coming-v6/install.sh
 
-          unity-cli --help
-
-      - name: Install Unity and iOS module
-        run: |
-          set -euo pipefail
-
-          unity-cli setup-unity \
-            --unity-version "$UNITY_VERSION" \
-            --changeset "$UNITY_CHANGESET" \
-            --build-targets iOS
-
-      - name: Verify Unity installation
-        run: |
-          set -euo pipefail
-
-          editor="${UNITY_EDITOR_PATH:-}"
-
-          if [ -z "$editor" ] || [ ! -x "$editor" ]; then
-
-            editor="$(find /Applications \
-              -path "*/Unity.app/Contents/MacOS/Unity" \
-              -type f -print -quit 2>/dev/null || true)"
-
-          fi
-
-          test -n "$editor"
-          test -x "$editor"
-
-          echo "UNITY_EDITOR_PATH=$editor" >> "$GITHUB_ENV"
-
-          echo "Unity editor found"
+      - name: Verify Unity
+        run: bash .coming-v6/verify.sh
 
       - name: Activate Unity Personal
         id: activate
         env:
           UNITY_USERNAME: ${{ secrets.UNITY_USERNAME || secrets.UNITY_EMAIL }}
           UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
-        run: |
-          set -euo pipefail
-
-          test -n "$UNITY_USERNAME"
-          test -n "$UNITY_PASSWORD"
-
-          unity-cli activate-license --license personal
-
-          echo "Unity Personal activated"
+        run: bash .coming-v6/activate.sh
 
       - name: Unity iOS IL2CPP export
-        run: |
-          set -euo pipefail
-
-          test -n "$UNITY_EDITOR_PATH"
-          test -x "$UNITY_EDITOR_PATH"
-
-          "$UNITY_EDITOR_PATH" \
-            -batchmode \
-            -nographics \
-            -quit \
-            -projectPath "$PWD/ComingProject" \
-            -buildTarget iOS \
-            -executeMethod ComingIOSBuilder.Build \
-            -logFile "$PWD/reports/unity.log" || {
-
-              echo "COMPILER ERRORS"
-
-              grep -E 'error CS|Exception|Error:' \
-                reports/unity.log | tail -100 || true
-
-              tail -80 reports/unity.log
-
-              exit 1
-            }
-
-          test -d ComingProject/ComingXcode/Unity-iPhone.xcodeproj
-
-          echo "UNITY EXPORT SUCCESS"
+        run: bash .coming-v6/export.sh
 
       - name: Return Unity License
         if: always() && steps.activate.outcome == 'success'
         continue-on-error: true
-        run: |
-          unity-cli return-license \
-            --license personal \
-            --when auto
+        run: bash .coming-v6/return.sh
 
       - name: Find Xcode project
-        run: |
-          set -euo pipefail
+        run: bash .coming-v6/find.sh
 
-          project="$(find ComingProject \
-            -type d \
-            -name Unity-iPhone.xcodeproj \
-            -print -quit)"
+      - name: Compile ARM64 iOS
+        run: bash .coming-v6/xcode.sh
 
-          test -n "$project"
-
-          echo "XCODE_PROJECT=$project" >> "$GITHUB_ENV"
-
-          echo "Xcode project found"
-
-      - name: Compile ARM64 iOS application
-        run: |
-          set -euo pipefail
-
-          xcodebuild \
-            -project "$XCODE_PROJECT" \
-            -scheme Unity-iPhone \
-            -configuration Release \
-            -sdk iphoneos \
-            -destination 'generic/platform=iOS' \
-            -derivedDataPath "$PWD/derived" \
-            ARCHS=arm64 \
-            IPHONEOS_DEPLOYMENT_TARGET=15.0 \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            build \
-            > reports/xcode.log 2>&1 || {
-
-              tail -100 reports/xcode.log
-
-              exit 1
-            }
-
-          echo "XCODE BUILD SUCCESS"
-
-      - name: Create real IPA V5
-        run: |
-          set -euo pipefail
-
-          app="$(find derived/Build/Products/Release-iphoneos \
-            -maxdepth 1 \
-            -type d \
-            -name '*.app' \
-            -print -quit)"
-
-          test -n "$app"
-          test -f "$app/Info.plist"
-
-          executable="$(/usr/libexec/PlistBuddy \
-            -c 'Print CFBundleExecutable' \
-            "$app/Info.plist")"
-
-          test -f "$app/$executable"
-
-          lipo -verify_arch arm64 "$app/$executable"
-
-          mkdir -p Payload
-
-          ditto "$app" Payload/Coming.app
-
-          ditto -c -k --keepParent \
-            Payload \
-            output/Coming-iOS-V5.ipa
-
-          unzip -tq output/Coming-iOS-V5.ipa
-
-          test -s output/Coming-iOS-V5.ipa
-
-          echo "IPA CREATED SUCCESSFULLY"
-
-          du -h output/Coming-iOS-V5.ipa
+      - name: Create real IPA V6
+        run: bash .coming-v6/ipa.sh
 
       - name: Protect IPA
         env:
           PASSWORD: ${{ secrets.COMING_ARCHIVE_PASSWORD }}
-        run: |
-          set -euo pipefail
-
-          test -n "$PASSWORD"
-
-          cd output
-
-          7zz a -t7z -mhe=on \
-            -p"$PASSWORD" \
-            Coming-iOS-V5.7z \
-            Coming-iOS-V5.ipa \
-            > /dev/null
-
-          test -s Coming-iOS-V5.7z
+        run: bash .coming-v6/protect.sh
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: Coming-iOS-V5
-          path: output/Coming-iOS-V5.7z
+          name: Coming-iOS-V6
+          path: output/Coming-iOS-V6.7z
           retention-days: 7
           if-no-files-found: error
+
+      - name: Upload V6 diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Coming-V6-Diagnostics
+          path: reports/
+          retention-days: 7
+          if-no-files-found: warn
 
       - name: Final summary
         if: always()
         run: |
-          if [ -f reports/csharp-fix.txt ]; then
-            cat reports/csharp-fix.txt \
-              >> "$GITHUB_STEP_SUMMARY"
-          fi
+          for file in reports/v6-*.txt; do
+            if [ -f "$file" ]; then
+              cat "$file" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
 
-          if [ -s output/Coming-iOS-V5.7z ]; then
-
-            {
-              echo "COMING V5 IPA CREATED"
-              echo "Unity: $UNITY_VERSION"
-              echo "Architecture: ARM64"
-              echo "Backend: IL2CPP"
-              echo "Minimum iOS: 15.0"
-              echo "Signing required"
-            } >> "$GITHUB_STEP_SUMMARY"
-
-          else
-
-            echo "IPA BUILD NOT COMPLETED" \
-              >> "$GITHUB_STEP_SUMMARY"
-
+          if [ -f .coming-v6/summary.sh ]; then
+            bash .coming-v6/summary.sh
           fi
