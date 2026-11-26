@@ -1,0 +1,622 @@
+name: Coming - Create IPA V5 CSharp Fix
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  recovery:
+    uses: ./.github/workflows/coming-create-ipa.yml
+    secrets:
+      COMING_ARCHIVE_PASSWORD: ${{ secrets.COMING_ARCHIVE_PASSWORD }}
+
+  build-ipa:
+    needs: recovery
+    runs-on: macos-15
+    timeout-minutes: 180
+
+    env:
+      UNITY_VERSION: 2022.3.62f3
+      UNITY_CHANGESET: 96770f904ca7
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare tools
+        env:
+          PASSWORD: ${{ secrets.COMING_ARCHIVE_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          test -n "$PASSWORD"
+
+          mkdir -p incoming restored ComingProject output reports
+
+          if ! command -v 7zz >/dev/null 2>&1; then
+            brew install sevenzip
+          fi
+
+          xcodebuild -version
+
+      - name: Download recovered project
+        uses: actions/download-artifact@v4
+        with:
+          name: Coming-Mega-Fix
+          path: incoming
+
+      - name: Extract recovered project
+        env:
+          PASSWORD: ${{ secrets.COMING_ARCHIVE_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          7zz x incoming/Coming-Mega-Fix.7z \
+            -p"$PASSWORD" \
+            -orestored \
+            -y > /dev/null
+
+          version="$(find restored/recovered \
+            -name ProjectVersion.txt -print -quit)"
+
+          test -n "$version"
+
+          project="$(dirname "$(dirname "$version")")"
+
+          test -d "$project/Assets"
+
+          rsync -a "$project/" ComingProject/
+
+          echo "Original project ready"
+
+      - name: V5 Fix CSharp 10 to CSharp 9
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          assets = Path("ComingProject/Assets")
+
+          pattern = re.compile(
+              r'^([ \t]*)namespace[ \t]+'
+              r'([\w.]+)[ \t]*;[ \t]*'
+              r'(?://[^\n]*)?$',
+              re.MULTILINE
+          )
+
+          fixed = 0
+
+          for file in assets.rglob("*.cs"):
+              text = file.read_text(
+                  encoding="utf-8-sig"
+              )
+
+              matches = list(pattern.finditer(text))
+
+              if not matches:
+                  continue
+
+              if len(matches) != 1:
+                  raise RuntimeError(
+                      "Unexpected namespace: " + str(file)
+                  )
+
+              match = matches[0]
+
+              replacement = (
+                  match.group(1) +
+                  "namespace " +
+                  match.group(2) +
+                  "\n" +
+                  match.group(1) +
+                  "{"
+              )
+
+              text = (
+                  text[:match.start()] +
+                  replacement +
+                  text[match.end():]
+              )
+
+              text = text.rstrip() + "\n}\n"
+
+              file.write_text(
+                  text,
+                  encoding="utf-8"
+              )
+
+              fixed += 1
+              print("FIXED:", file)
+
+          remaining = []
+
+          for file in assets.rglob("*.cs"):
+              text = file.read_text(
+                  encoding="utf-8-sig"
+              )
+
+              if pattern.search(text):
+                  remaining.append(str(file))
+
+          print("Namespaces fixed:", fixed)
+          print("Remaining:", len(remaining))
+
+          if remaining:
+              raise RuntimeError(
+                  "\n".join(remaining)
+              )
+
+          Path("reports/csharp-fix.txt").write_text(
+              f"Namespaces fixed: {fixed}\n"
+              f"Remaining: {len(remaining)}\n"
+          )
+
+          print("CS8773 namespace patch completed")
+          PY
+
+      - name: Prepare Unity project
+        run: |
+          set -euo pipefail
+
+          mkdir -p ComingProject/Packages
+          mkdir -p ComingProject/Assets/Editor
+          mkdir -p ComingProject/ProjectSettings
+
+          echo "m_EditorVersion: $UNITY_VERSION" \
+            > ComingProject/ProjectSettings/ProjectVersion.txt
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          project = Path("ComingProject")
+          manifest = project / "Packages/manifest.json"
+
+          if manifest.exists():
+              data = json.loads(manifest.read_text())
+          else:
+              data = {}
+
+          deps = data.setdefault("dependencies", {})
+
+          deps.setdefault("com.unity.ugui", "1.0.0")
+
+          modules = [
+              "ai",
+              "animation",
+              "audio",
+              "physics",
+              "physics2d",
+              "particlesystem",
+              "imgui",
+              "ui",
+              "uielements",
+              "terrain",
+              "terrainphysics",
+              "imageconversion",
+              "jsonserialize",
+              "unitywebrequest",
+              "unitywebrequestaudio",
+              "unitywebrequesttexture",
+              "video"
+          ]
+
+          for module in modules:
+              deps.setdefault(
+                  "com.unity.modules." + module,
+                  "1.0.0"
+              )
+
+          manifest.write_text(
+              json.dumps(data, indent=2)
+          )
+
+          for file in (project / "Assets").rglob("ComingTouch.cs"):
+              text = file.read_text(encoding="utf-8")
+
+              text = text.replace(
+                  "private static bool enabledTouch;",
+                  "private static bool enabledTouch = true;"
+              )
+
+              file.write_text(
+                  text,
+                  encoding="utf-8"
+              )
+
+          print("Project prepared")
+          print("Mobile controls enabled")
+          PY
+
+      - name: Create Unity iOS builder
+        run: |
+          cat > ComingProject/Assets/Editor/ComingIOSBuilder.cs <<'CS'
+          using System;
+          using System.IO;
+          using System.Linq;
+          using UnityEngine;
+          using UnityEditor;
+          using UnityEditor.Build.Reporting;
+
+          public static class ComingIOSBuilder
+          {
+              public static void Build()
+              {
+                  PlayerSettings.productName =
+                      "Slendytubbies Coming";
+
+                  PlayerSettings.companyName =
+                      "Coming Mobile";
+
+                  PlayerSettings.SetApplicationIdentifier(
+                      BuildTargetGroup.iOS,
+                      "com.coming.mobile"
+                  );
+
+                  PlayerSettings.bundleVersion =
+                      "1.0.0";
+
+                  PlayerSettings.iOS.buildNumber =
+                      "5";
+
+                  PlayerSettings.iOS.targetOSVersionString =
+                      "15.0";
+
+                  PlayerSettings.defaultInterfaceOrientation =
+                      UIOrientation.LandscapeLeft;
+
+                  PlayerSettings.SetScriptingBackend(
+                      BuildTargetGroup.iOS,
+                      ScriptingImplementation.IL2CPP
+                  );
+
+                  PlayerSettings.SetManagedStrippingLevel(
+                      BuildTargetGroup.iOS,
+                      ManagedStrippingLevel.Low
+                  );
+
+                  PlayerSettings.iOS.sdkVersion =
+                      iOSSdkVersion.DeviceSDK;
+
+                  PlayerSettings.SetUseDefaultGraphicsAPIs(
+                      BuildTarget.iOS,
+                      false
+                  );
+
+                  PlayerSettings.SetGraphicsAPIs(
+                      BuildTarget.iOS,
+                      new[] {
+                          UnityEngine.Rendering.GraphicsDeviceType.Metal
+                      }
+                  );
+
+                  string[] scenes =
+                      EditorBuildSettings.scenes
+                      .Where(s => s.enabled &&
+                          File.Exists(s.path))
+                      .Select(s => s.path)
+                      .ToArray();
+
+                  if (scenes.Length == 0)
+                  {
+                      throw new Exception(
+                          "Original scene order missing"
+                      );
+                  }
+
+                  foreach (string scene in scenes)
+                  {
+                      Debug.Log("BUILD SCENE: " + scene);
+                  }
+
+                  string root =
+                      Directory.GetParent(
+                          Application.dataPath
+                      ).FullName;
+
+                  string output =
+                      Path.Combine(root, "ComingXcode");
+
+                  BuildPlayerOptions options =
+                      new BuildPlayerOptions();
+
+                  options.scenes = scenes;
+
+                  options.locationPathName =
+                      output;
+
+                  options.target =
+                      BuildTarget.iOS;
+
+                  options.options =
+                      BuildOptions.None;
+
+                  BuildReport report =
+                      BuildPipeline.BuildPlayer(options);
+
+                  if (report.summary.result !=
+                      BuildResult.Succeeded)
+                  {
+                      throw new Exception(
+                          "Unity build failed: " +
+                          report.summary.result
+                      );
+                  }
+
+                  Debug.Log("COMING XCODE EXPORT SUCCESS");
+              }
+          }
+          CS
+
+      - name: Enable iPhone Files access
+        run: |
+          cat > ComingProject/Assets/Editor/ComingFiles.cs <<'CS'
+          #if UNITY_IOS
+          using System.IO;
+          using UnityEditor;
+          using UnityEditor.Callbacks;
+          using UnityEditor.iOS.Xcode;
+
+          public static class ComingFiles
+          {
+              [PostProcessBuild(100)]
+              public static void Enable(
+                  BuildTarget target,
+                  string output
+              )
+              {
+                  if (target != BuildTarget.iOS)
+                      return;
+
+                  string path =
+                      Path.Combine(output, "Info.plist");
+
+                  PlistDocument plist =
+                      new PlistDocument();
+
+                  plist.ReadFromFile(path);
+
+                  plist.root.SetBoolean(
+                      "UIFileSharingEnabled", true
+                  );
+
+                  plist.root.SetBoolean(
+                      "LSSupportsOpeningDocumentsInPlace",
+                      true
+                  );
+
+                  plist.WriteToFile(path);
+              }
+          }
+          #endif
+          CS
+
+      - name: Install Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install Unity CLI V4
+        run: |
+          set -euo pipefail
+
+          npm install -g \
+            @rage-against-the-pixel/unity-cli@4.0.3
+
+          unity-cli --help
+
+      - name: Install Unity and iOS module
+        run: |
+          set -euo pipefail
+
+          unity-cli setup-unity \
+            --unity-version "$UNITY_VERSION" \
+            --changeset "$UNITY_CHANGESET" \
+            --build-targets iOS
+
+      - name: Verify Unity installation
+        run: |
+          set -euo pipefail
+
+          editor="${UNITY_EDITOR_PATH:-}"
+
+          if [ -z "$editor" ] || [ ! -x "$editor" ]; then
+
+            editor="$(find /Applications \
+              -path "*/Unity.app/Contents/MacOS/Unity" \
+              -type f -print -quit 2>/dev/null || true)"
+
+          fi
+
+          test -n "$editor"
+          test -x "$editor"
+
+          echo "UNITY_EDITOR_PATH=$editor" >> "$GITHUB_ENV"
+
+          echo "Unity editor found"
+
+      - name: Activate Unity Personal
+        id: activate
+        env:
+          UNITY_USERNAME: ${{ secrets.UNITY_USERNAME || secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          test -n "$UNITY_USERNAME"
+          test -n "$UNITY_PASSWORD"
+
+          unity-cli activate-license --license personal
+
+          echo "Unity Personal activated"
+
+      - name: Unity iOS IL2CPP export
+        run: |
+          set -euo pipefail
+
+          test -n "$UNITY_EDITOR_PATH"
+          test -x "$UNITY_EDITOR_PATH"
+
+          "$UNITY_EDITOR_PATH" \
+            -batchmode \
+            -nographics \
+            -quit \
+            -projectPath "$PWD/ComingProject" \
+            -buildTarget iOS \
+            -executeMethod ComingIOSBuilder.Build \
+            -logFile "$PWD/reports/unity.log" || {
+
+              echo "COMPILER ERRORS"
+
+              grep -E 'error CS|Exception|Error:' \
+                reports/unity.log | tail -100 || true
+
+              tail -80 reports/unity.log
+
+              exit 1
+            }
+
+          test -d ComingProject/ComingXcode/Unity-iPhone.xcodeproj
+
+          echo "UNITY EXPORT SUCCESS"
+
+      - name: Return Unity License
+        if: always() && steps.activate.outcome == 'success'
+        continue-on-error: true
+        run: |
+          unity-cli return-license \
+            --license personal \
+            --when auto
+
+      - name: Find Xcode project
+        run: |
+          set -euo pipefail
+
+          project="$(find ComingProject \
+            -type d \
+            -name Unity-iPhone.xcodeproj \
+            -print -quit)"
+
+          test -n "$project"
+
+          echo "XCODE_PROJECT=$project" >> "$GITHUB_ENV"
+
+          echo "Xcode project found"
+
+      - name: Compile ARM64 iOS application
+        run: |
+          set -euo pipefail
+
+          xcodebuild \
+            -project "$XCODE_PROJECT" \
+            -scheme Unity-iPhone \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$PWD/derived" \
+            ARCHS=arm64 \
+            IPHONEOS_DEPLOYMENT_TARGET=15.0 \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build \
+            > reports/xcode.log 2>&1 || {
+
+              tail -100 reports/xcode.log
+
+              exit 1
+            }
+
+          echo "XCODE BUILD SUCCESS"
+
+      - name: Create real IPA V5
+        run: |
+          set -euo pipefail
+
+          app="$(find derived/Build/Products/Release-iphoneos \
+            -maxdepth 1 \
+            -type d \
+            -name '*.app' \
+            -print -quit)"
+
+          test -n "$app"
+          test -f "$app/Info.plist"
+
+          executable="$(/usr/libexec/PlistBuddy \
+            -c 'Print CFBundleExecutable' \
+            "$app/Info.plist")"
+
+          test -f "$app/$executable"
+
+          lipo -verify_arch arm64 "$app/$executable"
+
+          mkdir -p Payload
+
+          ditto "$app" Payload/Coming.app
+
+          ditto -c -k --keepParent \
+            Payload \
+            output/Coming-iOS-V5.ipa
+
+          unzip -tq output/Coming-iOS-V5.ipa
+
+          test -s output/Coming-iOS-V5.ipa
+
+          echo "IPA CREATED SUCCESSFULLY"
+
+          du -h output/Coming-iOS-V5.ipa
+
+      - name: Protect IPA
+        env:
+          PASSWORD: ${{ secrets.COMING_ARCHIVE_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          test -n "$PASSWORD"
+
+          cd output
+
+          7zz a -t7z -mhe=on \
+            -p"$PASSWORD" \
+            Coming-iOS-V5.7z \
+            Coming-iOS-V5.ipa \
+            > /dev/null
+
+          test -s Coming-iOS-V5.7z
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Coming-iOS-V5
+          path: output/Coming-iOS-V5.7z
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Final summary
+        if: always()
+        run: |
+          if [ -f reports/csharp-fix.txt ]; then
+            cat reports/csharp-fix.txt \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ -s output/Coming-iOS-V5.7z ]; then
+
+            {
+              echo "COMING V5 IPA CREATED"
+              echo "Unity: $UNITY_VERSION"
+              echo "Architecture: ARM64"
+              echo "Backend: IL2CPP"
+              echo "Minimum iOS: 15.0"
+              echo "Signing required"
+            } >> "$GITHUB_STEP_SUMMARY"
+
+          else
+
+            echo "IPA BUILD NOT COMPLETED" \
+              >> "$GITHUB_STEP_SUMMARY"
+
+          fi
