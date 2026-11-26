@@ -1,0 +1,394 @@
+
+name: Coming - Create IPA V1
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  recovery:
+    uses: ./.github/workflows/coming-mega-fix.yml
+    secrets:
+      COMING_ARCHIVE_PASSWORD: ${{ secrets.COMING_ARCHIVE_PASSWORD }}
+
+  create-ipa:
+    needs: recovery
+    runs-on: macos-15
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check archive password
+        env:
+          PASSWORD: ${{ secrets.COMING_ARCHIVE_PASSWORD }}
+        run: |
+          if [ -z "$PASSWORD" ]; then
+            echo "COMING_ARCHIVE_PASSWORD is missing"
+            exit 1
+          fi
+
+      - name: Prepare tools
+        run: |
+          mkdir -p incoming restored ComingProject output reports
+
+          if ! command -v 7zz >/dev/null 2>&1; then
+            brew install sevenzip
+          fi
+
+          xcodebuild -version
+
+      - name: Download Mega Fix project
+        uses: actions/download-artifact@v4
+        with:
+          name: Coming-Mega-Fix
+          path: incoming
+
+      - name: Extract recovered project
+        env:
+          PASSWORD: ${{ secrets.COMING_ARCHIVE_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          7zz x incoming/Coming-Mega-Fix.7z \
+            -p"$PASSWORD" \
+            -orestored \
+            -y > /dev/null
+
+          version="$(find restored \
+            -name ProjectVersion.txt -print -quit)"
+
+          test -n "$version"
+
+          project="$(dirname "$(dirname "$version")")"
+
+          test -d "$project/Assets"
+
+          rsync -a "$project/" ComingProject/
+
+          echo "Original project extracted"
+
+      - name: Prepare Unity 2022
+        run: |
+          set -euo pipefail
+
+          mkdir -p ComingProject/ProjectSettings
+          mkdir -p ComingProject/Packages
+
+          echo "m_EditorVersion: 2022.3.62f3" \
+            > ComingProject/ProjectSettings/ProjectVersion.txt
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          manifest = Path(
+              "ComingProject/Packages/manifest.json"
+          )
+
+          if not manifest.exists():
+              manifest.write_text(
+                  json.dumps({
+                      "dependencies": {
+                          "com.unity.ugui": "1.0.0",
+                          "com.unity.modules.audio": "1.0.0",
+                          "com.unity.modules.animation": "1.0.0",
+                          "com.unity.modules.physics": "1.0.0",
+                          "com.unity.modules.physics2d": "1.0.0",
+                          "com.unity.modules.ui": "1.0.0",
+                          "com.unity.modules.imgui": "1.0.0",
+                          "com.unity.modules.ai": "1.0.0",
+                          "com.unity.modules.particlesystem": "1.0.0",
+                          "com.unity.modules.unitywebrequest": "1.0.0",
+                          "com.unity.modules.video": "1.0.0"
+                      }
+                  }, indent=2)
+              )
+
+          print("Unity project prepared")
+          PY
+
+      - name: Create iOS build script
+        run: |
+          mkdir -p ComingProject/Assets/Editor
+
+          cat > ComingProject/Assets/Editor/ComingIOSBuild.cs <<'CS'
+          using System;
+          using System.IO;
+          using System.Linq;
+          using UnityEngine;
+          using UnityEditor;
+          using UnityEditor.Build.Reporting;
+
+          public static class ComingIOSBuild
+          {
+              private static string GetArgument(string name)
+              {
+                  string[] args =
+                      Environment.GetCommandLineArgs();
+
+                  int index = Array.IndexOf(args, name);
+
+                  if (index >= 0 && index + 1 < args.Length)
+                      return args[index + 1];
+
+                  return null;
+              }
+
+              public static void Build()
+              {
+                  PlayerSettings.productName =
+                      "Slendytubbies They're Coming";
+
+                  PlayerSettings.companyName =
+                      "Coming Mobile";
+
+                  PlayerSettings.SetApplicationIdentifier(
+                      BuildTargetGroup.iOS,
+                      "com.coming.mobile"
+                  );
+
+                  PlayerSettings.bundleVersion = "1.0.0";
+
+                  PlayerSettings.iOS.buildNumber = "1";
+
+                  PlayerSettings.iOS.targetOSVersionString =
+                      "15.0";
+
+                  PlayerSettings.defaultInterfaceOrientation =
+                      UIOrientation.LandscapeLeft;
+
+                  PlayerSettings.SetScriptingBackend(
+                      BuildTargetGroup.iOS,
+                      ScriptingImplementation.IL2CPP
+                  );
+
+                  PlayerSettings.SetManagedStrippingLevel(
+                      BuildTargetGroup.iOS,
+                      ManagedStrippingLevel.Low
+                  );
+
+                  PlayerSettings.iOS.sdkVersion =
+                      iOSSdkVersion.DeviceSDK;
+
+                  PlayerSettings.SetGraphicsAPIs(
+                      BuildTarget.iOS,
+                      new[] {
+                          UnityEngine.Rendering.GraphicsDeviceType.Metal
+                      }
+                  );
+
+                  PlayerSettings.SetUseDefaultGraphicsAPIs(
+                      BuildTarget.iOS,
+                      false
+                  );
+
+                  string[] scenes =
+                      EditorBuildSettings.scenes
+                      .Where(s => s.enabled &&
+                          File.Exists(s.path))
+                      .Select(s => s.path)
+                      .ToArray();
+
+                  if (scenes.Length == 0)
+                  {
+                      throw new Exception(
+                          "Original scene order missing. " +
+                          "Restore EditorBuildSettings first."
+                      );
+                  }
+
+                  foreach (string scene in scenes)
+                      Debug.Log("BUILD SCENE: " + scene);
+
+                  string output =
+                      GetArgument("-customBuildPath");
+
+                  if (string.IsNullOrEmpty(output))
+                      output = Path.GetFullPath("ComingXcode");
+
+                  BuildPlayerOptions options =
+                      new BuildPlayerOptions();
+
+                  options.scenes = scenes;
+
+                  options.locationPathName = output;
+
+                  options.target = BuildTarget.iOS;
+
+                  options.options = BuildOptions.None;
+
+                  BuildReport report =
+                      BuildPipeline.BuildPlayer(options);
+
+                  if (report.summary.result !=
+                      BuildResult.Succeeded)
+                  {
+                      throw new Exception(
+                          "Unity iOS build failed: " +
+                          report.summary.result
+                      );
+                  }
+
+                  Debug.Log("COMING XCODE EXPORT SUCCESS");
+              }
+          }
+          CS
+
+      - name: Enable iPhone Files access
+        run: |
+          cat > ComingProject/Assets/Editor/ComingFiles.cs <<'CS'
+          #if UNITY_IOS
+          using System.IO;
+          using UnityEditor;
+          using UnityEditor.Callbacks;
+          using UnityEditor.iOS.Xcode;
+
+          public static class ComingFiles
+          {
+              [PostProcessBuild(100)]
+              public static void Enable(
+                  BuildTarget target,
+                  string output
+              )
+              {
+                  if (target != BuildTarget.iOS)
+                      return;
+
+                  string path =
+                      Path.Combine(output, "Info.plist");
+
+                  PlistDocument plist =
+                      new PlistDocument();
+
+                  plist.ReadFromFile(path);
+
+                  plist.root.SetBoolean(
+                      "UIFileSharingEnabled", true
+                  );
+
+                  plist.root.SetBoolean(
+                      "LSSupportsOpeningDocumentsInPlace", true
+                  );
+
+                  plist.WriteToFile(path);
+              }
+          }
+          #endif
+          CS
+
+      - name: Unity IL2CPP iOS export
+        uses: game-ci/unity-builder@v4
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+          UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+        with:
+          projectPath: ComingProject
+          unityVersion: 2022.3.62f3
+          targetPlatform: iOS
+          buildName: Coming
+          buildsPath: build
+          buildMethod: ComingIOSBuild.Build
+          allowDirtyBuild: true
+          versioning: None
+
+      - name: Find generated Xcode project
+        run: |
+          set -euo pipefail
+
+          project="$(find build ComingProject \
+            -name Unity-iPhone.xcodeproj \
+            -type d -print -quit)"
+
+          if [ -z "$project" ]; then
+            echo "Xcode project not found"
+            exit 1
+          fi
+
+          echo "XCODE_PROJECT=$project" >> "$GITHUB_ENV"
+
+      - name: Compile iOS ARM64 application
+        run: |
+          set -euo pipefail
+
+          xcodebuild \
+            -project "$XCODE_PROJECT" \
+            -scheme Unity-iPhone \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$PWD/derived" \
+            ARCHS=arm64 \
+            IPHONEOS_DEPLOYMENT_TARGET=15.0 \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build \
+            > reports/xcode.log 2>&1 || {
+              tail -100 reports/xcode.log
+              exit 1
+            }
+
+          echo "Xcode build successful"
+
+      - name: Create IPA
+        run: |
+          set -euo pipefail
+
+          app="$(find derived/Build/Products \
+            -maxdepth 3 \
+            -name '*.app' \
+            -type d -print -quit)"
+
+          test -n "$app"
+
+          mkdir -p Payload
+
+          ditto "$app" "Payload/Coming.app"
+
+          ditto -c -k --keepParent \
+            Payload \
+            output/Coming-iOS-V1.ipa
+
+          unzip -t output/Coming-iOS-V1.ipa
+
+          echo "IPA created successfully"
+
+          du -h output/Coming-iOS-V1.ipa
+
+      - name: Encrypt IPA for personal testing
+        env:
+          PASSWORD: ${{ secrets.COMING_ARCHIVE_PASSWORD }}
+        run: |
+          7zz a -t7z -mhe=on \
+            -p"$PASSWORD" \
+            output/Coming-iOS-V1.7z \
+            output/Coming-iOS-V1.ipa \
+            > /dev/null
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Coming-iOS-V1
+          path: output/Coming-iOS-V1.7z
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Final summary
+        if: always()
+        run: |
+          if [ -f output/Coming-iOS-V1.7z ]; then
+            echo "COMING IPA CREATED" >> "$GITHUB_STEP_SUMMARY"
+            echo "Architecture: ARM64" >> "$GITHUB_STEP_SUMMARY"
+            echo "Backend: IL2CPP" >> "$GITHUB_STEP_SUMMARY"
+            echo "Minimum iOS: 15.0" >> "$GITHUB_STEP_SUMMARY"
+            echo "Signing: required before installation" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "IPA build not completed" >> "$GITHUB_STEP_SUMMARY"
+          fi
