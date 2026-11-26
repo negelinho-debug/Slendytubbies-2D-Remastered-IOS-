@@ -1,0 +1,447 @@
+
+name: Slendrina Freakish Friends - Preflight
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: "GameJolt build ID (optional)"
+        required: false
+        type: string
+      download_url:
+        description: "Original download URL (optional)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      GAME_ID: "708625"
+      BUILD_ID: ${{ inputs.build_id }}
+      DOWNLOAD_URL: ${{ inputs.download_url }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Prepare folders
+        run: |
+          mkdir -p original report
+
+      - name: Download original Slendrina Friends
+        run: |
+          set -euo pipefail
+
+          if [ -n "$DOWNLOAD_URL" ]; then
+
+            curl -fLsS --retry 2 \
+              --max-time 400 \
+              "$DOWNLOAD_URL" \
+              -o game.archive
+
+          else
+
+            if [ -z "$BUILD_ID" ]; then
+
+              curl -fLsS --retry 2 \
+                -A 'Mozilla/5.0' \
+                "https://gamejolt.com/site-api/web/discover/games/overview/$GAME_ID?ignore" \
+                -o report/gamejolt.json
+
+              BUILD_ID=$(python3 - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+
+          data = json.loads(
+              Path("report/gamejolt.json").read_text()
+          )
+
+          def walk(value):
+              if isinstance(value, dict):
+                  yield value
+                  for child in value.values():
+                      yield from walk(child)
+              elif isinstance(value, list):
+                  for child in value:
+                      yield from walk(child)
+
+          records = list(walk(data))
+
+          packages = {
+              str(x["id"]): x
+              for x in records
+              if "id" in x
+              and "title" in x
+              and "game_id" in x
+          }
+
+          releases = {
+              str(x["id"]): x
+              for x in records
+              if "id" in x
+              and "version_number" in x
+          }
+
+          candidates = {}
+
+          for build in records:
+
+              if "id" not in build:
+                  continue
+
+              if not (
+                  build.get("os_windows")
+                  or build.get("os_windows_64")
+              ):
+                  continue
+
+              package = packages.get(
+                  str(build.get("game_package_id")),
+                  {}
+              )
+
+              release = releases.get(
+                  str(build.get("game_release_id")),
+                  {}
+              )
+
+              title = str(package.get("title", ""))
+
+              version = str(
+                  release.get("version_number", "")
+              )
+
+              candidates[str(build["id"])] = (
+                  version,
+                  title
+              )
+
+          Path("report/builds.txt").write_text(
+              "\n".join(
+                  key + " | " + str(value)
+                  for key, value in candidates.items()
+              )
+          )
+
+          if not candidates:
+              raise SystemExit(
+                  "Windows build not found"
+              )
+
+          def version_key(value):
+              parts = re.findall(r"\d+", value)
+              return tuple(map(int, parts))
+
+          latest = max(
+              version_key(v[0])
+              for v in candidates.values()
+          )
+
+          matches = [
+              key
+              for key, value in candidates.items()
+              if version_key(value[0]) == latest
+          ]
+
+          if len(matches) != 1:
+              raise SystemExit(
+                  "Multiple Windows builds. "
+                  "Check report/builds.txt "
+                  "and supply build_id."
+              )
+
+          print(matches[0])
+          PY
+              )
+
+            fi
+
+            echo "Selected build: $BUILD_ID"
+
+            API="https://gamejolt.com/site-api/web/discover/games/builds/get-download-url/$BUILD_ID"
+
+            URL=$(curl -fsS --retry 2 \
+              -A 'Mozilla/5.0' \
+              -H 'Content-Type: application/json' \
+              -H "Referer: https://gamejolt.com/get/build?game=$GAME_ID&build=$BUILD_ID" \
+              --data '{"forceDownload":true}' \
+              "$API" | jq -er '.payload.url')
+
+            curl -fLsS --retry 2 \
+              --max-time 400 \
+              -A 'Mozilla/5.0' \
+              -e 'https://gamejolt.com/' \
+              "$URL" \
+              -o game.archive
+
+          fi
+
+          test -s game.archive
+
+          ls -lh game.archive
+
+          file game.archive
+
+          sha256sum game.archive \
+            > report/sha256.txt
+
+      - name: Extract original game
+        run: |
+          set -euo pipefail
+
+          7z l game.archive \
+            > report/archive-files.txt
+
+          7z x -y \
+            -ooriginal \
+            game.archive
+
+      - name: Detect Unity and backend
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY' | tee report/engine.txt
+          from pathlib import Path
+          import re
+          import shutil
+
+          root = Path("original")
+
+          files = [
+              p for p in root.rglob("*")
+              if p.is_file()
+          ]
+
+          mono = list(
+              root.rglob("Assembly-CSharp.dll")
+          )
+
+          il2cpp = list(
+              root.rglob("GameAssembly.dll")
+          )
+
+          metadata = list(
+              root.rglob("global-metadata.dat")
+          )
+
+          managers = list(
+              root.rglob("globalgamemanagers")
+          )
+
+          versions = set()
+
+          for path in files:
+
+              if (
+                  path.name.lower() not in {
+                      "globalgamemanagers",
+                      "unityplayer.dll",
+                      "maindata",
+                      "data.unity3d"
+                  }
+                  and path.suffix.lower() not in {
+                      ".assets",
+                      ".exe"
+                  }
+              ):
+                  continue
+
+              with path.open("rb") as f:
+                  data = f.read(4194304)
+
+              for version in re.findall(
+                  rb"(?:20\d{2}|6000|[345])\.\d+\.\d+[abfp]\d+",
+                  data
+              ):
+                  versions.add(version.decode())
+
+          print("SLENDRINA FRIENDS PREFLIGHT")
+          print("==========================")
+
+          if mono or il2cpp or managers:
+              print("Engine: Unity")
+          else:
+              print("Engine: Unknown")
+
+          print("Unity versions:", sorted(versions))
+
+          print("Mono DLLs:", len(mono))
+
+          print("GameAssembly.dll:", len(il2cpp))
+
+          print("IL2CPP metadata:", len(metadata))
+
+          if mono and not il2cpp and not metadata:
+
+              print("Backend: Mono")
+
+              print("PORT STATUS: MONO CANDIDATE")
+
+              Path("report/mono-candidate").touch()
+
+              for index, dll in enumerate(mono):
+
+                  print(
+                      "Original DLL:",
+                      dll,
+                      dll.stat().st_size,
+                      "bytes"
+                  )
+
+                  shutil.copy2(
+                      dll,
+                      Path("report") /
+                      f"Assembly-CSharp-{index}.dll"
+                  )
+
+          elif il2cpp or metadata:
+
+              print("Backend: IL2CPP")
+
+              print("PORT STATUS: SKIP")
+
+          else:
+
+              print("Backend: Unknown")
+
+              print("PORT STATUS: MORE ANALYSIS")
+
+          size = sum(
+              p.stat().st_size
+              for p in files
+          )
+
+          print(
+              "Extracted size:",
+              round(size / 1048576, 2),
+              "MB"
+          )
+          PY
+
+      - name: Check original scenes
+        run: |
+          find original -type f \
+            \( -name 'level*' \
+            -o -name '*.unity' \
+            -o -name '*.assets' \
+            -o -name '*.bundle' \) \
+            | sort > report/scenes.txt
+
+          cat report/scenes.txt
+
+      - name: Check Windows dependencies
+        run: |
+          find original -type f \
+            -iname '*.dll' \
+            | sort > report/libraries.txt
+
+          cat report/libraries.txt
+
+          find original -type f \
+            \( -iname '*steam*' \
+            -o -iname '*discord*' \
+            -o -iname '*xinput*' \
+            -o -iname '*fmod*' \
+            -o -iname '*wwise*' \) \
+            | sort > report/dependencies.txt
+
+          cat report/dependencies.txt
+
+      - name: Check original gameplay scripts
+        run: |
+          python3 - <<'PY' | tee report/gameplay.txt
+          from pathlib import Path
+          import re
+
+          terms = [
+              "slendrina",
+              "granny",
+              "grandpa",
+              "camera",
+              "door",
+              "challenge",
+              "endless",
+              "custom",
+              "night",
+              "character",
+              "enemy",
+              "input",
+              "mouse",
+              "keyboard",
+              "save",
+              "load",
+              "menu",
+              "touch"
+          ]
+
+          for dll in Path("original").rglob(
+              "Assembly-CSharp.dll"
+          ):
+
+              print("Assembly:", dll)
+
+              names = set()
+
+              for item in re.findall(
+                  rb"[A-Za-z_][A-Za-z0-9_.]{3,100}",
+                  dll.read_bytes()
+              ):
+
+                  name = item.decode(
+                      "ascii",
+                      errors="ignore"
+                  )
+
+                  if any(
+                      term in name.lower()
+                      for term in terms
+                  ):
+                      names.add(name)
+
+              for name in sorted(names):
+                  print(name)
+          PY
+
+      - name: Create final report
+        if: always()
+        run: |
+          {
+            echo "# Slendrina Freakish Friends"
+            echo ""
+            echo '```'
+            cat report/engine.txt 2>/dev/null || true
+            echo '```'
+            echo ""
+            echo "## Windows dependencies"
+            echo '```'
+            cat report/dependencies.txt 2>/dev/null || true
+            echo '```'
+            echo ""
+            echo "No Recovery"
+            echo "No Unity installation"
+            echo "No Xcode"
+            echo "No IPA compilation"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Preflight report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Slendrina-Friends-Preflight
+          path: report/
+          retention-days: 14
+
+      - name: Preserve original game if Mono
+        if: success() && hashFiles('report/mono-candidate') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: Slendrina-Friends-Original
+          path: game.archive
+          compression-level: 0
+          retention-days: 14
