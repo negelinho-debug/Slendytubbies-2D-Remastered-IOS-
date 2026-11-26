@@ -1,0 +1,490 @@
+
+name: Slendytubbies A New Story 1.2 - Recovery
+
+on:
+  workflow_dispatch:
+    inputs:
+      preflight_run:
+        description: "Preflight run ID (optional)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  recovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PREFLIGHT_RUN: ${{ inputs.preflight_run }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Prepare folders
+        run: |
+          mkdir -p original
+          mkdir -p download
+          mkdir -p output
+          mkdir -p tools
+          mkdir -p export
+
+          df -h
+
+      - name: Download existing original game
+        run: |
+          set -euo pipefail
+
+          RUN="$PREFLIGHT_RUN"
+
+          if [ -z "$RUN" ]; then
+
+            RUN=$(gh run list \
+              --workflow new-story-ios.yml \
+              --status success \
+              --limit 1 \
+              --json databaseId \
+              --jq '.[0].databaseId')
+
+          fi
+
+          test -n "$RUN"
+
+          echo "Preflight run: $RUN"
+
+          gh run download "$RUN" \
+            --name A-New-Story-Original \
+            --dir download
+
+          test -s download/game.archive
+
+          ls -lh download/game.archive
+
+          echo "Original game downloaded from GitHub"
+
+      - name: Extract original game
+        run: |
+          set -euo pipefail
+
+          7z x -y \
+            -ooriginal \
+            download/game.archive
+
+          DLL=$(find "$PWD/original" \
+            -type f \
+            -name Assembly-CSharp.dll \
+            -print -quit)
+
+          test -n "$DLL"
+
+          DATA=$(dirname "$(dirname "$DLL")")
+
+          ROOT=$(dirname "$DATA")
+
+          echo "GAME_DATA=$DATA" >> "$GITHUB_ENV"
+
+          echo "GAME_ROOT=$ROOT" >> "$GITHUB_ENV"
+
+          cp "$DLL" \
+            output/Assembly-CSharp-original.dll
+
+          echo "Original Mono assembly found"
+
+          echo "Game root: $ROOT"
+
+          ls -lh "$DLL"
+
+          rm download/game.archive
+
+          df -h
+
+      - name: Verify original Unity 5.6.1f1
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY' | tee output/game-report.txt
+          import os
+          import re
+          from pathlib import Path
+
+          root = Path(os.environ["GAME_ROOT"])
+
+          data = Path(os.environ["GAME_DATA"])
+
+          dll = data / "Managed/Assembly-CSharp.dll"
+
+          assert dll.is_file()
+
+          print("Game: Slendytubbies A New Story")
+
+          print("Expected game version: 1.2")
+
+          print("Expected Unity: 5.6.1f1")
+
+          print("Original DLL size:", dll.stat().st_size)
+
+          print("Backend: Mono")
+
+          if any(root.rglob("global-metadata.dat")):
+              raise SystemExit(
+                  "Unexpected IL2CPP metadata"
+              )
+
+          versions = set()
+
+          for path in root.rglob("*"):
+
+              if not path.is_file():
+                  continue
+
+              if (
+                  path.name.lower() not in {
+                      "globalgamemanagers",
+                      "unityplayer.dll",
+                      "maindata",
+                      "data.unity3d"
+                  }
+                  and path.suffix.lower()
+                  not in {".assets", ".exe"}
+              ):
+                  continue
+
+              with path.open("rb") as f:
+                  content = f.read(4194304)
+
+              for match in re.findall(
+                  rb"(?:20\d{2}|6000|[345])\.\d+\.\d+[abfp]\d+",
+                  content
+              ):
+                  versions.add(match.decode())
+
+          print("Detected versions:", sorted(versions))
+
+          if "5.6.1f1" not in versions:
+              raise SystemExit(
+                  "Expected Unity version not confirmed"
+              )
+
+          print("Original game verified")
+
+          PY
+
+      - name: Download AssetRipper
+        run: |
+          set -euo pipefail
+
+          curl -fLsS --retry 3 \
+            --max-time 300 \
+            https://github.com/AssetRipper/AssetRipper/releases/download/2.0.0/AssetRipper_linux_x64.tar.xz \
+            -o tools/ripper.tar.xz
+
+          mkdir -p tools/ripper
+
+          tar -xJf tools/ripper.tar.xz \
+            -C tools/ripper
+
+          rm tools/ripper.tar.xz
+
+      - name: Recover original A New Story project
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+
+          RIPPER=$(find "$PWD/tools/ripper" \
+            -type f \
+            -name AssetRipper.GUI.Free \
+            -print -quit)
+
+          test -x "$RIPPER"
+
+          "$RIPPER" \
+            --headless \
+            --port 18926 \
+            > output/assetripper.log 2>&1 &
+
+          PID=$!
+
+          trap 'kill "$PID" 2>/dev/null || true' EXIT
+
+          API=http://127.0.0.1:18926
+
+          curl -fsS \
+            --retry 30 \
+            --retry-connrefused \
+            --retry-delay 2 \
+            "$API/Settings/Edit" \
+            -o /dev/null
+
+          curl -fsS \
+            -d 'ScriptExportMode=DllExportWithRenaming&ScriptContentLevel=Level2' \
+            "$API/Settings/Update" \
+            -o /dev/null
+
+          echo "Loading original game"
+
+          curl -fsS \
+            --max-time 600 \
+            --data-urlencode "Path=$GAME_ROOT" \
+            "$API/LoadFolder" \
+            -o /dev/null
+
+          echo "Exporting original Unity assets"
+
+          curl -fsS \
+            --max-time 1200 \
+            --data-urlencode "Path=$PWD/export" \
+            "$API/Export/UnityProject" \
+            -o /dev/null
+
+          test -d export/ExportedProject/Assets
+
+          test -d export/ExportedProject/ProjectSettings
+
+          echo "Original project exported"
+
+          df -h
+
+      - name: Verify original scenes
+        run: |
+          set -euo pipefail
+
+          PROJECT=export/ExportedProject
+
+          find "$PROJECT/Assets" \
+            -type f \
+            -name '*.unity' \
+            | sort | tee output/scenes.txt
+
+          SCENES=$(find "$PROJECT/Assets" \
+            -type f \
+            -name '*.unity' | wc -l)
+
+          echo "Recovered scenes: $SCENES"
+
+          test "$SCENES" -gt 0
+
+          find "$PROJECT/Assets" \
+            -type f \
+            -name '*.prefab' \
+            | sort > output/prefabs.txt
+
+          find "$PROJECT/Assets" \
+            -type f \
+            -name '*.dll' \
+            | sort > output/assemblies.txt
+
+          find "$PROJECT/Assets" \
+            -type f \
+            -name '*.cs' \
+            | sort > output/scripts.txt
+
+      - name: Verify original game scripts
+        run: |
+          set -euo pipefail
+
+          PROJECT=export/ExportedProject
+
+          DLL=$(find "$PROJECT/Assets" \
+            -type f \
+            -name Assembly-CSharp.dll \
+            -print -quit)
+
+          test -n "$DLL"
+
+          test -s "$DLL"
+
+          test -s "$DLL.meta"
+
+          echo "Recovered DLL: $DLL"
+
+          ls -lh "$DLL"
+
+          sha256sum \
+            output/Assembly-CSharp-original.dll \
+            "$DLL" \
+            | tee output/assembly-hashes.txt
+
+          echo "Managed assembly preserved for inspection"
+
+      - name: Preserve original scene order
+        run: |
+          set -euo pipefail
+
+          PROJECT=export/ExportedProject
+
+          test -s \
+            "$PROJECT/ProjectSettings/EditorBuildSettings.asset"
+
+          cp \
+            "$PROJECT/ProjectSettings/EditorBuildSettings.asset" \
+            output/
+
+          cp \
+            "$PROJECT/ProjectSettings/ProjectVersion.txt" \
+            output/
+
+          echo "Recovered project version"
+
+          cat output/ProjectVersion.txt
+
+          echo "Original scene order"
+
+          cat output/EditorBuildSettings.asset
+
+      - name: Check missing scene references
+        run: |
+          python3 - <<'PY' | tee output/scene-integrity.txt
+          import re
+          from pathlib import Path
+
+          root = Path(
+              "export/ExportedProject/Assets"
+          )
+
+          total = 0
+
+          for scene in sorted(root.rglob("*.unity")):
+
+              source = scene.read_text(
+                  errors="replace"
+              )
+
+              missing = len(re.findall(
+                  r"(?m)^\s*m_Script:\s*\{fileID: 0\}",
+                  source
+              ))
+
+              total += missing
+
+              print(
+                  str(scene.relative_to(root)),
+                  "| Empty script references:",
+                  missing
+              )
+
+          print("Total empty references:", total)
+
+          print(
+              "Further Unity validation required"
+          )
+          PY
+
+      - name: Check campaign files
+        run: |
+          python3 - <<'PY' | tee output/campaign-report.txt
+          from pathlib import Path
+
+          assets = Path(
+              "export/ExportedProject/Assets"
+          )
+
+          terms = [
+              "chapter",
+              "campaign",
+              "story",
+              "dialog",
+              "cutscene",
+              "menu",
+              "player",
+              "ending",
+              "checkpoint"
+          ]
+
+          for path in sorted(assets.rglob("*")):
+
+              if not path.is_file():
+                  continue
+
+              if path.suffix.lower() not in {
+                  ".unity",
+                  ".prefab",
+                  ".cs"
+              }:
+                  continue
+
+              if any(
+                  term in path.name.lower()
+                  for term in terms
+              ):
+                  print(path.relative_to(assets))
+
+          PY
+
+      - name: Check recovered project size
+        run: |
+          du -sh export/ExportedProject
+
+          df -h
+
+      - name: Package reusable Unity project
+        run: |
+          set -euo pipefail
+
+          rm -rf original tools/ripper
+
+          tar -cf - \
+            -C export ExportedProject \
+            | gzip -1 \
+            > output/A-New-Story-Unity-Project.tar.gz
+
+          test -s \
+            output/A-New-Story-Unity-Project.tar.gz
+
+          gzip -t \
+            output/A-New-Story-Unity-Project.tar.gz
+
+          ls -lh output/
+
+      - name: Create Recovery summary
+        run: |
+          {
+            echo "# A New Story 1.2 Recovery"
+            echo ""
+            echo "## Original game"
+            echo '```'
+            cat output/game-report.txt
+            echo '```'
+            echo ""
+            echo "## Recovered Unity version"
+            echo '```'
+            cat output/ProjectVersion.txt
+            echo '```'
+            echo ""
+            echo "## Recovered scenes"
+            echo '```'
+            cat output/scenes.txt
+            echo '```'
+            echo ""
+            echo "## Recovery package"
+            echo '```'
+            ls -lh output/A-New-Story-Unity-Project.tar.gz
+            echo '```'
+            echo ""
+            echo "Original Mono assembly preserved"
+            echo "No Unity installation"
+            echo "No Xcode compilation"
+            echo "No IPA compilation"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload A New Story Recovery
+        uses: actions/upload-artifact@v4
+        with:
+          name: A-New-Story-Recovery
+          path: output/
+          compression-level: 0
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A-New-Story-Recovery-Logs
+          path: output/
+          retention-days: 14
+          if-no-files-found: warn
