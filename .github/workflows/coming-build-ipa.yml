@@ -1,5 +1,5 @@
 
-name: Coming - Create IPA V3 Return License
+name: Coming - Create IPA V4 Return License
 
 on:
   workflow_dispatch:
@@ -20,7 +20,8 @@ jobs:
     timeout-minutes: 180
 
     env:
-      UNITY_VERSION: 2022.3.73f1
+      UNITY_VERSION: 2022.3.62f3
+      UNITY_CHANGESET: 96770f904ca7
 
     steps:
       - name: Checkout
@@ -59,7 +60,7 @@ jobs:
             -orestored \
             -y > /dev/null
 
-          version="$(find restored \
+          version="$(find restored/recovered \
             -name ProjectVersion.txt -print -quit)"
 
           test -n "$version"
@@ -306,14 +307,17 @@ jobs:
           #endif
           CS
 
-      - name: Install Node.js
+      - name: Install Node.js 24
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
 
-      - name: Install Unity CLI
+      - name: Install Unity CLI V4
         run: |
-          npm install -g @rage-against-the-pixel/unity-cli
+          set -euo pipefail
+
+          npm install -g \
+            @rage-against-the-pixel/unity-cli@4.0.3
 
           unity-cli --help
 
@@ -323,7 +327,29 @@ jobs:
 
           unity-cli setup-unity \
             --unity-version "$UNITY_VERSION" \
-            --modules ios
+            --changeset "$UNITY_CHANGESET" \
+            --build-targets iOS
+
+      - name: Verify Unity installation
+        run: |
+          set -euo pipefail
+
+          editor="${UNITY_EDITOR_PATH:-}"
+
+          if [ -z "$editor" ] || [ ! -x "$editor" ]; then
+
+            editor="$(find /Applications \
+              -path "*/Unity.app/Contents/MacOS/Unity" \
+              -type f -print -quit 2>/dev/null || true)"
+
+          fi
+
+          test -n "$editor"
+          test -x "$editor"
+
+          echo "UNITY_EDITOR_PATH=$editor" >> "$GITHUB_ENV"
+
+          echo "Unity editor found"
 
       - name: Activate Unity Personal
         id: activate
@@ -338,9 +364,7 @@ jobs:
 
           unity-cli activate-license --license personal
 
-          unity-cli license-context
-
-          echo "Unity Personal activated"
+          echo "Unity Personal activation completed"
 
       - name: Unity iOS IL2CPP export
         run: |
@@ -412,7 +436,7 @@ jobs:
 
           echo "XCODE BUILD SUCCESS"
 
-      - name: Create IPA
+      - name: Create real IPA
         run: |
           set -euo pipefail
 
