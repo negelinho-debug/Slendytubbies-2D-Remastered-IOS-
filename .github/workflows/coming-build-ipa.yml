@@ -1,5 +1,5 @@
 
-name: Coming - Create IPA V2
+name: Coming - Create IPA V3 Return License
 
 on:
   workflow_dispatch:
@@ -19,20 +19,20 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 180
 
+    env:
+      UNITY_VERSION: 2022.3.73f1
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare build tools
+      - name: Prepare tools
         env:
           PASSWORD: ${{ secrets.COMING_ARCHIVE_PASSWORD }}
         run: |
           set -euo pipefail
 
-          if [ -z "$PASSWORD" ]; then
-            echo "Missing COMING_ARCHIVE_PASSWORD"
-            exit 1
-          fi
+          test -n "$PASSWORD"
 
           mkdir -p incoming restored ComingProject output reports
 
@@ -42,13 +42,13 @@ jobs:
 
           xcodebuild -version
 
-      - name: Download recovered game
+      - name: Download recovered project
         uses: actions/download-artifact@v4
         with:
           name: Coming-Mega-Fix
           path: incoming
 
-      - name: Extract original project
+      - name: Extract recovered project
         env:
           PASSWORD: ${{ secrets.COMING_ARCHIVE_PASSWORD }}
         run: |
@@ -70,17 +70,17 @@ jobs:
 
           rsync -a "$project/" ComingProject/
 
-          echo "Recovered project ready"
+          echo "Original project ready"
 
       - name: Prepare Unity project
         run: |
           set -euo pipefail
 
           mkdir -p ComingProject/Packages
-          mkdir -p ComingProject/ProjectSettings
           mkdir -p ComingProject/Assets/Editor
+          mkdir -p ComingProject/ProjectSettings
 
-          echo "m_EditorVersion: 2022.3.62f3" \
+          echo "m_EditorVersion: $UNITY_VERSION" \
             > ComingProject/ProjectSettings/ProjectVersion.txt
 
           python3 - <<'PY'
@@ -129,15 +129,7 @@ jobs:
               json.dumps(data, indent=2)
           )
 
-          print("Unity dependencies prepared")
-          PY
-
-      - name: Enable mobile controls by default
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          for file in Path("ComingProject/Assets").rglob("ComingTouch.cs"):
+          for file in (project / "Assets").rglob("ComingTouch.cs"):
               text = file.read_text(encoding="utf-8")
 
               text = text.replace(
@@ -147,6 +139,8 @@ jobs:
 
               file.write_text(text, encoding="utf-8")
 
+          print("Project prepared")
+          print("Mobile controls enabled")
           PY
 
       - name: Create Unity iOS builder
@@ -225,24 +219,18 @@ jobs:
                       );
                   }
 
-                  Debug.Log(
-                      "Original scenes: " +
-                      scenes.Length
-                  );
-
                   foreach (string scene in scenes)
+                  {
                       Debug.Log("BUILD SCENE: " + scene);
+                  }
 
-                  string projectRoot =
+                  string root =
                       Directory.GetParent(
                           Application.dataPath
                       ).FullName;
 
                   string output =
-                      Path.Combine(
-                          projectRoot,
-                          "ComingXcode"
-                      );
+                      Path.Combine(root, "ComingXcode");
 
                   BuildPlayerOptions options =
                       new BuildPlayerOptions();
@@ -270,9 +258,7 @@ jobs:
                       );
                   }
 
-                  Debug.Log(
-                      "COMING XCODE EXPORT SUCCESS"
-                  );
+                  Debug.Log("COMING XCODE EXPORT SUCCESS");
               }
           }
           CS
@@ -289,7 +275,7 @@ jobs:
           public static class ComingFiles
           {
               [PostProcessBuild(100)]
-              public static void EnableFiles(
+              public static void Enable(
                   BuildTarget target,
                   string output
               )
@@ -298,10 +284,7 @@ jobs:
                       return;
 
                   string path =
-                      Path.Combine(
-                          output,
-                          "Info.plist"
-                      );
+                      Path.Combine(output, "Info.plist");
 
                   PlistDocument plist =
                       new PlistDocument();
@@ -309,8 +292,7 @@ jobs:
                   plist.ReadFromFile(path);
 
                   plist.root.SetBoolean(
-                      "UIFileSharingEnabled",
-                      true
+                      "UIFileSharingEnabled", true
                   );
 
                   plist.root.SetBoolean(
@@ -324,21 +306,72 @@ jobs:
           #endif
           CS
 
-      - name: Unity iOS IL2CPP export
-        uses: game-ci/unity-builder@v4
-        env:
-          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
-          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
-          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
-          UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+      - name: Install Node.js
+        uses: actions/setup-node@v4
         with:
-          projectPath: ComingProject
-          unityVersion: 2022.3.62f3
-          targetPlatform: iOS
-          buildName: Coming
-          buildMethod: ComingIOSBuilder.Build
-          allowDirtyBuild: true
-          versioning: None
+          node-version: '22'
+
+      - name: Install Unity CLI
+        run: |
+          npm install -g @rage-against-the-pixel/unity-cli
+
+          unity-cli --help
+
+      - name: Install Unity and iOS module
+        run: |
+          set -euo pipefail
+
+          unity-cli setup-unity \
+            --unity-version "$UNITY_VERSION" \
+            --modules ios
+
+      - name: Activate Unity Personal
+        id: activate
+        env:
+          UNITY_USERNAME: ${{ secrets.UNITY_USERNAME || secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          test -n "$UNITY_USERNAME"
+          test -n "$UNITY_PASSWORD"
+
+          unity-cli activate-license --license personal
+
+          unity-cli license-context
+
+          echo "Unity Personal activated"
+
+      - name: Unity iOS IL2CPP export
+        run: |
+          set -euo pipefail
+
+          test -n "$UNITY_EDITOR_PATH"
+          test -x "$UNITY_EDITOR_PATH"
+
+          "$UNITY_EDITOR_PATH" \
+            -batchmode \
+            -nographics \
+            -quit \
+            -projectPath "$PWD/ComingProject" \
+            -buildTarget iOS \
+            -executeMethod ComingIOSBuilder.Build \
+            -logFile "$PWD/reports/unity.log" || {
+              tail -100 reports/unity.log
+              exit 1
+            }
+
+          test -d ComingProject/ComingXcode/Unity-iPhone.xcodeproj
+
+          echo "UNITY EXPORT SUCCESS"
+
+      - name: Return Unity License
+        if: always() && steps.activate.outcome == 'success'
+        continue-on-error: true
+        run: |
+          unity-cli return-license \
+            --license personal \
+            --when auto
 
       - name: Find Xcode project
         run: |
@@ -349,10 +382,7 @@ jobs:
             -name Unity-iPhone.xcodeproj \
             -print -quit)"
 
-          if [ -z "$project" ]; then
-            echo "Xcode export missing"
-            exit 1
-          fi
+          test -n "$project"
 
           echo "XCODE_PROJECT=$project" >> "$GITHUB_ENV"
 
@@ -382,7 +412,7 @@ jobs:
 
           echo "XCODE BUILD SUCCESS"
 
-      - name: Create real IPA
+      - name: Create IPA
         run: |
           set -euo pipefail
 
@@ -392,11 +422,7 @@ jobs:
             -name '*.app' \
             -print -quit)"
 
-          if [ -z "$app" ]; then
-            echo "Compiled application not found"
-            exit 1
-          fi
-
+          test -n "$app"
           test -f "$app/Info.plist"
 
           executable="$(/usr/libexec/PlistBuddy \
@@ -409,7 +435,7 @@ jobs:
 
           mkdir -p Payload
 
-          ditto "$app" "Payload/Coming.app"
+          ditto "$app" Payload/Coming.app
 
           ditto -c -k --keepParent \
             Payload \
@@ -423,11 +449,13 @@ jobs:
 
           du -h output/Coming-iOS-V1.ipa
 
-      - name: Protect IPA archive
+      - name: Protect IPA
         env:
           PASSWORD: ${{ secrets.COMING_ARCHIVE_PASSWORD }}
         run: |
           set -euo pipefail
+
+          test -n "$PASSWORD"
 
           cd output
 
@@ -447,25 +475,19 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
-      - name: Final build summary
+      - name: Final summary
         if: always()
         run: |
           if [ -s output/Coming-iOS-V1.7z ]; then
 
-            echo "COMING IPA CREATED" \
-              >> "$GITHUB_STEP_SUMMARY"
-
-            echo "Architecture: ARM64" \
-              >> "$GITHUB_STEP_SUMMARY"
-
-            echo "Backend: IL2CPP" \
-              >> "$GITHUB_STEP_SUMMARY"
-
-            echo "Minimum iOS: 15.0" \
-              >> "$GITHUB_STEP_SUMMARY"
-
-            echo "IPA signing required" \
-              >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo "COMING IPA CREATED"
+              echo "Unity: $UNITY_VERSION"
+              echo "Architecture: ARM64"
+              echo "Backend: IL2CPP"
+              echo "Minimum iOS: 15.0"
+              echo "Signing required"
+            } >> "$GITHUB_STEP_SUMMARY"
 
           else
 
