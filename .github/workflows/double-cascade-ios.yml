@@ -1,0 +1,369 @@
+
+name: Slendytubbies Double Cascade - Preflight
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: "GameJolt Build ID (optional)"
+        required: false
+        type: string
+      download_url:
+        description: "Direct original archive URL (optional)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      GAME_ID: "1092985"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare folders
+        run: |
+          mkdir -p original
+          mkdir -p report
+
+      - name: Download Double Cascade
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_ID: ${{ inputs.build_id }}
+          DOWNLOAD_URL: ${{ inputs.download_url }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$DOWNLOAD_URL" ]; then
+
+            curl -fLsS --retry 2 \
+              --max-time 500 \
+              "$DOWNLOAD_URL" \
+              -o game.archive
+
+          elif gh release download double-cascade-original \
+            --pattern '*.zip' \
+            --output game.archive 2>/dev/null; then
+
+            echo "Original archive loaded"
+
+          else
+
+            if [ -z "$BUILD_ID" ]; then
+
+              curl -fLsS --retry 2 \
+                -A 'Mozilla/5.0' \
+                "https://gamejolt.com/site-api/web/discover/games/overview/$GAME_ID?ignore" \
+                -o report/gamejolt.json
+
+              BUILD_ID=$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          data = json.loads(
+              Path("report/gamejolt.json").read_text()
+          )
+
+          def walk(value):
+              if isinstance(value, dict):
+                  yield value
+                  for child in value.values():
+                      yield from walk(child)
+              elif isinstance(value, list):
+                  for child in value:
+                      yield from walk(child)
+
+          matches = {}
+
+          for item in walk(data):
+              if "id" not in item:
+                  continue
+
+              if not (
+                  item.get("os_windows")
+                  or item.get("os_windows_64")
+              ):
+                  continue
+
+              if "game_release_id" not in item:
+                  continue
+
+              matches[str(item["id"])] = item
+
+          if len(matches) != 1:
+              raise SystemExit(
+                  "Cannot identify a unique Windows build. "
+                  "Candidates: " + str(list(matches)) +
+                  ". Supply build_id or download_url."
+              )
+
+          print(next(iter(matches)))
+          PY
+              )
+
+            fi
+
+            echo "Selected build: $BUILD_ID"
+
+            API="https://gamejolt.com/site-api/web/discover/games/builds/get-download-url/$BUILD_ID"
+
+            URL=$(curl -fsS --retry 2 \
+              -A 'Mozilla/5.0' \
+              -H 'Content-Type: application/json' \
+              -H "Referer: https://gamejolt.com/get/build?game=$GAME_ID&build=$BUILD_ID" \
+              --data '{"forceDownload":true}' \
+              "$API" | jq -er '.payload.url')
+
+            curl -fLsS --retry 2 \
+              --max-time 500 \
+              -A 'Mozilla/5.0' \
+              -e 'https://gamejolt.com/' \
+              "$URL" \
+              -o game.archive
+
+          fi
+
+          test -s game.archive
+
+          ls -lh game.archive
+
+          sha256sum game.archive \
+            | tee report/sha256.txt
+
+          file game.archive
+
+      - name: Extract original game
+        run: |
+          set -euo pipefail
+
+          7z l game.archive \
+            > report/archive-files.txt
+
+          7z x -y \
+            -ooriginal \
+            game.archive
+
+          echo "Original game extracted"
+
+      - name: Detect game engine
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY' | tee report/engine.txt
+          from pathlib import Path
+          import re
+          import os
+
+          root = Path("original")
+
+          unity = list(root.rglob("globalgamemanagers"))
+          mono = list(root.rglob("Assembly-CSharp.dll"))
+          il2cpp = list(root.rglob("GameAssembly.dll"))
+          metadata = list(root.rglob("global-metadata.dat"))
+          unreal = list(root.rglob("*.pak"))
+          godot = list(root.rglob("*.pck"))
+
+          print("DOUBLE CASCADE PREFLIGHT")
+          print("========================")
+
+          if unity:
+              print("Engine: Unity")
+          elif mono or il2cpp:
+              print("Engine: Probably Unity")
+          elif unreal:
+              print("Engine: Possibly Unreal Engine")
+          elif godot:
+              print("Engine: Possibly Godot")
+          else:
+              print("Engine: Unknown")
+
+          versions = set()
+
+          for file in unity:
+              with file.open("rb") as stream:
+                  data = stream.read(4194304)
+
+              for match in re.findall(
+                  rb"\b(?:20\d{2}|6000)\.\d+\.\d+[abfp]\d+\b",
+                  data
+              ):
+                  versions.add(match.decode())
+
+          print("Unity versions:", sorted(versions))
+
+          print("Mono assemblies:", len(mono))
+          print("GameAssembly.dll:", len(il2cpp))
+          print("IL2CPP metadata:", len(metadata))
+
+          if mono and not il2cpp:
+              print("Backend: Mono")
+              print("PORT STATUS: MONO CANDIDATE")
+          elif il2cpp and metadata:
+              print("Backend: IL2CPP")
+              print("PORT STATUS: REQUIRES MORE ANALYSIS")
+          else:
+              print("PORT STATUS: UNKNOWN")
+
+          for dll in mono:
+              print(
+                  "Original game assembly:",
+                  dll,
+                  dll.stat().st_size,
+                  "bytes"
+              )
+
+          size = sum(
+              p.stat().st_size
+              for p in root.rglob("*")
+              if p.is_file()
+          )
+
+          print(
+              "Extracted game size:",
+              round(size / 1024 / 1024, 2),
+              "MB"
+          )
+
+          PY
+
+      - name: Check scenes and resources
+        run: |
+          find original -type f \
+            \( -name 'level*' \
+            -o -name '*.unity' \
+            -o -name '*.assets' \
+            -o -name '*.bundle' \
+            -o -name '*.resource' \
+            -o -name '*.resS' \) \
+            | sort > report/scenes-resources.txt
+
+          cat report/scenes-resources.txt
+
+      - name: Check game libraries
+        run: |
+          find original -type f \
+            \( -iname '*.dll' \
+            -o -iname '*.so' \
+            -o -iname '*.dylib' \) \
+            | sort > report/libraries.txt
+
+          cat report/libraries.txt
+
+      - name: Check possible Windows dependencies
+        run: |
+          find original -type f \
+            \( -iname '*discord*' \
+            -o -iname '*steam*' \
+            -o -iname '*xinput*' \
+            -o -iname '*directx*' \
+            -o -iname '*fmod*' \
+            -o -iname '*wwise*' \) \
+            | sort > report/windows-dependencies.txt
+
+          cat report/windows-dependencies.txt
+
+      - name: Inspect original game scripts
+        run: |
+          python3 - <<'PY' | tee report/game-scripts.txt
+          from pathlib import Path
+          import re
+
+          terms = [
+              "ron",
+              "miles",
+              "campaign",
+              "dialog",
+              "weapon",
+              "reload",
+              "shoot",
+              "inventory",
+              "nightvision",
+              "flashlight",
+              "save",
+              "load",
+              "controller",
+              "player",
+              "input",
+              "discord",
+              "scene",
+              "checkpoint",
+              "cutscene",
+              "mouse",
+              "keyboard",
+              "sprint",
+              "crouch"
+          ]
+
+          assemblies = list(
+              Path("original").rglob("Assembly-CSharp.dll")
+          )
+
+          for dll in assemblies:
+              print("ASSEMBLY:", dll)
+
+              data = dll.read_bytes()
+
+              strings = re.findall(
+                  rb"[A-Za-z_][A-Za-z0-9_.]{3,100}",
+                  data
+              )
+
+              found = set()
+
+              for item in strings:
+                  name = item.decode(
+                      "ascii",
+                      errors="ignore"
+                  )
+
+                  if any(
+                      term in name.lower()
+                      for term in terms
+                  ):
+                      found.add(name)
+
+              for name in sorted(found):
+                  print(name)
+
+          if not assemblies:
+              print("Managed game assembly not found")
+
+          PY
+
+      - name: Create final report
+        if: always()
+        run: |
+          {
+            echo "# Double Cascade - Preflight"
+            echo ""
+            echo "## Engine analysis"
+            echo '```'
+            cat report/engine.txt 2>/dev/null || true
+            echo '```'
+            echo ""
+            echo "## Original archive"
+            echo '```'
+            ls -lh game.archive 2>/dev/null || true
+            echo '```'
+            echo ""
+            echo "No Unity installation"
+            echo "No AssetRipper recovery"
+            echo "No Xcode build"
+            echo "No IPA compilation"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Double Cascade report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Double-Cascade-Preflight
+          path: report/
+          retention-days: 14
+          if-no-files-found: warn
