@@ -1,0 +1,496 @@
+
+name: Slendytubbies III Multiplayer 2.6 - Preflight
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_url:
+        description: "Alternative ZIP URL (optional)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    env:
+      SOURCE_URL: ${{ inputs.source_url }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Prepare folders
+        run: |
+          mkdir -p original reports
+          python3 -m pip install requests beautifulsoup4
+
+      - name: Download original ST3 Multiplayer 2.6
+        run: |
+          python3 - <<'PY'
+          import os
+          import requests
+          import zipfile
+          import time
+          from pathlib import Path
+          from bs4 import BeautifulSoup
+
+          windows = (
+              "https://www.mediafire.com/file/"
+              "696woz1sf4qj0dx/"
+              "Slendytubbies+3+Multiplayer+(x64).zip/file"
+          )
+
+          linux = (
+              "https://www.mediafire.com/file/"
+              "5q28c9al37xadtu/"
+              "S3MP_V2_6_Linux_x64.zip/file"
+          )
+
+          sources = []
+
+          custom = os.environ.get(
+              "SOURCE_URL", ""
+          ).strip()
+
+          if custom:
+              sources.append(("Custom", custom))
+
+          sources.extend([
+              ("Windows x64", windows),
+              ("Linux x64", linux)
+          ])
+
+          session = requests.Session()
+
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0"
+          })
+
+          output = Path("original/game.archive")
+
+          def resolve(url):
+              if (
+                  "www.mediafire.com/file/" in url
+                  or
+                  "www.mediafire.com/file_premium/" in url
+              ):
+                  response = session.get(
+                      url,
+                      timeout=60
+                  )
+
+                  response.raise_for_status()
+
+                  page = BeautifulSoup(
+                      response.text,
+                      "html.parser"
+                  )
+
+                  button = page.select_one(
+                      "#downloadButton"
+                  )
+
+                  if not button:
+                      raise RuntimeError(
+                          "MediaFire link unavailable"
+                      )
+
+                  link = button.get("href")
+
+                  if not link:
+                      raise RuntimeError(
+                          "Direct download missing"
+                      )
+
+                  return link
+
+              return url
+
+          success = False
+
+          for platform, url in sources:
+              print("Trying:", platform, flush=True)
+
+              for attempt in range(2):
+                  try:
+                      output.unlink(missing_ok=True)
+
+                      direct = resolve(url)
+
+                      with session.get(
+                          direct,
+                          stream=True,
+                          timeout=(30, 90)
+                      ) as response:
+
+                          response.raise_for_status()
+
+                          total = 0
+
+                          with output.open("wb") as f:
+
+                              for chunk in response.iter_content(
+                                  chunk_size=1024 * 1024
+                              ):
+                                  if not chunk:
+                                      continue
+
+                                  f.write(chunk)
+
+                                  total += len(chunk)
+
+                                  if total > 6 * 1024**3:
+                                      raise RuntimeError(
+                                          "Archive too large"
+                                      )
+
+                      if not zipfile.is_zipfile(output):
+                          raise RuntimeError(
+                              "Downloaded file is not ZIP"
+                          )
+
+                      Path(
+                          "reports/source.txt"
+                      ).write_text(
+                          f"Platform: {platform}\n"
+                          f"Source: {url}\n"
+                          f"Requested version: 2.6\n"
+                      )
+
+                      print(
+                          "Downloaded:",
+                          round(
+                              output.stat().st_size
+                              / 1024**2, 2
+                          ),
+                          "MiB",
+                          flush=True
+                      )
+
+                      success = True
+                      break
+
+                  except Exception as error:
+                      print(
+                          "Download failed:",
+                          str(error),
+                          flush=True
+                      )
+
+                      output.unlink(missing_ok=True)
+
+                      time.sleep(3)
+
+              if success:
+                  break
+
+          if not success:
+              raise SystemExit(
+                  "Official downloads unavailable. "
+                  "Use a working direct ZIP URL."
+              )
+
+          print("ORIGINAL ARCHIVE READY")
+          PY
+
+      - name: Inspect original Unity game
+        run: |
+          python3 - <<'PY'
+          import re
+          import zipfile
+          import hashlib
+          from pathlib import Path
+
+          archive = Path(
+              "original/game.archive"
+          )
+
+          report = []
+
+          def log(text):
+              print(text, flush=True)
+              report.append(str(text))
+
+          with zipfile.ZipFile(archive) as z:
+
+              files = z.infolist()
+
+              names = [
+                  item.filename
+                  for item in files
+                  if not item.is_dir()
+              ]
+
+              total = sum(
+                  item.file_size
+                  for item in files
+              )
+
+              log("SLENDYTUBBIES III MULTIPLAYER 2.6")
+
+              log(
+                  Path(
+                      "reports/source.txt"
+                  ).read_text()
+              )
+
+              log(
+                  "Archive size: "
+                  + str(round(
+                      archive.stat().st_size / 1024**2,
+                      2
+                  ))
+                  + " MiB"
+              )
+
+              log(
+                  "Extracted size: "
+                  + str(round(
+                      total / 1024**2,
+                      2
+                  ))
+                  + " MiB"
+              )
+
+              log("Files: " + str(len(names)))
+
+              Path(
+                  "reports/files.txt"
+              ).write_text("\n".join(names))
+
+              managed = [
+                  n for n in names
+                  if n.lower().endswith(
+                      ".dll"
+                  )
+                  and "/managed/" in n.lower()
+              ]
+
+              assemblies = [
+                  n for n in managed
+                  if n.lower().endswith(
+                      "/assembly-csharp.dll"
+                  )
+              ]
+
+              il2cpp = [
+                  n for n in names
+                  if n.lower().endswith((
+                      "gameassembly.dll",
+                      "libil2cpp.so",
+                      "global-metadata.dat"
+                  ))
+              ]
+
+              mono = [
+                  n for n in names
+                  if "monobleedingedge" in n.lower()
+                  or n.lower().endswith((
+                      "mono.dll",
+                      "libmono.so",
+                      "mono-2.0-bdwgc.dll"
+                  ))
+              ]
+
+              log("")
+              log("=== SCRIPT BACKEND ===")
+
+              if il2cpp:
+                  backend = "IL2CPP"
+              elif assemblies:
+                  backend = "Mono"
+              else:
+                  backend = "Unknown"
+
+              log("Backend: " + backend)
+
+              log(
+                  "Mono runtime files: "
+                  + str(len(mono))
+              )
+
+              log(
+                  "IL2CPP files: "
+                  + str(len(il2cpp))
+              )
+
+              for item in assemblies:
+                  size = z.getinfo(item).file_size
+
+                  log(
+                      "Original assembly: "
+                      + item
+                      + " | "
+                      + str(size)
+                      + " bytes"
+                  )
+
+              log("")
+              log("=== UNITY VERSION ===")
+
+              candidates = [
+                  n for n in names
+                  if n.lower().endswith((
+                      "/globalgamemanagers",
+                      "/globalgamemanagers.assets",
+                      "/data.unity3d",
+                      "/resources.assets"
+                  ))
+              ]
+
+              versions = []
+
+              pattern = re.compile(
+                  rb"\b(?:20\d{2}|[3-6])"
+                  rb"\.\d+\.\d+[abfp]\d+\b"
+              )
+
+              for item in candidates:
+
+                  with z.open(item) as f:
+                      head = f.read(1024 * 1024)
+
+                  found = pattern.findall(head)
+
+                  for value in found:
+                      version = value.decode()
+
+                      if version not in versions:
+                          versions.append(version)
+
+              for version in versions:
+                  log("Unity version candidate: " + version)
+
+              if not versions:
+                  log("Unity version: UNKNOWN")
+
+              log("")
+              log("=== ORIGINAL SCENE FILES ===")
+
+              scenes = [
+                  n for n in names
+                  if re.search(
+                      r"/level\d+$",
+                      n,
+                      re.IGNORECASE
+                  )
+              ]
+
+              for scene in scenes:
+                  log(scene)
+
+              log(
+                  "Standalone scene files: "
+                  + str(len(scenes))
+              )
+
+              log("")
+              log("=== MANAGED LIBRARIES ===")
+
+              for dll in managed:
+                  log(dll)
+
+              log("")
+              log("=== NATIVE PLUGINS ===")
+
+              native = [
+                  n for n in names
+                  if (
+                      "/plugins/" in n.lower()
+                      and n.lower().endswith((
+                          ".dll", ".so",
+                          ".dylib", ".bundle"
+                      ))
+                  )
+              ]
+
+              for item in native:
+                  log(item)
+
+              log("")
+              log("=== ASSET INTEGRITY ===")
+
+              bad = z.testzip()
+
+              if bad:
+                  raise RuntimeError(
+                      "Corrupt archive entry: " + bad
+                  )
+
+              log("ZIP integrity: OK")
+
+              digest = hashlib.sha256()
+
+              with archive.open("rb") as f:
+                  for block in iter(
+                      lambda: f.read(1024 * 1024),
+                      b""
+                  ):
+                      digest.update(block)
+
+              log("SHA256: " + digest.hexdigest())
+
+              log("")
+              log("=== PORT STATUS ===")
+
+              if backend == "Mono" and versions:
+                  log("READY FOR RECOVERY ANALYSIS")
+              elif backend == "IL2CPP":
+                  log("IL2CPP RECOVERY REQUIRED")
+              else:
+                  log("ADDITIONAL INSPECTION REQUIRED")
+
+              log(
+                  "iOS runtime compatibility: NOT TESTED"
+              )
+
+              log(
+                  "Offline gameplay: NOT TESTED"
+              )
+
+              Path(
+                  "reports/preflight.txt"
+              ).write_text(
+                  "\n".join(report) + "\n"
+              )
+
+              if not candidates and not assemblies:
+                  raise RuntimeError(
+                      "Unity game data not found"
+                  )
+
+          print("PREFLIGHT COMPLETE")
+          PY
+
+      - name: Upload original game
+        uses: actions/upload-artifact@v4
+        with:
+          name: ST3-Multiplayer-Original
+          path: original/game.archive
+          compression-level: 0
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Upload preflight report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ST3-Multiplayer-Preflight
+          path: reports/
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Show final results
+        if: always()
+        run: |
+          echo "# ST3 Multiplayer 2.6" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -f reports/preflight.txt ]; then
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat reports/preflight.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
