@@ -1,0 +1,594 @@
+
+name: Slendytubbies III Multiplayer 2.65 - Preflight
+
+on:
+  workflow_dispatch:
+    inputs:
+      download_url:
+        description: "Official PC download link (optional)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      DOWNLOAD_URL: ${{ inputs.download_url }}
+      GAME_PAGE: https://zeoworks.com/games/Slendytubbies3.html
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Prepare folders
+        run: |
+          mkdir -p original report
+
+          python3 -m venv tools
+
+          tools/bin/pip install \
+            requests beautifulsoup4 gdown
+
+      - name: Find official PC Multiplayer 2.65
+        run: |
+          set -euo pipefail
+
+          tools/bin/python - <<'PY'
+          import os
+          import re
+          import requests
+          from pathlib import Path
+          from bs4 import BeautifulSoup
+          from urllib.parse import urljoin, unquote
+
+          session = requests.Session()
+
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0"
+          })
+
+          supplied = os.environ.get(
+              "DOWNLOAD_URL", ""
+          ).strip()
+
+          def page(url):
+              response = session.get(
+                  url, timeout=30
+              )
+
+              response.raise_for_status()
+
+              return BeautifulSoup(
+                  response.text, "html.parser"
+              )
+
+          if supplied:
+              selected = supplied
+
+          else:
+              main = os.environ["GAME_PAGE"]
+
+              soup = page(main)
+
+              pages = set()
+
+              candidates = set()
+
+              report = []
+
+              for a in soup.find_all("a", href=True):
+
+                  url = urljoin(main, a["href"])
+
+                  label = a.get_text(" ", strip=True)
+
+                  report.append(label + " | " + url)
+
+                  value = unquote(
+                      url + " " + label
+                  ).lower()
+
+                  if re.search(
+                      r"2[._]65", value
+                  ) and (
+                      "mp" in value
+                      or "multiplayer" in value
+                  ):
+                      if "zeoworks.com/games/" in url:
+                          pages.add(url)
+
+              pages.add(
+                  urljoin(main, "v2_65_MP.html")
+              )
+
+              for url in sorted(pages):
+
+                  try:
+                      sub = page(url)
+
+                      text = sub.get_text(" ", strip=True)
+
+                      if not re.search(
+                          r"2\.65\b", text
+                      ):
+                          continue
+
+                      for a in sub.find_all(
+                          "a", href=True
+                      ):
+
+                          link = urljoin(url, a["href"])
+
+                          value = unquote(link).lower()
+
+                          label = a.get_text(
+                              " ", strip=True
+                          ).lower()
+
+                          report.append(
+                              label + " | " + link
+                          )
+
+                          combined = value + " " + label
+
+                          if any(
+                              x in combined for x in [
+                                  "android",
+                                  ".apk",
+                                  "linux",
+                                  "x86",
+                                  "32bit",
+                                  "32-bit"
+                              ]
+                          ):
+                              continue
+
+                          if any(
+                              x in combined for x in [
+                                  "x64",
+                                  "64bit",
+                                  "64-bit",
+                                  "windows"
+                              ]
+                          ) and any(
+                              x in value for x in [
+                                  "mediafire.com",
+                                  "drive.google.com",
+                                  ".zip",
+                                  ".rar",
+                                  ".7z"
+                              ]
+                          ):
+                              candidates.add(link)
+
+                  except Exception as error:
+
+                      report.append(
+                          url + " | " + str(error)
+                      )
+
+              Path("report/download-links.txt").write_text(
+                  "\n".join(report)
+              )
+
+              if len(candidates) != 1:
+
+                  raise SystemExit(
+                      "PC 2.65 download not uniquely "
+                      "identified. Candidates: " +
+                      str(sorted(candidates)) +
+                      ". Supply the official download_url."
+                  )
+
+              selected = candidates.pop()
+
+          Path("report/selected-url.txt").write_text(
+              selected
+          )
+
+          print("Selected download:", selected)
+
+          PY
+
+      - name: Download original ST3 Multiplayer
+        run: |
+          set -euo pipefail
+
+          tools/bin/python - <<'PY'
+          import requests
+          import gdown
+          from pathlib import Path
+          from bs4 import BeautifulSoup
+
+          url = Path(
+              "report/selected-url.txt"
+          ).read_text().strip()
+
+          session = requests.Session()
+
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0"
+          })
+
+          if "drive.google.com" in url:
+
+              result = gdown.download(
+                  url=url,
+                  output="game.archive",
+                  fuzzy=True,
+                  quiet=False
+              )
+
+              if not result:
+                  raise SystemExit(
+                      "Google Drive download failed"
+                  )
+
+          else:
+
+              if "mediafire.com/file/" in url:
+
+                  page = session.get(
+                      url, timeout=30
+                  )
+
+                  page.raise_for_status()
+
+                  soup = BeautifulSoup(
+                      page.text, "html.parser"
+                  )
+
+                  button = soup.select_one(
+                      "a#downloadButton"
+                  )
+
+                  if not button or not button.get("href"):
+
+                      raise SystemExit(
+                          "MediaFire download unavailable"
+                      )
+
+                  url = button["href"]
+
+              with session.get(
+                  url,
+                  stream=True,
+                  timeout=(30, 120)
+              ) as response:
+
+                  response.raise_for_status()
+
+                  with open("game.archive", "wb") as f:
+
+                      for chunk in response.iter_content(
+                          chunk_size=1048576
+                      ):
+
+                          if chunk:
+                              f.write(chunk)
+
+          PY
+
+          test -s game.archive
+
+          ls -lh game.archive
+
+          file game.archive
+
+          sha256sum game.archive \
+            > report/sha256.txt
+
+      - name: Extract original PC game
+        run: |
+          set -euo pipefail
+
+          7z l game.archive \
+            > report/archive-files.txt
+
+          7z x -y \
+            -ooriginal \
+            game.archive
+
+      - name: Detect Unity and game backend
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY' | tee report/engine.txt
+          from pathlib import Path
+          import re
+          import shutil
+
+          root = Path("original")
+
+          files = [
+              p for p in root.rglob("*")
+              if p.is_file()
+          ]
+
+          mono = list(
+              root.rglob("Assembly-CSharp.dll")
+          )
+
+          il2cpp = list(
+              root.rglob("GameAssembly.dll")
+          )
+
+          metadata = list(
+              root.rglob("global-metadata.dat")
+          )
+
+          versions = set()
+
+          for path in files:
+
+              if (
+                  path.name.lower() not in {
+                      "globalgamemanagers",
+                      "unityplayer.dll",
+                      "maindata",
+                      "data.unity3d"
+                  }
+                  and path.suffix.lower()
+                  not in {".assets", ".exe"}
+              ):
+                  continue
+
+              with path.open("rb") as f:
+                  data = f.read(4194304)
+
+              for version in re.findall(
+                  rb"(?:20\d{2}|6000|[345])\.\d+\.\d+[abfp]\d+",
+                  data
+              ):
+                  versions.add(version.decode())
+
+          print("ST3 MULTIPLAYER PREFLIGHT")
+          print("=========================")
+
+          print("Requested version: 2.65")
+
+          print("Unity versions:", sorted(versions))
+
+          print("Mono DLLs:", len(mono))
+
+          print("IL2CPP:", bool(il2cpp or metadata))
+
+          if mono and not il2cpp and not metadata:
+
+              print("Backend: Mono")
+
+              print("PORT STATUS: MONO CANDIDATE")
+
+              Path("report/mono-candidate").touch()
+
+              for i, dll in enumerate(mono):
+
+                  print(
+                      "Original DLL:",
+                      dll,
+                      dll.stat().st_size,
+                      "bytes"
+                  )
+
+                  shutil.copy2(
+                      dll,
+                      Path("report") /
+                      f"Assembly-CSharp-{i}.dll"
+                  )
+
+          elif il2cpp or metadata:
+
+              print("Backend: IL2CPP")
+
+              print("PORT STATUS: COMPLEX")
+
+          else:
+
+              print("Backend: Unknown")
+
+          print(
+              "Extracted size:",
+              round(
+                  sum(p.stat().st_size for p in files)
+                  / 1048576,
+                  2
+              ),
+              "MB"
+          )
+
+          PY
+
+      - name: Check FishNet and multiplayer libraries
+        run: |
+          python3 - <<'PY' | tee report/network.txt
+          from pathlib import Path
+          import re
+
+          root = Path("original")
+
+          terms = [
+              "fishnet",
+              "tugboat",
+              "litnetlib",
+              "photon",
+              "mirror",
+              "websocket",
+              "transport",
+              "network",
+              "steam",
+              "discord"
+          ]
+
+          print("NETWORK LIBRARIES")
+
+          for path in root.rglob("*.dll"):
+
+              if any(
+                  t in path.name.lower()
+                  for t in terms
+              ):
+                  print(path)
+
+          print("\nGAME NETWORK REFERENCES")
+
+          for dll in root.rglob("Assembly-CSharp.dll"):
+
+              strings = re.findall(
+                  rb"[A-Za-z_][A-Za-z0-9_.]{3,120}",
+                  dll.read_bytes()
+              )
+
+              found = set()
+
+              for value in strings:
+
+                  name = value.decode(
+                      "ascii",
+                      errors="ignore"
+                  )
+
+                  if any(
+                      t in name.lower()
+                      for t in terms
+                  ):
+                      found.add(name)
+
+              for name in sorted(found):
+                  print(name)
+
+          print(
+              "\nNetwork references do not prove "
+              "iOS multiplayer compatibility."
+          )
+
+          PY
+
+      - name: Check original maps and assets
+        run: |
+          find original -type f \
+            \( -name 'level*' \
+            -o -name '*.assets' \
+            -o -name '*.bundle' \
+            -o -name '*.unity' \
+            -o -name '*.resS' \) \
+            | sort > report/scenes.txt
+
+          cat report/scenes.txt
+
+      - name: Check S2 DLC and game modes
+        run: |
+          python3 - <<'PY' | tee report/modes.txt
+          from pathlib import Path
+          import re
+
+          terms = [
+              "survival",
+              "sandbox",
+              "collect",
+              "versus",
+              "hideandseek",
+              "hide_and_seek",
+              "hide and seek",
+              "infection",
+              "singleplayer",
+              "multiplayer",
+              "custard",
+              "slendytubbies2",
+              "s2dlc",
+              "dlc"
+          ]
+
+          root = Path("original")
+
+          for dll in root.rglob("Assembly-CSharp.dll"):
+
+              data = dll.read_bytes()
+
+              found = set()
+
+              for value in re.findall(
+                  rb"[\x20-\x7e]{4,160}",
+                  data
+              ):
+
+                  found.add(value.decode("ascii"))
+
+              for value in re.findall(
+                  rb"(?:[\x20-\x7e]\x00){4,160}",
+                  data
+              ):
+
+                  found.add(
+                      value.decode("utf-16-le")
+                  )
+
+              for name in sorted(found):
+
+                  if any(
+                      term in name.lower()
+                      for term in terms
+                  ):
+                      print(name)
+
+          print(
+              "\nReferences alone do not confirm "
+              "that every game mode is playable."
+          )
+
+          PY
+
+      - name: Check original DLL dependencies
+        run: |
+          find original -type f \
+            -iname '*.dll' \
+            | sort > report/libraries.txt
+
+          cat report/libraries.txt
+
+      - name: Create final summary
+        if: always()
+        run: |
+          {
+            echo "# ST3 Multiplayer 2.65"
+            echo ""
+            echo "## Engine"
+            echo '```'
+            cat report/engine.txt 2>/dev/null || true
+            echo '```'
+            echo ""
+            echo "## Networking"
+            echo '```'
+            head -80 report/network.txt 2>/dev/null || true
+            echo '```'
+            echo ""
+            echo "## Game modes"
+            echo '```'
+            head -100 report/modes.txt 2>/dev/null || true
+            echo '```'
+            echo ""
+            echo "No Recovery"
+            echo "No Unity installation"
+            echo "No Xcode"
+            echo "No IPA compilation"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Preflight report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ST3-Multiplayer-265-Preflight
+          path: report/
+          retention-days: 14
+
+      - name: Preserve original game if Mono
+        if: success() && hashFiles('report/mono-candidate') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ST3-Multiplayer-265-Original
+          path: game.archive
+          compression-level: 0
+          retention-days: 14
