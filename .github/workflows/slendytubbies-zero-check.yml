@@ -1,0 +1,385 @@
+
+name: Slendytubbies Zero - Preflight
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      GAME_ID: "950008"
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Prepare folders
+        run: mkdir -p original report
+
+      - name: Find original Windows build
+        run: |
+          set -euo pipefail
+
+          curl -fsSL --retry 2 \
+            -A 'Mozilla/5.0' \
+            "https://gamejolt.com/site-api/web/discover/games/overview/$GAME_ID?ignore" \
+            -o report/gamejolt.json
+
+          python3 - <<'PY'
+          import json
+          import re
+          import os
+          from pathlib import Path
+
+          data = json.loads(
+              Path("report/gamejolt.json").read_text()
+          )
+
+          def walk(x):
+              if isinstance(x, dict):
+                  yield x
+                  for v in x.values():
+                      yield from walk(v)
+              elif isinstance(x, list):
+                  for v in x:
+                      yield from walk(v)
+
+          records = list(walk(data))
+
+          releases = {
+              str(x["id"]): x
+              for x in records
+              if "id" in x
+              and "version_number" in x
+          }
+
+          packages = {
+              str(x["id"]): x
+              for x in records
+              if "id" in x
+              and "title" in x
+              and "game_id" in x
+          }
+
+          candidates = {}
+
+          for b in records:
+
+              if "id" not in b:
+                  continue
+
+              if not (
+                  b.get("os_windows")
+                  or b.get("os_windows_64")
+              ):
+                  continue
+
+              if "game_release_id" not in b:
+                  continue
+
+              release = releases.get(
+                  str(b["game_release_id"]),
+                  {}
+              )
+
+              package = packages.get(
+                  str(b.get("game_package_id")),
+                  {}
+              )
+
+              title = str(package.get("title", ""))
+
+              if any(
+                  x in title.lower()
+                  for x in [
+                      "records",
+                      "demo",
+                      "soundtrack"
+                  ]
+              ):
+                  continue
+
+              version = str(
+                  release.get("version_number", "")
+              )
+
+              candidates[str(b["id"])] = (
+                  version,
+                  title
+              )
+
+          print("Windows builds:", candidates)
+
+          Path("report/builds.txt").write_text(
+              str(candidates)
+          )
+
+          if not candidates:
+              raise SystemExit(
+                  "Windows build not found"
+              )
+
+          def version_key(v):
+              return tuple(
+                  map(int, re.findall(r"\d+", v))
+              )
+
+          latest = max(
+              version_key(v[0])
+              for v in candidates.values()
+          )
+
+          matches = [
+              k for k, v in candidates.items()
+              if version_key(v[0]) == latest
+          ]
+
+          if len(matches) != 1:
+              raise SystemExit(
+                  "Multiple matching builds"
+              )
+
+          build = matches[0]
+
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write("BUILD_ID=" + build + "\n")
+
+          print("Selected:", build, candidates[build])
+          PY
+
+      - name: Download original Slendytubbies Zero
+        run: |
+          set -euo pipefail
+
+          API="https://gamejolt.com/site-api/web/discover/games/builds/get-download-url/$BUILD_ID"
+
+          URL=$(curl -fsS --retry 2 \
+            -A 'Mozilla/5.0' \
+            -H 'Content-Type: application/json' \
+            -H "Referer: https://gamejolt.com/get/build?game=$GAME_ID&build=$BUILD_ID" \
+            --data '{"forceDownload":true}' \
+            "$API" | jq -er '.payload.url')
+
+          curl -fLsS --retry 2 \
+            --max-time 500 \
+            -A 'Mozilla/5.0' \
+            -e 'https://gamejolt.com/' \
+            "$URL" \
+            -o game.archive
+
+          test -s game.archive
+
+          ls -lh game.archive
+
+          sha256sum game.archive \
+            > report/sha256.txt
+
+      - name: Extract original game
+        run: |
+          set -euo pipefail
+
+          7z l game.archive \
+            > report/archive-files.txt
+
+          7z x -y \
+            -ooriginal \
+            game.archive
+
+      - name: Detect Unity and Mono
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY' | tee report/engine.txt
+          import re
+          from pathlib import Path
+
+          root = Path("original")
+
+          mono = list(
+              root.rglob("Assembly-CSharp.dll")
+          )
+
+          il2cpp = list(
+              root.rglob("GameAssembly.dll")
+          )
+
+          metadata = list(
+              root.rglob("global-metadata.dat")
+          )
+
+          versions = set()
+
+          files = [
+              p for p in root.rglob("*")
+              if p.is_file()
+          ]
+
+          for p in files:
+
+              if (
+                  p.name.lower() not in {
+                      "globalgamemanagers",
+                      "unityplayer.dll",
+                      "maindata",
+                      "data.unity3d"
+                  }
+                  and p.suffix.lower()
+                  not in {".assets", ".exe"}
+              ):
+                  continue
+
+              with p.open("rb") as f:
+                  data = f.read(4194304)
+
+              for v in re.findall(
+                  rb"(?:20\d{2}|6000|[345])\.\d+\.\d+[abfp]\d+",
+                  data
+              ):
+                  versions.add(v.decode())
+
+          print("SLENDYTUBBIES ZERO")
+          print("==================")
+
+          print("Unity versions:", sorted(versions))
+
+          print("Mono DLL count:", len(mono))
+
+          print("IL2CPP:", bool(il2cpp or metadata))
+
+          if mono and not il2cpp and not metadata:
+
+              print("Backend: Mono")
+
+              print("PORT STATUS: MONO CANDIDATE")
+
+              Path("report/mono-candidate").touch()
+
+              for dll in mono:
+                  print("Original DLL:", dll)
+                  print("DLL bytes:", dll.stat().st_size)
+
+          elif il2cpp or metadata:
+
+              print("Backend: IL2CPP")
+
+              print("PORT STATUS: COMPLEX")
+
+          else:
+
+              print("Backend: Unknown")
+
+          print(
+              "Extracted size:",
+              round(
+                  sum(p.stat().st_size for p in files)
+                  / 1048576,
+                  2
+              ),
+              "MB"
+          )
+          PY
+
+      - name: Check original scenes
+        run: |
+          find original -type f \
+            \( -name 'level*' \
+            -o -name '*.unity' \
+            -o -name '*.assets' \
+            -o -name '*.bundle' \) \
+            | sort > report/scenes.txt
+
+          cat report/scenes.txt
+
+      - name: Check original campaign
+        run: |
+          python3 - <<'PY' | tee report/campaign.txt
+          import re
+          from pathlib import Path
+
+          terms = [
+              "story",
+              "campaign",
+              "dialog",
+              "cutscene",
+              "chapter",
+              "ending",
+              "save",
+              "load",
+              "checkpoint",
+              "arcade",
+              "puzzle",
+              "nightvision",
+              "inventory",
+              "player",
+              "input"
+          ]
+
+          for dll in Path("original").rglob(
+              "Assembly-CSharp.dll"
+          ):
+
+              found = set()
+
+              for value in re.findall(
+                  rb"[A-Za-z_][A-Za-z0-9_.]{3,100}",
+                  dll.read_bytes()
+              ):
+
+                  name = value.decode(
+                      "ascii",
+                      errors="ignore"
+                  )
+
+                  if any(
+                      t in name.lower()
+                      for t in terms
+                  ):
+                      found.add(name)
+
+              for name in sorted(found):
+                  print(name)
+          PY
+
+      - name: Check dependencies
+        run: |
+          find original -type f \
+            -iname '*.dll' \
+            | sort > report/libraries.txt
+
+          cat report/libraries.txt
+
+      - name: Create final report
+        if: always()
+        run: |
+          {
+            echo "# Slendytubbies Zero Preflight"
+            echo '```'
+            cat report/engine.txt 2>/dev/null || true
+            echo '```'
+            echo ""
+            echo "No Recovery"
+            echo "No Unity installation"
+            echo "No IPA build"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Zero-Preflight
+          path: report/
+          retention-days: 14
+
+      - name: Preserve original game if Mono
+        if: success() && hashFiles('report/mono-candidate') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: Zero-Original
+          path: game.archive
+          compression-level: 0
+          retention-days: 30
