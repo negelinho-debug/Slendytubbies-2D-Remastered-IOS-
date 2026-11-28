@@ -1,18 +1,8 @@
 
-name: POSTAL 2 iOS - V5 IPA
+name: POSTAL 2 iOS - V6 ONLINE
 
 on:
   workflow_dispatch:
-    inputs:
-      web_repo:
-        description: "Offline web repository (owner/repo)"
-        required: false
-        type: string
-      web_path:
-        description: "Folder with offline game"
-        required: true
-        default: "Web"
-        type: string
 
 permissions:
   contents: read
@@ -20,253 +10,202 @@ permissions:
 jobs:
   build-ipa:
     runs-on: macos-15
-    timeout-minutes: 60
+    timeout-minutes: 30
 
     steps:
-      - name: Download offline game
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ inputs.web_repo || github.repository }}
-          token: ${{ secrets.GAME_REPO_TOKEN || github.token }}
-          path: source
-          lfs: true
-          persist-credentials: false
-
-      - name: Validate game files
-        env:
-          WEB_PATH: ${{ inputs.web_path }}
-        run: |
-          ROOT="source/$WEB_PATH"
-
-          if [ ! -f "$ROOT/index.html" ]; then
-            echo "::error::Missing offline index.html"
-            exit 1
-          fi
-
-          for module in \
-            postal_engine_browser.mjs \
-            map-renderer.mjs \
-            rooms.mjs
-          do
-            if [ -z "$(find "$ROOT" -name "$module" -type f -print -quit)" ]; then
-              echo "::error::Missing $module"
-              exit 1
-            fi
-          done
-
-          mkdir -p Web App
-          rsync -a --exclude='.git' "$ROOT/" Web/
-          du -sh Web
-
-      - name: Install tools
+      - name: Install build tools
         run: |
           brew install xcodegen
-          xcodebuild -version
+          mkdir -p App
 
-      - name: Create iOS application
+      - name: Create iOS project
         run: |
           cat > project.yml <<'EOF'
           name: Postal2
-
           options:
             deploymentTarget:
               iOS: "16.0"
-
           targets:
             Postal2:
               type: application
               platform: iOS
-
               sources:
-                - path: App
-                - path: Web
-                  type: folder
-                  buildPhase: resources
-
+                - App
               info:
                 path: Info.plist
                 properties:
                   CFBundleDisplayName: POSTAL 2
+                  CFBundleShortVersionString: "6.0"
+                  CFBundleVersion: "6"
                   UILaunchScreen: {}
                   UIRequiresFullScreen: true
+                  UIViewControllerBasedStatusBarAppearance: true
                   UISupportedInterfaceOrientations:
                     - UIInterfaceOrientationLandscapeLeft
                     - UIInterfaceOrientationLandscapeRight
-                  NSAppTransportSecurity:
-                    NSAllowsLocalNetworking: true
-
               settings:
                 base:
                   PRODUCT_BUNDLE_IDENTIFIER: com.projectparadise.postal2
-                  TARGETED_DEVICE_FAMILY: "1,2"
                   CODE_SIGNING_ALLOWED: NO
+                  TARGETED_DEVICE_FAMILY: "1"
                   CLANG_ENABLE_OBJC_ARC: YES
+              dependencies:
+                - sdk: WebKit.framework
           EOF
 
           cat > App/main.m <<'EOF'
           #import <UIKit/UIKit.h>
           #import <WebKit/WebKit.h>
-          #import <GCDWebServer/GCDWebServer.h>
-          #import <GCDWebServer/GCDWebServerFileResponse.h>
 
-          @interface AppDelegate : UIResponder
-          <UIApplicationDelegate>
+          @interface GameController : UIViewController
+          <WKNavigationDelegate>
 
-          @property(nonatomic,strong)
-          UIWindow *window;
-
-          @property(nonatomic,strong)
-          WKWebView *web;
-
-          @property(nonatomic,strong)
-          GCDWebServer *server;
+          @property(nonatomic,strong) WKWebView *web;
+          @property(nonatomic,strong) UIButton *retry;
 
           @end
 
-          @implementation AppDelegate
+          @implementation GameController
 
-          - (BOOL)application:(UIApplication *)app
-          didFinishLaunchingWithOptions:(NSDictionary *)options {
+          - (BOOL)prefersStatusBarHidden {
+            return YES;
+          }
 
-            self.window = [[UIWindow alloc]
-              initWithFrame:UIScreen.mainScreen.bounds];
+          - (BOOL)prefersHomeIndicatorAutoHidden {
+            return YES;
+          }
 
-            UIViewController *vc =
-              [[UIViewController alloc] init];
+          - (UIInterfaceOrientationMask)supportedInterfaceOrientations {
+            return UIInterfaceOrientationMaskLandscape;
+          }
 
-            self.window.rootViewController = vc;
+          - (void)viewDidLoad {
+            [super viewDidLoad];
 
-            NSString *root = [[NSBundle mainBundle]
-              pathForResource:@"Web" ofType:nil];
-
-            root = [root stringByResolvingSymlinksInPath];
-
-            self.server = [[GCDWebServer alloc] init];
-
-            [self.server addDefaultHandlerForMethod:@"GET"
-              requestClass:[GCDWebServerRequest class]
-              processBlock:^GCDWebServerResponse *
-              (GCDWebServerRequest *request) {
-
-                NSString *relative = request.path;
-
-                if ([relative hasPrefix:@"/"]) {
-                  relative = [relative substringFromIndex:1];
-                }
-
-                if (relative.length == 0) {
-                  relative = @"index.html";
-                }
-
-                NSString *path = [[root
-                  stringByAppendingPathComponent:relative]
-                  stringByResolvingSymlinksInPath];
-
-                if (![path hasPrefix:[root
-                  stringByAppendingString:@"/"]]) {
-                  return [GCDWebServerResponse
-                    responseWithStatusCode:403];
-                }
-
-                BOOL directory = NO;
-
-                if (![[NSFileManager defaultManager]
-                  fileExistsAtPath:path
-                  isDirectory:&directory]) {
-                  return [GCDWebServerResponse
-                    responseWithStatusCode:404];
-                }
-
-                if (directory) {
-                  path = [path
-                    stringByAppendingPathComponent:@"index.html"];
-                }
-
-                GCDWebServerFileResponse *response =
-                  [GCDWebServerFileResponse
-                    responseWithFile:path
-                    byteRange:request.byteRange];
-
-                if (!response) {
-                  return [GCDWebServerResponse
-                    responseWithStatusCode:404];
-                }
-
-                NSString *ext =
-                  path.pathExtension.lowercaseString;
-
-                if ([ext isEqualToString:@"wasm"]) {
-                  response.contentType = @"application/wasm";
-                }
-
-                if ([ext isEqualToString:@"mjs"] ||
-                    [ext isEqualToString:@"js"]) {
-                  response.contentType = @"text/javascript";
-                }
-
-                [response setValue:@"same-origin"
-                  forAdditionalHeader:
-                  @"Cross-Origin-Opener-Policy"];
-
-                [response setValue:@"require-corp"
-                  forAdditionalHeader:
-                  @"Cross-Origin-Embedder-Policy"];
-
-                [response setValue:@"same-origin"
-                  forAdditionalHeader:
-                  @"Cross-Origin-Resource-Policy"];
-
-                [response setValue:@"bytes"
-                  forAdditionalHeader:@"Accept-Ranges"];
-
-                return response;
-              }];
-
-            NSError *error = nil;
-
-            BOOL started = [self.server
-              startWithOptions:@{
-                GCDWebServerOption_Port: @18765,
-                GCDWebServerOption_BindToLocalhost: @YES
-              }
-              error:&error];
+            self.view.backgroundColor = UIColor.blackColor;
 
             WKWebViewConfiguration *config =
               [[WKWebViewConfiguration alloc] init];
 
-            config.allowsInlineMediaPlayback = YES;
-
             config.websiteDataStore =
               [WKWebsiteDataStore defaultDataStore];
+
+            config.defaultWebpagePreferences
+              .allowsContentJavaScript = YES;
+
+            config.allowsInlineMediaPlayback = YES;
 
             config.mediaTypesRequiringUserActionForPlayback =
               WKAudiovisualMediaTypeNone;
 
             self.web = [[WKWebView alloc]
-              initWithFrame:vc.view.bounds
+              initWithFrame:self.view.bounds
               configuration:config];
+
+            self.web.navigationDelegate = self;
 
             self.web.autoresizingMask =
               UIViewAutoresizingFlexibleWidth |
               UIViewAutoresizingFlexibleHeight;
 
-            self.web.scrollView.scrollEnabled = NO;
+            self.web.backgroundColor = UIColor.blackColor;
+            self.web.opaque = NO;
             self.web.scrollView.bounces = NO;
 
-            [vc.view addSubview:self.web];
+            self.web.scrollView.contentInsetAdjustmentBehavior =
+              UIScrollViewContentInsetAdjustmentNever;
+
+            [self.view addSubview:self.web];
+
+            self.retry = [UIButton
+              buttonWithType:UIButtonTypeSystem];
+
+            self.retry.frame = CGRectMake(
+              20, 20, 220, 45
+            );
+
+            [self.retry
+              setTitle:@"Retry connection"
+              forState:UIControlStateNormal];
+
+            self.retry.backgroundColor =
+              UIColor.darkGrayColor;
+
+            self.retry.tintColor =
+              UIColor.whiteColor;
+
+            self.retry.layer.cornerRadius = 10;
+
+            [self.retry
+              addTarget:self
+              action:@selector(loadGame)
+              forControlEvents:UIControlEventTouchUpInside];
+
+            self.retry.hidden = YES;
+
+            [self.view addSubview:self.retry];
+
+            [self loadGame];
+          }
+
+          - (void)loadGame {
+
+            self.retry.hidden = YES;
+
+            NSURL *url = [NSURL URLWithString:
+              @"https://kahnstation.kahn.lol/gopostal/"];
+
+            NSMutableURLRequest *request =
+              [NSMutableURLRequest
+                requestWithURL:url];
+
+            request.allowsCellularAccess = YES;
+            request.timeoutInterval = 180;
+
+            [self.web loadRequest:request];
+          }
+
+          - (void)webView:(WKWebView *)webView
+          didFailProvisionalNavigation:(WKNavigation *)navigation
+          withError:(NSError *)error {
+
+            self.retry.hidden = NO;
+          }
+
+          - (void)webView:(WKWebView *)webView
+          didFailNavigation:(WKNavigation *)navigation
+          withError:(NSError *)error {
+
+            self.retry.hidden = NO;
+          }
+
+          - (void)webViewWebContentProcessDidTerminate:
+          (WKWebView *)webView {
+
+            self.retry.hidden = NO;
+          }
+
+          @end
+
+          @interface AppDelegate : UIResponder
+          <UIApplicationDelegate>
+
+          @property(nonatomic,strong) UIWindow *window;
+
+          @end
+
+          @implementation AppDelegate
+
+          - (BOOL)application:(UIApplication *)application
+          didFinishLaunchingWithOptions:(NSDictionary *)options {
+
+            self.window = [[UIWindow alloc]
+              initWithFrame:UIScreen.mainScreen.bounds];
+
+            self.window.rootViewController =
+              [[GameController alloc] init];
+
             [self.window makeKeyAndVisible];
-
-            if (started) {
-              NSURL *url = [NSURL URLWithString:
-                @"http://localhost:18765/index.html"];
-
-              [self.web loadRequest:
-                [NSURLRequest requestWithURL:url]];
-            } else {
-              [self.web loadHTMLString:
-                @"Offline runtime startup failed"
-                baseURL:nil];
-            }
 
             return YES;
           }
@@ -284,22 +223,12 @@ jobs:
 
           xcodegen generate
 
-          cat > Podfile <<'EOF'
-          platform :ios, '16.0'
-
-          target 'Postal2' do
-            pod 'GCDWebServer', '3.5.4'
-          end
-          EOF
-
-          pod install
-
-      - name: Build iOS ARM64
+      - name: Build iPhone application
         run: |
           set -o pipefail
 
           xcodebuild \
-            -workspace Postal2.xcworkspace \
+            -project Postal2.xcodeproj \
             -scheme Postal2 \
             -configuration Release \
             -sdk iphoneos \
@@ -309,7 +238,7 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             build 2>&1 | tee build.log
 
-      - name: Package IPA
+      - name: Create IPA
         run: |
           mkdir -p Payload
 
@@ -317,21 +246,23 @@ jobs:
             Build/Build/Products/Release-iphoneos/Postal2.app \
             Payload/
 
-          test -f Payload/Postal2.app/Web/index.html
+          test -f Payload/Postal2.app/Postal2
 
-          zip -qry POSTAL2-V5.ipa Payload
+          zip -qry POSTAL2-V6.ipa Payload
+
+          ls -lh POSTAL2-V6.ipa
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: POSTAL2-V5-IPA
-          path: POSTAL2-V5.ipa
+          name: POSTAL2-V6-IPA
+          path: POSTAL2-V6.ipa
           compression-level: 0
 
-      - name: Upload logs
+      - name: Upload build logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: POSTAL2-V5-LOGS
+          name: POSTAL2-V6-LOGS
           path: build.log
           if-no-files-found: ignore
