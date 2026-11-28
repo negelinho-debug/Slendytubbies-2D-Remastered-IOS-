@@ -1,214 +1,181 @@
 
-name: POSTAL 2 iOS - Web Port
+name: POSTAL 2 iOS - V3
 
 on:
   workflow_dispatch:
-    inputs:
-      web_repo:
-        description: "GitHub repository with offline web build"
-        required: true
-        type: string
-      web_path:
-        description: "Folder containing index.html"
-        required: true
-        default: "."
+
+permissions:
+  contents: read
 
 jobs:
-  build:
-    runs-on: macos-15
-    timeout-minutes: 90
+  runtime-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      GAME_URL: https://kahnstation.kahn.lol/gopostal/
 
     steps:
-      - name: Prepare URL
-        id: source
-        env:
-          REPO: ${{ inputs.web_repo }}
+      - name: Install browser tools
         run: |
-          REPO="${REPO#https://github.com/}"
-          REPO="${REPO%/}"
-          REPO="${REPO%.git}"
-          [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
-          echo "repo=$REPO" >> "$GITHUB_OUTPUT"
+          npm install playwright
+          npx playwright install --with-deps webkit
 
-      - name: Download web build
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ steps.source.outputs.repo }}
-          token: ${{ secrets.GAME_REPO_TOKEN || github.token }}
-          path: source
-          lfs: true
-          persist-credentials: false
-
-      - name: Prepare resources
-        env:
-          WEB_PATH: ${{ inputs.web_path }}
+      - name: Test game runtime
         run: |
-          test -f "source/$WEB_PATH/index.html"
-          mkdir -p Web App
-          rsync -a --exclude='.git' \
-            "source/$WEB_PATH/" Web/
-          du -sh Web
-          find Web -name '*.wasm'
+          mkdir -p logs
 
-      - name: Install build tools
-        run: |
-          brew install xcodegen
-          pod --version
+          cat > test.cjs <<'EOF'
+          const { webkit } = require('playwright');
+          const fs = require('fs');
 
-      - name: Create iOS project
-        run: |
-          cat > project.yml <<'EOF'
-          name: Postal2
-          options:
-            deploymentTarget:
-              iOS: "16.0"
-          targets:
-            Postal2:
-              type: application
-              platform: iOS
-              sources:
-                - path: App
-                - path: Web
-                  type: folder
-                  buildPhase: resources
-              settings:
-                base:
-                  PRODUCT_BUNDLE_IDENTIFIER: com.projectparadise.postal2
-                  GENERATE_INFOPLIST_FILE: YES
-                  INFOPLIST_KEY_CFBundleDisplayName: POSTAL 2
-                  INFOPLIST_KEY_UILaunchScreen_Generation: YES
-                  INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
-                  CODE_SIGNING_ALLOWED: NO
-                  TARGETED_DEVICE_FAMILY: "1,2"
-          EOF
-
-          cat > App/main.m <<'EOF'
-          #import <UIKit/UIKit.h>
-          #import <WebKit/WebKit.h>
-          #import <GCDWebServer/GCDWebServer.h>
-
-          @interface AppDelegate : UIResponder
-          <UIApplicationDelegate>
-          @property(nonatomic,strong) UIWindow *window;
-          @property(nonatomic,strong) GCDWebServer *server;
-          @property(nonatomic,strong) WKWebView *web;
-          @end
-
-          @implementation AppDelegate
-
-          - (BOOL)application:(UIApplication *)app
-          didFinishLaunchingWithOptions:(NSDictionary *)options {
-
-            self.window = [[UIWindow alloc]
-              initWithFrame:UIScreen.mainScreen.bounds];
-
-            UIViewController *vc =
-              [[UIViewController alloc] init];
-
-            self.window.rootViewController = vc;
-
-            NSString *path = [[NSBundle mainBundle]
-              pathForResource:@"Web" ofType:nil];
-
-            self.server = [[GCDWebServer alloc] init];
-
-            [self.server addGETHandlerForBasePath:@"/"
-              directoryPath:path
-              indexFilename:@"index.html"
-              cacheAge:0
-              allowRangeRequests:YES];
-
-            NSError *error = nil;
-
-            BOOL started = [self.server startWithOptions:@{
-              GCDWebServerOption_Port: @18765,
-              GCDWebServerOption_BindToLocalhost: @YES
-            } error:&error];
-
-            WKWebViewConfiguration *config =
-              [[WKWebViewConfiguration alloc] init];
-
-            config.allowsInlineMediaPlayback = YES;
-            config.mediaTypesRequiringUserActionForPlayback =
-              WKAudiovisualMediaTypeNone;
-
-            self.web = [[WKWebView alloc]
-              initWithFrame:vc.view.bounds
-              configuration:config];
-
-            self.web.autoresizingMask =
-              UIViewAutoresizingFlexibleWidth |
-              UIViewAutoresizingFlexibleHeight;
-
-            self.web.scrollView.scrollEnabled = NO;
-            [vc.view addSubview:self.web];
-
-            if (started) {
-              NSURL *url = [NSURL URLWithString:
-                @"http://localhost:18765/index.html"];
-              [self.web loadRequest:
-                [NSURLRequest requestWithURL:url]];
-            } else {
-              [self.web loadHTMLString:
-                @"Local runtime startup error"
-                baseURL:nil];
-            }
-
-            [self.window makeKeyAndVisible];
-            return YES;
+          function log(text) {
+            console.log(text);
+            fs.appendFileSync(
+              'logs/runtime.txt',
+              text + '\n'
+            );
           }
-          @end
 
-          int main(int argc, char *argv[]) {
-            @autoreleasepool {
-              return UIApplicationMain(
-                argc, argv, nil,
-                NSStringFromClass([AppDelegate class]));
+          (async () => {
+            const browser = await webkit.launch();
+
+            const context = await browser.newContext({
+              viewport: {
+                width: 844,
+                height: 390
+              },
+              isMobile: true,
+              hasTouch: true,
+              deviceScaleFactor: 2
+            });
+
+            const page = await context.newPage();
+
+            page.on('response', r => {
+              log(
+                r.status() + ' ' +
+                r.request().resourceType() + ' ' +
+                r.url().split('?')[0]
+              );
+            });
+
+            page.on('pageerror', e => {
+              log('ERROR: ' + e.message);
+            });
+
+            page.on('requestfailed', r => {
+              log('FAILED: ' +
+                r.url().split('?')[0]);
+            });
+
+            page.on('websocket', s => {
+              log('WEBSOCKET: ' +
+                s.url().split('?')[0]);
+            });
+
+            try {
+              const response = await page.goto(
+                process.env.GAME_URL,
+                {
+                  waitUntil: 'domcontentloaded',
+                  timeout: 120000
+                }
+              );
+
+              log('HTTP: ' + response.status());
+
+              if (!response.ok()) {
+                throw new Error('Website unavailable');
+              }
+
+              await page.waitForTimeout(120000);
+
+              const info = await page.evaluate(() => ({
+                title: document.title,
+                canvas: document.querySelectorAll(
+                  'canvas'
+                ).length,
+                video: document.querySelectorAll(
+                  'video'
+                ).length,
+                wasm: typeof WebAssembly,
+                isolated: crossOriginIsolated,
+                sharedMemory: typeof SharedArrayBuffer,
+                resources: performance
+                  .getEntriesByType('resource')
+                  .map(r => ({
+                    url: r.name.split('?')[0],
+                    size: r.transferSize
+                  }))
+              }));
+
+              fs.writeFileSync(
+                'logs/resources.json',
+                JSON.stringify(info, null, 2)
+              );
+
+              await page.screenshot({
+                path: 'logs/online.png'
+              });
+
+              log('STARTING OFFLINE TEST');
+
+              await context.setOffline(true);
+
+              try {
+                await page.reload({
+                  waitUntil: 'domcontentloaded',
+                  timeout: 30000
+                });
+
+                await page.waitForTimeout(30000);
+
+                await page.screenshot({
+                  path: 'logs/offline.png'
+                });
+
+                log('OFFLINE RELOAD COMPLETED');
+              } catch (e) {
+                log('OFFLINE FAILED: ' + e.message);
+              }
+
+              fs.writeFileSync(
+                'logs/planned-controls.json',
+                JSON.stringify({
+                  movement: true,
+                  cameraTouch: true,
+                  sprint: true,
+                  crouch: true,
+                  jump: true,
+                  attack: true,
+                  alternateAttack: true,
+                  kick: true,
+                  reload: true,
+                  inventory: true,
+                  map: true,
+                  urinate: true,
+                  firstPerson: 'BehindView 0',
+                  thirdPerson: 'BehindView 1',
+                  mods: 'pending',
+                  multiplayer: 'pending'
+                }, null, 2)
+              );
+
+            } catch (e) {
+              log('FATAL: ' + e.message);
+              process.exitCode = 1;
+            } finally {
+              await browser.close();
             }
-          }
+          })();
           EOF
 
-          xcodegen generate
+          node test.cjs
 
-          cat > Podfile <<'EOF'
-          platform :ios, '16.0'
-          target 'Postal2' do
-            pod 'GCDWebServer', '3.5.4'
-          end
-          EOF
-
-          pod install
-
-      - name: Build ARM64
-        run: |
-          set -o pipefail
-          xcodebuild \
-            -workspace Postal2.xcworkspace \
-            -scheme Postal2 \
-            -configuration Release \
-            -sdk iphoneos \
-            -destination 'generic/platform=iOS' \
-            -derivedDataPath Build \
-            ARCHS=arm64 \
-            CODE_SIGNING_ALLOWED=NO \
-            build 2>&1 | tee build.log
-
-      - name: Create IPA
-        run: |
-          mkdir -p Payload
-          cp -R Build/Build/Products/Release-iphoneos/Postal2.app Payload/
-          zip -qry Postal2-iOS.ipa Payload
-
-      - name: Upload IPA
-        uses: actions/upload-artifact@v4
-        with:
-          name: Postal2-iOS
-          path: Postal2-iOS.ipa
-          compression-level: 0
-
-      - name: Upload logs
+      - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Build-Logs
-          path: build.log
+          name: POSTAL2-V3-REPORT
+          path: logs/
