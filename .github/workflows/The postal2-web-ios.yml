@@ -1,108 +1,337 @@
 
-name: POSTAL 2 iOS - V4
+name: POSTAL 2 iOS - V5 IPA
 
 on:
   workflow_dispatch:
+    inputs:
+      web_repo:
+        description: "Offline web repository (owner/repo)"
+        required: false
+        type: string
+      web_path:
+        description: "Folder with offline game"
+        required: true
+        default: "Web"
+        type: string
+
+permissions:
+  contents: read
 
 jobs:
-  runtime-check:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+  build-ipa:
+    runs-on: macos-15
+    timeout-minutes: 60
 
     steps:
-      - name: Install runtime tools
+      - name: Download offline game
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.web_repo || github.repository }}
+          token: ${{ secrets.GAME_REPO_TOKEN || github.token }}
+          path: source
+          lfs: true
+          persist-credentials: false
+
+      - name: Validate game files
+        env:
+          WEB_PATH: ${{ inputs.web_path }}
         run: |
-          npm install playwright
-          npx playwright install --with-deps chromium webkit
+          ROOT="source/$WEB_PATH"
 
-      - name: Check game modules
+          if [ ! -f "$ROOT/index.html" ]; then
+            echo "::error::Missing offline index.html"
+            exit 1
+          fi
+
+          for module in \
+            postal_engine_browser.mjs \
+            map-renderer.mjs \
+            rooms.mjs
+          do
+            if [ -z "$(find "$ROOT" -name "$module" -type f -print -quit)" ]; then
+              echo "::error::Missing $module"
+              exit 1
+            fi
+          done
+
+          mkdir -p Web App
+          rsync -a --exclude='.git' "$ROOT/" Web/
+          du -sh Web
+
+      - name: Install tools
         run: |
-          mkdir -p logs
+          brew install xcodegen
+          xcodebuild -version
 
-          cat > test.cjs <<'EOF'
-          const { chromium, webkit } = require('playwright');
-          const fs = require('fs');
+      - name: Create iOS application
+        run: |
+          cat > project.yml <<'EOF'
+          name: Postal2
 
-          (async () => {
-            let failed = false;
+          options:
+            deploymentTarget:
+              iOS: "16.0"
 
-            for (const [name, engine] of [
-              ['chromium', chromium],
-              ['webkit', webkit]
-            ]) {
-              const browser = await engine.launch();
-              const page = await browser.newPage();
-              const errors = [];
-              const log = [];
+          targets:
+            Postal2:
+              type: application
+              platform: iOS
 
-              page.on('response', r => {
-                const url = r.url().split('?')[0];
-                log.push(r.status() + ' ' + url);
+              sources:
+                - path: App
+                - path: Web
+                  type: folder
+                  buildPhase: resources
 
-                if (r.status() >= 400 &&
-                    url.includes('/games/postal2/')) {
-                  errors.push(url);
-                }
-              });
+              info:
+                path: Info.plist
+                properties:
+                  CFBundleDisplayName: POSTAL 2
+                  UILaunchScreen: {}
+                  UIRequiresFullScreen: true
+                  UISupportedInterfaceOrientations:
+                    - UIInterfaceOrientationLandscapeLeft
+                    - UIInterfaceOrientationLandscapeRight
+                  NSAppTransportSecurity:
+                    NSAllowsLocalNetworking: true
 
-              page.on('pageerror', e => {
-                log.push('ERROR: ' + e.message);
-                errors.push(e.message);
-              });
-
-              try {
-                const response = await page.goto(
-                  'https://kahnstation.kahn.lol/gopostal/',
-                  {
-                    waitUntil: 'domcontentloaded',
-                    timeout: 90000
-                  }
-                );
-
-                if (!response.ok()) {
-                  errors.push('HTTP ' + response.status());
-                }
-
-                await page.waitForTimeout(90000);
-
-                await page.screenshot({
-                  path: `logs/${name}.png`
-                });
-
-                for (const frame of page.frames()) {
-                  const info = await frame.evaluate(() => ({
-                    title: document.title,
-                    canvas: document.querySelectorAll('canvas').length,
-                    isolated: crossOriginIsolated,
-                    sharedMemory: typeof SharedArrayBuffer
-                  }));
-
-                  log.push(JSON.stringify(info));
-                }
-
-              } catch (e) {
-                errors.push(e.message);
-              } finally {
-                await browser.close();
-              }
-
-              fs.writeFileSync(
-                `logs/${name}.txt`,
-                log.concat(errors).join('\n')
-              );
-
-              if (errors.length) failed = true;
-            }
-
-            if (failed) process.exitCode = 1;
-          })();
+              settings:
+                base:
+                  PRODUCT_BUNDLE_IDENTIFIER: com.projectparadise.postal2
+                  TARGETED_DEVICE_FAMILY: "1,2"
+                  CODE_SIGNING_ALLOWED: NO
+                  CLANG_ENABLE_OBJC_ARC: YES
           EOF
 
-          node test.cjs
+          cat > App/main.m <<'EOF'
+          #import <UIKit/UIKit.h>
+          #import <WebKit/WebKit.h>
+          #import <GCDWebServer/GCDWebServer.h>
+          #import <GCDWebServer/GCDWebServerFileResponse.h>
 
-      - name: Upload report
+          @interface AppDelegate : UIResponder
+          <UIApplicationDelegate>
+
+          @property(nonatomic,strong)
+          UIWindow *window;
+
+          @property(nonatomic,strong)
+          WKWebView *web;
+
+          @property(nonatomic,strong)
+          GCDWebServer *server;
+
+          @end
+
+          @implementation AppDelegate
+
+          - (BOOL)application:(UIApplication *)app
+          didFinishLaunchingWithOptions:(NSDictionary *)options {
+
+            self.window = [[UIWindow alloc]
+              initWithFrame:UIScreen.mainScreen.bounds];
+
+            UIViewController *vc =
+              [[UIViewController alloc] init];
+
+            self.window.rootViewController = vc;
+
+            NSString *root = [[NSBundle mainBundle]
+              pathForResource:@"Web" ofType:nil];
+
+            root = [root stringByResolvingSymlinksInPath];
+
+            self.server = [[GCDWebServer alloc] init];
+
+            [self.server addDefaultHandlerForMethod:@"GET"
+              requestClass:[GCDWebServerRequest class]
+              processBlock:^GCDWebServerResponse *
+              (GCDWebServerRequest *request) {
+
+                NSString *relative = request.path;
+
+                if ([relative hasPrefix:@"/"]) {
+                  relative = [relative substringFromIndex:1];
+                }
+
+                if (relative.length == 0) {
+                  relative = @"index.html";
+                }
+
+                NSString *path = [[root
+                  stringByAppendingPathComponent:relative]
+                  stringByResolvingSymlinksInPath];
+
+                if (![path hasPrefix:[root
+                  stringByAppendingString:@"/"]]) {
+                  return [GCDWebServerResponse
+                    responseWithStatusCode:403];
+                }
+
+                BOOL directory = NO;
+
+                if (![[NSFileManager defaultManager]
+                  fileExistsAtPath:path
+                  isDirectory:&directory]) {
+                  return [GCDWebServerResponse
+                    responseWithStatusCode:404];
+                }
+
+                if (directory) {
+                  path = [path
+                    stringByAppendingPathComponent:@"index.html"];
+                }
+
+                GCDWebServerFileResponse *response =
+                  [GCDWebServerFileResponse
+                    responseWithFile:path
+                    byteRange:request.byteRange];
+
+                if (!response) {
+                  return [GCDWebServerResponse
+                    responseWithStatusCode:404];
+                }
+
+                NSString *ext =
+                  path.pathExtension.lowercaseString;
+
+                if ([ext isEqualToString:@"wasm"]) {
+                  response.contentType = @"application/wasm";
+                }
+
+                if ([ext isEqualToString:@"mjs"] ||
+                    [ext isEqualToString:@"js"]) {
+                  response.contentType = @"text/javascript";
+                }
+
+                [response setValue:@"same-origin"
+                  forAdditionalHeader:
+                  @"Cross-Origin-Opener-Policy"];
+
+                [response setValue:@"require-corp"
+                  forAdditionalHeader:
+                  @"Cross-Origin-Embedder-Policy"];
+
+                [response setValue:@"same-origin"
+                  forAdditionalHeader:
+                  @"Cross-Origin-Resource-Policy"];
+
+                [response setValue:@"bytes"
+                  forAdditionalHeader:@"Accept-Ranges"];
+
+                return response;
+              }];
+
+            NSError *error = nil;
+
+            BOOL started = [self.server
+              startWithOptions:@{
+                GCDWebServerOption_Port: @18765,
+                GCDWebServerOption_BindToLocalhost: @YES
+              }
+              error:&error];
+
+            WKWebViewConfiguration *config =
+              [[WKWebViewConfiguration alloc] init];
+
+            config.allowsInlineMediaPlayback = YES;
+
+            config.websiteDataStore =
+              [WKWebsiteDataStore defaultDataStore];
+
+            config.mediaTypesRequiringUserActionForPlayback =
+              WKAudiovisualMediaTypeNone;
+
+            self.web = [[WKWebView alloc]
+              initWithFrame:vc.view.bounds
+              configuration:config];
+
+            self.web.autoresizingMask =
+              UIViewAutoresizingFlexibleWidth |
+              UIViewAutoresizingFlexibleHeight;
+
+            self.web.scrollView.scrollEnabled = NO;
+            self.web.scrollView.bounces = NO;
+
+            [vc.view addSubview:self.web];
+            [self.window makeKeyAndVisible];
+
+            if (started) {
+              NSURL *url = [NSURL URLWithString:
+                @"http://localhost:18765/index.html"];
+
+              [self.web loadRequest:
+                [NSURLRequest requestWithURL:url]];
+            } else {
+              [self.web loadHTMLString:
+                @"Offline runtime startup failed"
+                baseURL:nil];
+            }
+
+            return YES;
+          }
+
+          @end
+
+          int main(int argc, char *argv[]) {
+            @autoreleasepool {
+              return UIApplicationMain(
+                argc, argv, nil,
+                NSStringFromClass([AppDelegate class]));
+            }
+          }
+          EOF
+
+          xcodegen generate
+
+          cat > Podfile <<'EOF'
+          platform :ios, '16.0'
+
+          target 'Postal2' do
+            pod 'GCDWebServer', '3.5.4'
+          end
+          EOF
+
+          pod install
+
+      - name: Build iOS ARM64
+        run: |
+          set -o pipefail
+
+          xcodebuild \
+            -workspace Postal2.xcworkspace \
+            -scheme Postal2 \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath Build \
+            ARCHS=arm64 \
+            CODE_SIGNING_ALLOWED=NO \
+            build 2>&1 | tee build.log
+
+      - name: Package IPA
+        run: |
+          mkdir -p Payload
+
+          cp -R \
+            Build/Build/Products/Release-iphoneos/Postal2.app \
+            Payload/
+
+          test -f Payload/Postal2.app/Web/index.html
+
+          zip -qry POSTAL2-V5.ipa Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: POSTAL2-V5-IPA
+          path: POSTAL2-V5.ipa
+          compression-level: 0
+
+      - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: POSTAL2-V4-REPORT
-          path: logs/
+          name: POSTAL2-V5-LOGS
+          path: build.log
+          if-no-files-found: ignore
