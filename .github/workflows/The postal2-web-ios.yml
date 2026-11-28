@@ -1,181 +1,108 @@
 
-name: POSTAL 2 iOS - V3
+name: POSTAL 2 iOS - V4
 
 on:
   workflow_dispatch:
 
-permissions:
-  contents: read
-
 jobs:
-  runtime-test:
+  runtime-check:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-
-    env:
-      GAME_URL: https://kahnstation.kahn.lol/gopostal/
+    timeout-minutes: 15
 
     steps:
-      - name: Install browser tools
+      - name: Install runtime tools
         run: |
           npm install playwright
-          npx playwright install --with-deps webkit
+          npx playwright install --with-deps chromium webkit
 
-      - name: Test game runtime
+      - name: Check game modules
         run: |
           mkdir -p logs
 
           cat > test.cjs <<'EOF'
-          const { webkit } = require('playwright');
+          const { chromium, webkit } = require('playwright');
           const fs = require('fs');
 
-          function log(text) {
-            console.log(text);
-            fs.appendFileSync(
-              'logs/runtime.txt',
-              text + '\n'
-            );
-          }
-
           (async () => {
-            const browser = await webkit.launch();
+            let failed = false;
 
-            const context = await browser.newContext({
-              viewport: {
-                width: 844,
-                height: 390
-              },
-              isMobile: true,
-              hasTouch: true,
-              deviceScaleFactor: 2
-            });
+            for (const [name, engine] of [
+              ['chromium', chromium],
+              ['webkit', webkit]
+            ]) {
+              const browser = await engine.launch();
+              const page = await browser.newPage();
+              const errors = [];
+              const log = [];
 
-            const page = await context.newPage();
+              page.on('response', r => {
+                const url = r.url().split('?')[0];
+                log.push(r.status() + ' ' + url);
 
-            page.on('response', r => {
-              log(
-                r.status() + ' ' +
-                r.request().resourceType() + ' ' +
-                r.url().split('?')[0]
-              );
-            });
-
-            page.on('pageerror', e => {
-              log('ERROR: ' + e.message);
-            });
-
-            page.on('requestfailed', r => {
-              log('FAILED: ' +
-                r.url().split('?')[0]);
-            });
-
-            page.on('websocket', s => {
-              log('WEBSOCKET: ' +
-                s.url().split('?')[0]);
-            });
-
-            try {
-              const response = await page.goto(
-                process.env.GAME_URL,
-                {
-                  waitUntil: 'domcontentloaded',
-                  timeout: 120000
+                if (r.status() >= 400 &&
+                    url.includes('/games/postal2/')) {
+                  errors.push(url);
                 }
-              );
-
-              log('HTTP: ' + response.status());
-
-              if (!response.ok()) {
-                throw new Error('Website unavailable');
-              }
-
-              await page.waitForTimeout(120000);
-
-              const info = await page.evaluate(() => ({
-                title: document.title,
-                canvas: document.querySelectorAll(
-                  'canvas'
-                ).length,
-                video: document.querySelectorAll(
-                  'video'
-                ).length,
-                wasm: typeof WebAssembly,
-                isolated: crossOriginIsolated,
-                sharedMemory: typeof SharedArrayBuffer,
-                resources: performance
-                  .getEntriesByType('resource')
-                  .map(r => ({
-                    url: r.name.split('?')[0],
-                    size: r.transferSize
-                  }))
-              }));
-
-              fs.writeFileSync(
-                'logs/resources.json',
-                JSON.stringify(info, null, 2)
-              );
-
-              await page.screenshot({
-                path: 'logs/online.png'
               });
 
-              log('STARTING OFFLINE TEST');
-
-              await context.setOffline(true);
+              page.on('pageerror', e => {
+                log.push('ERROR: ' + e.message);
+                errors.push(e.message);
+              });
 
               try {
-                await page.reload({
-                  waitUntil: 'domcontentloaded',
-                  timeout: 30000
-                });
+                const response = await page.goto(
+                  'https://kahnstation.kahn.lol/gopostal/',
+                  {
+                    waitUntil: 'domcontentloaded',
+                    timeout: 90000
+                  }
+                );
 
-                await page.waitForTimeout(30000);
+                if (!response.ok()) {
+                  errors.push('HTTP ' + response.status());
+                }
+
+                await page.waitForTimeout(90000);
 
                 await page.screenshot({
-                  path: 'logs/offline.png'
+                  path: `logs/${name}.png`
                 });
 
-                log('OFFLINE RELOAD COMPLETED');
+                for (const frame of page.frames()) {
+                  const info = await frame.evaluate(() => ({
+                    title: document.title,
+                    canvas: document.querySelectorAll('canvas').length,
+                    isolated: crossOriginIsolated,
+                    sharedMemory: typeof SharedArrayBuffer
+                  }));
+
+                  log.push(JSON.stringify(info));
+                }
+
               } catch (e) {
-                log('OFFLINE FAILED: ' + e.message);
+                errors.push(e.message);
+              } finally {
+                await browser.close();
               }
 
               fs.writeFileSync(
-                'logs/planned-controls.json',
-                JSON.stringify({
-                  movement: true,
-                  cameraTouch: true,
-                  sprint: true,
-                  crouch: true,
-                  jump: true,
-                  attack: true,
-                  alternateAttack: true,
-                  kick: true,
-                  reload: true,
-                  inventory: true,
-                  map: true,
-                  urinate: true,
-                  firstPerson: 'BehindView 0',
-                  thirdPerson: 'BehindView 1',
-                  mods: 'pending',
-                  multiplayer: 'pending'
-                }, null, 2)
+                `logs/${name}.txt`,
+                log.concat(errors).join('\n')
               );
 
-            } catch (e) {
-              log('FATAL: ' + e.message);
-              process.exitCode = 1;
-            } finally {
-              await browser.close();
+              if (errors.length) failed = true;
             }
+
+            if (failed) process.exitCode = 1;
           })();
           EOF
 
           node test.cjs
 
-      - name: Upload results
+      - name: Upload report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: POSTAL2-V3-REPORT
+          name: POSTAL2-V4-REPORT
           path: logs/
