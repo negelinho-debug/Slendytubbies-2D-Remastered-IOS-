@@ -1,0 +1,375 @@
+
+name: ST3 Multiplayer 2.5 - Preflight x86
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_url:
+        description: "Alternative download URL (optional)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    env:
+      SOURCE_URL: ${{ inputs.source_url }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Prepare folders
+        run: |
+          mkdir -p original reports
+
+          python3 -m pip install gdown==5.2.0
+
+      - name: Download official ST3 2.5 x86
+        run: |
+          set -euo pipefail
+
+          URL="$SOURCE_URL"
+
+          if [ -z "$URL" ]; then
+
+            URL="https://drive.google.com/file/d/13Gt_864N1tWFMSz-fSwF6t4FXeop-XdO/view"
+
+          fi
+
+          gdown --fuzzy "$URL" \
+            -O original/game.archive
+
+          test -s original/game.archive
+
+          ls -lh original/game.archive
+
+          echo "Download completed"
+
+      - name: Inspect original Unity game
+        run: |
+          python3 - <<'PY'
+          import re
+          import zipfile
+          import hashlib
+          from pathlib import Path
+
+          archive = Path(
+              "original/game.archive"
+          )
+
+          report = []
+
+          def log(message):
+              print(message, flush=True)
+              report.append(str(message))
+
+          if not zipfile.is_zipfile(archive):
+              raise RuntimeError(
+                  "Downloaded file is not ZIP"
+              )
+
+          log("ST3 MULTIPLAYER 2.5 x86")
+          log("Requested version: 2.5")
+
+          with zipfile.ZipFile(archive) as z:
+
+              files = [
+                  item for item in z.infolist()
+                  if not item.is_dir()
+              ]
+
+              names = [
+                  item.filename
+                  for item in files
+              ]
+
+              size = archive.stat().st_size
+
+              extracted = sum(
+                  item.file_size
+                  for item in files
+              )
+
+              log(
+                  f"Archive size: "
+                  f"{size / 1048576:.2f} MiB"
+              )
+
+              log(
+                  f"Extracted size: "
+                  f"{extracted / 1048576:.2f} MiB"
+              )
+
+              log(f"Files: {len(names)}")
+
+              Path(
+                  "reports/files.txt"
+              ).write_text(
+                  "\n".join(names)
+              )
+
+              log("")
+              log("=== SCRIPT BACKEND ===")
+
+              managed = [
+                  n for n in names
+                  if "/managed/" in n.lower()
+                  and n.lower().endswith(".dll")
+              ]
+
+              gameplay = [
+                  n for n in managed
+                  if n.lower().endswith(
+                      "/assembly-csharp.dll"
+                  )
+              ]
+
+              il2cpp = [
+                  n for n in names
+                  if n.lower().endswith((
+                      "gameassembly.dll",
+                      "global-metadata.dat",
+                      "libil2cpp.so"
+                  ))
+              ]
+
+              if il2cpp:
+                  backend = "IL2CPP"
+              elif gameplay:
+                  backend = "Mono"
+              else:
+                  backend = "Unknown"
+
+              log("Backend: " + backend)
+
+              Path(
+                  "reports/backend.txt"
+              ).write_text(backend)
+
+              for dll in gameplay:
+
+                  log(
+                      "Original gameplay DLL: "
+                      + dll
+                  )
+
+                  log(
+                      "DLL bytes: "
+                      + str(
+                          z.getinfo(dll).file_size
+                      )
+                  )
+
+              for item in il2cpp:
+                  log("IL2CPP: " + item)
+
+              log("")
+              log("=== UNITY VERSION ===")
+
+              pattern = re.compile(
+                  rb"\b(?:20\d{2}|6000|[3-6])"
+                  rb"\.\d+\.\d+[abfp]\d+\b"
+              )
+
+              versions = set()
+
+              for name in names:
+
+                  if not name.lower().endswith((
+                      "/globalgamemanagers",
+                      "/globalgamemanagers.assets",
+                      "/resources.assets",
+                      "/data.unity3d",
+                      "/maindata"
+                  )):
+                      continue
+
+                  with z.open(name) as f:
+                      data = f.read(4194304)
+
+                  for version in pattern.findall(
+                      data
+                  ):
+                      versions.add(
+                          version.decode()
+                      )
+
+              for version in sorted(versions):
+                  log("Unity candidate: " + version)
+
+              if not versions:
+                  log("Unity version: UNKNOWN")
+
+              log("")
+              log("=== SCENES ===")
+
+              scenes = [
+                  n for n in names
+                  if re.search(
+                      r"/level\d+$",
+                      n,
+                      re.I
+                  )
+              ]
+
+              for scene in scenes:
+                  log(scene)
+
+              log(
+                  f"Standalone scene files: "
+                  f"{len(scenes)}"
+              )
+
+              log("")
+              log("=== MANAGED DLLS ===")
+
+              for dll in managed:
+                  log(dll)
+
+              log("")
+              log("=== NATIVE PLUGINS ===")
+
+              native = [
+                  n for n in names
+                  if "/plugins/" in n.lower()
+                  and n.lower().endswith((
+                      ".dll",
+                      ".so",
+                      ".dylib",
+                      ".bundle"
+                  ))
+                  and n not in managed
+              ]
+
+              for dll in native:
+                  log(dll)
+
+              log("")
+              log("=== ARCHIVE INTEGRITY ===")
+
+              bad = z.testzip()
+
+              if bad:
+                  raise RuntimeError(
+                      "Corrupt archive: " + bad
+                  )
+
+              log("ZIP integrity: OK")
+
+          digest = hashlib.sha256()
+
+          with archive.open("rb") as f:
+
+              for chunk in iter(
+                  lambda: f.read(4194304),
+                  b""
+              ):
+                  digest.update(chunk)
+
+          sha = digest.hexdigest()
+
+          log("SHA256: " + sha)
+
+          old = (
+              "597848bacaddb1e9d0e682ca584ffde3"
+              "fb91a422af5b4e9216d3dee05263efbf"
+          )
+
+          log("")
+          log("=== COMPARISON ===")
+
+          if sha == old:
+              log("Same archive as previous ST3")
+          else:
+              log("Different archive")
+
+          log("")
+          log("=== PORT RESULT ===")
+
+          if backend == "Mono" and versions:
+
+              log("MONO GAMEPLAY DLL FOUND")
+              log("READY FOR RECOVERY ANALYSIS")
+
+          elif backend == "IL2CPP":
+
+              log("IL2CPP DETECTED")
+              log("Original Mono DLL unavailable")
+              log("Do not start IPA yet")
+
+          else:
+
+              log("ADDITIONAL INSPECTION REQUIRED")
+
+          log("Exact game version: not verified")
+          log("Multiplayer compatibility: not tested")
+          log("iOS compatibility: not tested")
+
+          Path(
+              "reports/preflight.txt"
+          ).write_text(
+              "\n".join(report) + "\n"
+          )
+
+          print("PREFLIGHT COMPLETED")
+          PY
+
+      - name: Decide whether to preserve archive
+        id: result
+        run: |
+          BACKEND=$(cat reports/backend.txt)
+
+          if [ "$BACKEND" = "Mono" ]; then
+
+            echo "mono=true" >> "$GITHUB_OUTPUT"
+
+          else
+
+            echo "mono=false" >> "$GITHUB_OUTPUT"
+
+          fi
+
+      - name: Save original Mono game
+        if: steps.result.outputs.mono == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ST3-25-x86-Original
+          path: original/game.archive
+          compression-level: 0
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Upload preflight report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ST3-25-x86-Preflight
+          path: reports/
+          retention-days: 14
+
+      - name: Show final result
+        if: always()
+        run: |
+          echo "# ST3 Multiplayer 2.5 x86" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -f reports/preflight.txt ]; then
+
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+            cat reports/preflight.txt \
+              >> "$GITHUB_STEP_SUMMARY"
+
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+          else
+
+            echo "Download or inspection failed" \
+              >> "$GITHUB_STEP_SUMMARY"
+
+          fi
