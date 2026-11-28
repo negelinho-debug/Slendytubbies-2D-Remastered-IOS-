@@ -1,8 +1,18 @@
 
-name: POSTAL 2 iOS - V8 NATIVE
+name: POSTAL 2 iOS - V9 NATIVE CAMPAIGN
 
 on:
   workflow_dispatch:
+    inputs:
+      game_repo:
+        description: "Private game repository URL"
+        required: true
+        type: string
+      game_path:
+        description: "Folder containing System and Maps"
+        required: true
+        default: "."
+        type: string
 
 permissions:
   contents: read
@@ -10,17 +20,60 @@ permissions:
 jobs:
   native-build:
     runs-on: macos-15
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     env:
       IPHONEOS_DEPLOYMENT_TARGET: "16.0"
       CARGO_TERM_COLOR: never
 
     steps:
-      - name: Download native engine
+      - name: Prepare game repository
+        id: game
+        env:
+          REPO: ${{ inputs.game_repo }}
         run: |
           mkdir -p logs
+          REPO="${REPO#https://github.com/}"
+          REPO="${REPO%/}"
+          REPO="${REPO%.git}"
 
+          [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+
+          echo "repo=$REPO" >> "$GITHUB_OUTPUT"
+
+      - name: Download original campaign
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.game.outputs.repo }}
+          token: ${{ secrets.GAME_REPO_TOKEN || github.token }}
+          path: game
+          lfs: true
+          persist-credentials: false
+
+      - name: Validate campaign
+        env:
+          GAME_PATH: ${{ inputs.game_path }}
+        run: |
+          ROOT="game/$GAME_PATH"
+
+          test -f "$ROOT/System/Core.u"
+          test -f "$ROOT/System/Engine.u"
+          test -d "$ROOT/Maps"
+
+          if [ ! -f "$ROOT/System/Postal2.ini" ]; then
+            test -f "$ROOT/System/Default.ini"
+            cp "$ROOT/System/Default.ini" \
+              "$ROOT/System/Postal2.ini"
+          fi
+
+          find "$ROOT/Maps" -iname '*.fuk' \
+            > logs/maps.txt
+
+          test -s logs/maps.txt
+          du -sh "$ROOT"
+
+      - name: Download native engine
+        run: |
           git clone --depth 1 \
             https://github.com/p2HookedDev/Postal-2-Reimplemented.git \
             engine
@@ -28,72 +81,184 @@ jobs:
           cd engine
           git rev-parse HEAD > ../logs/commit.txt
 
-      - name: Prepare ARM64
+      - name: Prepare iOS ARM64
         working-directory: engine
         run: |
-          rustup show
           rustup target add aarch64-apple-ios
           rustc --version
           xcodebuild -version
-          xcrun --sdk iphoneos --show-sdk-path
 
-      - name: Adapt Vulkan to Metal
+      - name: Fix RFD and Metal
         working-directory: engine
         run: |
           python3 <<'PY'
           from pathlib import Path
 
-          p = Path("crates/p2-game/src/main.rs")
-          s = p.read_text()
+          main = Path("crates/p2-game/src/main.rs")
+          text = main.read_text()
+          assert "Backends::VULKAN" in text
 
-          old = "Backends::VULKAN"
-          new = "Backends::METAL"
-
-          if old not in s:
-              raise RuntimeError(
-                  "Renderer source changed"
+          main.write_text(
+              text.replace(
+                  "Backends::VULKAN",
+                  "Backends::METAL"
               )
+          )
 
-          p.write_text(s.replace(old, new))
+          form = Path(
+              "crates/p2-engine/src/game_dir_form.rs"
+          )
 
-          print("Metal backend selected")
+          text = form.read_text()
+          needle = '            if ui.button("Browse")'
+
+          assert needle in text
+
+          text = text.replace(
+              needle,
+              '            #[cfg(not(target_os = "ios"))]\n'
+              + needle
+          )
+
+          form.write_text(text)
+
+          cargo = Path(
+              "crates/p2-engine/Cargo.toml"
+          )
+
+          text = cargo.read_text()
+          assert "rfd.workspace = true" in text
+
+          text = text.replace(
+              "rfd.workspace = true\n", ""
+          )
+
+          text += """
+          [target.'cfg(not(target_os = "ios"))'.dependencies]
+          rfd.workspace = true
+          """
+
+          cargo.write_text(text)
+
+          p = Path(
+              "crates/p2-engine/src/game_dir.rs"
+          )
+
+          text = p.read_text()
+
+          needle = (
+              "pub fn known_game_dir() -> Option<PathBuf> {"
+          )
+
+          assert needle in text
+
+          text = text.replace(
+              needle,
+              needle + """
+              #[cfg(target_os = "ios")]
+              if let Ok(exe) = std::env::current_exe() {
+                  if let Some(parent) = exe.parent() {
+                      let bundled = parent.join("GameData");
+                      if is_game_dir(&bundled) {
+                          return Some(bundled);
+                      }
+                  }
+              }
+              """
+          )
+
+          p.write_text(text)
+
+          print("iOS patches applied")
           PY
 
           git diff > ../logs/ios.patch
 
-      - name: Compile native ARM64 engine
+      - name: Compile native engine
         working-directory: engine
         run: |
           set -o pipefail
 
           cargo build \
-            --locked \
             -p p2-game \
             --target aarch64-apple-ios \
             --jobs 3 \
             2>&1 | tee ../logs/build.log
 
-      - name: Verify native executable
+      - name: Prepare iOS application
+        env:
+          GAME_PATH: ${{ inputs.game_path }}
         run: |
-          BIN="engine/target/aarch64-apple-ios/debug/p2-game"
+          mkdir -p Payload/Postal2.app/GameData
 
-          test -f "$BIN"
+          cp \
+            engine/target/aarch64-apple-ios/debug/p2-game \
+            Payload/Postal2.app/Postal2
 
-          file "$BIN" | tee logs/binary.txt
-          xcrun lipo -archs "$BIN"
+          chmod +x Payload/Postal2.app/Postal2
 
-          mkdir -p Native
-          cp "$BIN" Native/Postal2
+          xcrun lipo -archs \
+            Payload/Postal2.app/Postal2
 
-      - name: Upload native engine
+          rsync -a --exclude='.git' \
+            "game/$GAME_PATH/" \
+            Payload/Postal2.app/GameData/
+
+          cp engine/LICENSE \
+            Payload/Postal2.app/Engine-LICENSE.txt
+
+      - name: Create Info.plist
+        run: |
+          python3 <<'PY'
+          import plistlib
+
+          info = {
+              "CFBundleName": "Postal2",
+              "CFBundleDisplayName": "POSTAL 2",
+              "CFBundleIdentifier":
+                  "com.projectparadise.postal2",
+              "CFBundleExecutable": "Postal2",
+              "CFBundlePackageType": "APPL",
+              "CFBundleShortVersionString": "9.0",
+              "CFBundleVersion": "9",
+              "MinimumOSVersion": "16.0",
+              "CFBundleSupportedPlatforms": [
+                  "iPhoneOS"
+              ],
+              "UIDeviceFamily": [1],
+              "UIRequiresFullScreen": True,
+              "UILaunchScreen": {},
+              "UISupportedInterfaceOrientations": [
+                  "UIInterfaceOrientationLandscapeLeft",
+                  "UIInterfaceOrientationLandscapeRight"
+              ]
+          }
+
+          with open(
+              "Payload/Postal2.app/Info.plist", "wb"
+          ) as f:
+              plistlib.dump(info, f)
+          PY
+
+      - name: Package campaign IPA
+        run: |
+          test -f Payload/Postal2.app/Postal2
+          test -f Payload/Postal2.app/GameData/System/Core.u
+          test -d Payload/Postal2.app/GameData/Maps
+
+          zip -qry POSTAL2-V9.ipa Payload
+          ls -lh POSTAL2-V9.ipa
+
+      - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: POSTAL2-V8-ARM64
-          path: Native/
+          name: POSTAL2-V9-IPA
+          path: POSTAL2-V9.ipa
+          compression-level: 0
 
-      - name: Upload build logs
+      - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: POSTAL2-V8-LOGS
+          name: POSTAL2-V9-LOGS
           path: logs/
