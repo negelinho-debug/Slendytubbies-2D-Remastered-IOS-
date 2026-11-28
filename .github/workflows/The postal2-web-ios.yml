@@ -1,5 +1,5 @@
 
-name: POSTAL 2 iOS - V6 ONLINE
+name: POSTAL 2 iOS - V8 NATIVE
 
 on:
   workflow_dispatch:
@@ -8,261 +8,92 @@ permissions:
   contents: read
 
 jobs:
-  build-ipa:
+  native-build:
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 60
+
+    env:
+      IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+      CARGO_TERM_COLOR: never
 
     steps:
-      - name: Install build tools
+      - name: Download native engine
         run: |
-          brew install xcodegen
-          mkdir -p App
+          mkdir -p logs
 
-      - name: Create iOS project
+          git clone --depth 1 \
+            https://github.com/p2HookedDev/Postal-2-Reimplemented.git \
+            engine
+
+          cd engine
+          git rev-parse HEAD > ../logs/commit.txt
+
+      - name: Prepare ARM64
+        working-directory: engine
         run: |
-          cat > project.yml <<'EOF'
-          name: Postal2
-          options:
-            deploymentTarget:
-              iOS: "16.0"
-          targets:
-            Postal2:
-              type: application
-              platform: iOS
-              sources:
-                - App
-              info:
-                path: Info.plist
-                properties:
-                  CFBundleDisplayName: POSTAL 2
-                  CFBundleShortVersionString: "6.0"
-                  CFBundleVersion: "6"
-                  UILaunchScreen: {}
-                  UIRequiresFullScreen: true
-                  UIViewControllerBasedStatusBarAppearance: true
-                  UISupportedInterfaceOrientations:
-                    - UIInterfaceOrientationLandscapeLeft
-                    - UIInterfaceOrientationLandscapeRight
-              settings:
-                base:
-                  PRODUCT_BUNDLE_IDENTIFIER: com.projectparadise.postal2
-                  CODE_SIGNING_ALLOWED: NO
-                  TARGETED_DEVICE_FAMILY: "1"
-                  CLANG_ENABLE_OBJC_ARC: YES
-              dependencies:
-                - sdk: WebKit.framework
-          EOF
+          rustup show
+          rustup target add aarch64-apple-ios
+          rustc --version
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
 
-          cat > App/main.m <<'EOF'
-          #import <UIKit/UIKit.h>
-          #import <WebKit/WebKit.h>
+      - name: Adapt Vulkan to Metal
+        working-directory: engine
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
 
-          @interface GameController : UIViewController
-          <WKNavigationDelegate>
+          p = Path("crates/p2-game/src/main.rs")
+          s = p.read_text()
 
-          @property(nonatomic,strong) WKWebView *web;
-          @property(nonatomic,strong) UIButton *retry;
+          old = "Backends::VULKAN"
+          new = "Backends::METAL"
 
-          @end
+          if old not in s:
+              raise RuntimeError(
+                  "Renderer source changed"
+              )
 
-          @implementation GameController
+          p.write_text(s.replace(old, new))
 
-          - (BOOL)prefersStatusBarHidden {
-            return YES;
-          }
+          print("Metal backend selected")
+          PY
 
-          - (BOOL)prefersHomeIndicatorAutoHidden {
-            return YES;
-          }
+          git diff > ../logs/ios.patch
 
-          - (UIInterfaceOrientationMask)supportedInterfaceOrientations {
-            return UIInterfaceOrientationMaskLandscape;
-          }
-
-          - (void)viewDidLoad {
-            [super viewDidLoad];
-
-            self.view.backgroundColor = UIColor.blackColor;
-
-            WKWebViewConfiguration *config =
-              [[WKWebViewConfiguration alloc] init];
-
-            config.websiteDataStore =
-              [WKWebsiteDataStore defaultDataStore];
-
-            config.defaultWebpagePreferences
-              .allowsContentJavaScript = YES;
-
-            config.allowsInlineMediaPlayback = YES;
-
-            config.mediaTypesRequiringUserActionForPlayback =
-              WKAudiovisualMediaTypeNone;
-
-            self.web = [[WKWebView alloc]
-              initWithFrame:self.view.bounds
-              configuration:config];
-
-            self.web.navigationDelegate = self;
-
-            self.web.autoresizingMask =
-              UIViewAutoresizingFlexibleWidth |
-              UIViewAutoresizingFlexibleHeight;
-
-            self.web.backgroundColor = UIColor.blackColor;
-            self.web.opaque = NO;
-            self.web.scrollView.bounces = NO;
-
-            self.web.scrollView.contentInsetAdjustmentBehavior =
-              UIScrollViewContentInsetAdjustmentNever;
-
-            [self.view addSubview:self.web];
-
-            self.retry = [UIButton
-              buttonWithType:UIButtonTypeSystem];
-
-            self.retry.frame = CGRectMake(
-              20, 20, 220, 45
-            );
-
-            [self.retry
-              setTitle:@"Retry connection"
-              forState:UIControlStateNormal];
-
-            self.retry.backgroundColor =
-              UIColor.darkGrayColor;
-
-            self.retry.tintColor =
-              UIColor.whiteColor;
-
-            self.retry.layer.cornerRadius = 10;
-
-            [self.retry
-              addTarget:self
-              action:@selector(loadGame)
-              forControlEvents:UIControlEventTouchUpInside];
-
-            self.retry.hidden = YES;
-
-            [self.view addSubview:self.retry];
-
-            [self loadGame];
-          }
-
-          - (void)loadGame {
-
-            self.retry.hidden = YES;
-
-            NSURL *url = [NSURL URLWithString:
-              @"https://kahnstation.kahn.lol/gopostal/"];
-
-            NSMutableURLRequest *request =
-              [NSMutableURLRequest
-                requestWithURL:url];
-
-            request.allowsCellularAccess = YES;
-            request.timeoutInterval = 180;
-
-            [self.web loadRequest:request];
-          }
-
-          - (void)webView:(WKWebView *)webView
-          didFailProvisionalNavigation:(WKNavigation *)navigation
-          withError:(NSError *)error {
-
-            self.retry.hidden = NO;
-          }
-
-          - (void)webView:(WKWebView *)webView
-          didFailNavigation:(WKNavigation *)navigation
-          withError:(NSError *)error {
-
-            self.retry.hidden = NO;
-          }
-
-          - (void)webViewWebContentProcessDidTerminate:
-          (WKWebView *)webView {
-
-            self.retry.hidden = NO;
-          }
-
-          @end
-
-          @interface AppDelegate : UIResponder
-          <UIApplicationDelegate>
-
-          @property(nonatomic,strong) UIWindow *window;
-
-          @end
-
-          @implementation AppDelegate
-
-          - (BOOL)application:(UIApplication *)application
-          didFinishLaunchingWithOptions:(NSDictionary *)options {
-
-            self.window = [[UIWindow alloc]
-              initWithFrame:UIScreen.mainScreen.bounds];
-
-            self.window.rootViewController =
-              [[GameController alloc] init];
-
-            [self.window makeKeyAndVisible];
-
-            return YES;
-          }
-
-          @end
-
-          int main(int argc, char *argv[]) {
-            @autoreleasepool {
-              return UIApplicationMain(
-                argc, argv, nil,
-                NSStringFromClass([AppDelegate class]));
-            }
-          }
-          EOF
-
-          xcodegen generate
-
-      - name: Build iPhone application
+      - name: Compile native ARM64 engine
+        working-directory: engine
         run: |
           set -o pipefail
 
-          xcodebuild \
-            -project Postal2.xcodeproj \
-            -scheme Postal2 \
-            -configuration Release \
-            -sdk iphoneos \
-            -destination 'generic/platform=iOS' \
-            -derivedDataPath Build \
-            ARCHS=arm64 \
-            CODE_SIGNING_ALLOWED=NO \
-            build 2>&1 | tee build.log
+          cargo build \
+            --locked \
+            -p p2-game \
+            --target aarch64-apple-ios \
+            --jobs 3 \
+            2>&1 | tee ../logs/build.log
 
-      - name: Create IPA
+      - name: Verify native executable
         run: |
-          mkdir -p Payload
+          BIN="engine/target/aarch64-apple-ios/debug/p2-game"
 
-          cp -R \
-            Build/Build/Products/Release-iphoneos/Postal2.app \
-            Payload/
+          test -f "$BIN"
 
-          test -f Payload/Postal2.app/Postal2
+          file "$BIN" | tee logs/binary.txt
+          xcrun lipo -archs "$BIN"
 
-          zip -qry POSTAL2-V6.ipa Payload
+          mkdir -p Native
+          cp "$BIN" Native/Postal2
 
-          ls -lh POSTAL2-V6.ipa
-
-      - name: Upload IPA
+      - name: Upload native engine
         uses: actions/upload-artifact@v4
         with:
-          name: POSTAL2-V6-IPA
-          path: POSTAL2-V6.ipa
-          compression-level: 0
+          name: POSTAL2-V8-ARM64
+          path: Native/
 
       - name: Upload build logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: POSTAL2-V6-LOGS
-          path: build.log
-          if-no-files-found: ignore
+          name: POSTAL2-V8-LOGS
+          path: logs/
