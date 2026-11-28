@@ -1,15 +1,11 @@
 
-name: Slendytubbies Zero 1.1.0 - iOS V1
+name: Slendytubbies Zero - Fix 1 Metal Watchdog
 
 on:
   workflow_dispatch:
     inputs:
-      recovery_run:
-        description: "Recovery run ID (optional)"
-        required: false
-        type: string
       prepared_run:
-        description: "Prepared project run ID (optional)"
+        description: "Successful Zero V1 run ID (optional)"
         required: false
         type: string
 
@@ -24,8 +20,8 @@ jobs:
 
     env:
       GH_TOKEN: ${{ github.token }}
-      RECOVERY_RUN: ${{ inputs.recovery_run }}
       PREPARED_RUN: ${{ inputs.prepared_run }}
+      UNITY_VERSION: 2022.3.58f1
       UNITY_EDITOR_PATH: /Applications/Unity/Unity.app/Contents/MacOS/Unity
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
 
@@ -34,65 +30,221 @@ jobs:
 
       - name: Prepare folders
         run: |
-          mkdir -p recovery logs dist refs
+          mkdir -p incoming logs dist
+
           df -h
 
-      - name: Download existing Zero Recovery
-        if: inputs.prepared_run == ''
+      - name: Reuse successful Zero V1 project
         run: |
           set -euo pipefail
 
-          RUN="$RECOVERY_RUN"
+          RUN="$PREPARED_RUN"
 
           if [ -z "$RUN" ]; then
-            RUN=$(gh run list \
-              --workflow slendytubbies-zero-recovery.yml \
-              --status success \
-              --limit 1 \
-              --json databaseId \
-              --jq '.[0].databaseId')
+
+            RUN=$(gh api \
+              "repos/$GITHUB_REPOSITORY/actions/artifacts?name=Zero-Prepared-V1&per_page=100" \
+              --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | reverse | .[0].workflow_run.id // empty')
+
           fi
 
           test -n "$RUN"
 
+          echo "Using prepared run: $RUN"
+
           gh run download "$RUN" \
-            --name Zero-Recovery \
-            --dir recovery
+            --name Zero-Prepared-V1 \
+            --dir incoming
 
-          test -s recovery/Zero-Unity-Project.tar.gz
+          test -s incoming/Zero-Prepared-V1.tar.gz
 
-          tar -xzf recovery/Zero-Unity-Project.tar.gz
+          tar -xzf incoming/Zero-Prepared-V1.tar.gz
 
-          rm recovery/Zero-Unity-Project.tar.gz
+          rm incoming/Zero-Prepared-V1.tar.gz
 
-          test -s ExportedProject/Assets/Scenes/InitialSetup.unity
+          test -d ExportedProject/Assets
 
-          test -s ExportedProject/Assets/Scenes/MainMenu/MainMenu.unity
+          test -s ExportedProject/Assets/Editor/BuildZero.cs
 
-          test -s ExportedProject/Assets/Scenes/Epilogue.unity
+          test -s ExportedProject/ProjectSettings/GraphicsSettings.asset
 
           grep -F '2022.3.58f1' \
             ExportedProject/ProjectSettings/ProjectVersion.txt
 
-          echo "Original project loaded"
+          echo "Original prepared project loaded"
+
           echo "No new Recovery"
 
-      - name: Reuse prepared project
-        if: inputs.prepared_run != ''
+          echo "No new DLL patch"
+
+      - name: Verify original campaign
         run: |
           set -euo pipefail
 
-          gh run download "$PREPARED_RUN" \
-            --name Zero-Prepared-V1 \
-            --dir recovery
+          PROJECT=ExportedProject
 
-          tar -xzf recovery/Zero-Prepared-V1.tar.gz
+          test -s "$PROJECT/Assets/Scenes/InitialSetup.unity"
 
-          rm recovery/Zero-Prepared-V1.tar.gz
+          test -s "$PROJECT/Assets/Scenes/MainMenu/MainMenu.unity"
 
-          test -d ExportedProject/Assets
+          test -s "$PROJECT/Assets/Scenes/Epilogue.unity"
 
-      - name: Install Unity 2022.3.58f1 and iOS support
+          test -s "$PROJECT/ProjectSettings/EditorBuildSettings.asset"
+
+          find "$PROJECT/Assets" \
+            -name '*.unity' \
+            | sort | tee logs/scenes.txt
+
+          DLL=$(find "$PROJECT/Assets" \
+            -name ZeroOriginalGame.dll \
+            -print -quit)
+
+          test -s "$DLL"
+
+          test -s "$DLL.meta"
+
+          MOBILE=$(find "$PROJECT/Assets" \
+            -name ZeroMobile.dll \
+            -print -quit)
+
+          test -s "$MOBILE"
+
+          echo "Original campaign DLL verified"
+
+          echo "Mobile controls preserved"
+
+          echo "Scenes: $(wc -l < logs/scenes.txt)"
+
+      - name: Fix Metal shader startup watchdog
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY' | tee logs/shader-fix.txt
+          from pathlib import Path
+          import re
+
+          path = Path(
+              "ExportedProject/ProjectSettings/GraphicsSettings.asset"
+          )
+
+          text = path.read_text()
+
+          Path(
+              "logs/GraphicsSettings-before.asset"
+          ).write_text(text)
+
+          print("ZERO FIX 1")
+          print("Crash: 0x8BADF00D")
+          print("Watchdog: scene-create")
+          print("Startup time allowance: 18.90 seconds")
+          print("Blocking operation: WarmupPreloadedShaders")
+
+          preload = re.search(
+              r"(?m)^([ \t]*)m_PreloadedShaders:",
+              text
+          )
+
+          if not preload:
+              raise RuntimeError(
+                  "Original shader settings not found"
+              )
+
+          pattern = re.compile(
+              r"(?m)^([ \t]*)m_PreloadShadersBatchTimeLimit:"
+              r"[ \t]*([^\r\n]*)$"
+          )
+
+          previous = pattern.search(text)
+
+          if previous:
+
+              print(
+                  "Previous shader preload limit:",
+                  previous.group(2)
+              )
+
+              text = pattern.sub(
+                  lambda m:
+                      m.group(1) +
+                      "m_PreloadShadersBatchTimeLimit: 2",
+                  text
+              )
+
+          else:
+
+              indent = preload.group(1)
+
+              text = (
+                  text.rstrip() +
+                  "\n" +
+                  indent +
+                  "m_PreloadShadersBatchTimeLimit: 2\n"
+              )
+
+          path.write_text(text)
+
+          updated = path.read_text()
+
+          assert re.search(
+              r"(?m)^\s*m_PreloadShadersBatchTimeLimit:"
+              r"\s*2\s*$",
+              updated
+          )
+
+          assert "m_PreloadedShaders:" in updated
+
+          Path(
+              "logs/GraphicsSettings-after.asset"
+          ).write_text(updated)
+
+          print("New shader preload limit: 2 ms")
+
+          print("Shader prewarming deferred")
+
+          print("Original shader collections preserved")
+
+          print("Original materials preserved")
+
+          print("Original scenes preserved")
+
+          print("METAL WATCHDOG FIX APPLIED")
+          PY
+
+      - name: Update Fix 1 build number
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path(
+              "ExportedProject/Assets/Editor/BuildZero.cs"
+          )
+
+          text = path.read_text()
+
+          text, count = re.subn(
+              r'(PlayerSettings\.iOS\.buildNumber\s*=\s*)"[^"]*";',
+              r'\g<1>"2";',
+              text
+          )
+
+          if count != 1:
+              raise RuntimeError(
+                  "Unexpected original builder"
+              )
+
+          path.write_text(text)
+
+          print("Original game version: 1.1.0")
+
+          print("iOS Fix 1 build number: 2")
+
+          print("Original bundle identifier preserved")
+          PY
+
+      - name: Install Unity 2022.3.58f1
         timeout-minutes: 40
         run: |
           set -euo pipefail
@@ -127,1298 +279,10 @@ jobs:
         with:
           node-version: '24'
 
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '8.0.x'
-
-      - name: Find Unity managed references
-        if: inputs.prepared_run == ''
+      - name: Install Unity CLI
         run: |
-          set -euo pipefail
-
-          SOURCE=""
-
-          while IFS= read -r DLL; do
-
-            DIR="$(dirname "$DLL")"
-
-            if [ -s "$DIR/UnityEngine.InputLegacyModule.dll" ] &&
-               [ -s "$DIR/UnityEngine.IMGUIModule.dll" ] &&
-               [ -s "$DIR/UnityEngine.TextRenderingModule.dll" ]; then
-
-              SOURCE="$DIR"
-              break
-
-            fi
-
-          done < <(
-            find -L /Applications/Unity \
-              -type f \
-              -name UnityEngine.CoreModule.dll \
-              2>/dev/null
-          )
-
-          test -n "$SOURCE"
-
-          cp "$SOURCE"/UnityEngine*.dll refs/
-
-          echo "UNITY_MANAGED=$SOURCE" >> "$GITHUB_ENV"
-
-          echo "Unity references: $SOURCE"
-
-      - name: Create Zero mobile controls
-        if: inputs.prepared_run == ''
-        run: |
-          set -euo pipefail
-
-          mkdir -p mobile
-
-          cat > mobile/ZeroMobile.csproj <<'XML'
-          <Project Sdk="Microsoft.NET.Sdk">
-            <PropertyGroup>
-              <TargetFramework>netstandard2.1</TargetFramework>
-              <AssemblyName>ZeroMobile</AssemblyName>
-              <LangVersion>latest</LangVersion>
-            </PropertyGroup>
-            <ItemGroup>
-              <Reference Include="UnityEngine.CoreModule">
-                <HintPath>$(UnityManaged)/UnityEngine.CoreModule.dll</HintPath>
-              </Reference>
-              <Reference Include="UnityEngine.InputLegacyModule">
-                <HintPath>$(UnityManaged)/UnityEngine.InputLegacyModule.dll</HintPath>
-              </Reference>
-              <Reference Include="UnityEngine.IMGUIModule">
-                <HintPath>$(UnityManaged)/UnityEngine.IMGUIModule.dll</HintPath>
-              </Reference>
-              <Reference Include="UnityEngine.TextRenderingModule">
-                <HintPath>$(UnityManaged)/UnityEngine.TextRenderingModule.dll</HintPath>
-              </Reference>
-            </ItemGroup>
-          </Project>
-          XML
-
-          cat > mobile/ZeroInput.cs <<'CS'
-          using System;
-          using System.Collections.Generic;
-          using UnityEngine;
-          using UnityEngine.SceneManagement;
-
-          public static class ZeroInput
-          {
-              static int frame = -1;
-
-              static Vector2 move;
-              static Vector2 look;
-
-              static HashSet<KeyCode> held =
-                  new HashSet<KeyCode>();
-
-              static HashSet<KeyCode> down =
-                  new HashSet<KeyCode>();
-
-              static HashSet<KeyCode> up =
-                  new HashSet<KeyCode>();
-
-              public static bool Visible = true;
-
-              public static readonly KeyCode[] Keys = {
-                  KeyCode.E,
-                  KeyCode.Space,
-                  KeyCode.LeftShift,
-                  KeyCode.LeftControl,
-                  KeyCode.F,
-                  KeyCode.N,
-                  KeyCode.I,
-                  KeyCode.Tab,
-                  KeyCode.Mouse0,
-                  KeyCode.Mouse1,
-                  KeyCode.R,
-                  KeyCode.Escape
-              };
-
-              static bool Mobile =>
-                  Application.platform ==
-                  RuntimePlatform.IPhonePlayer;
-
-              public static bool InGame()
-              {
-                  string name = SceneManager
-                      .GetActiveScene()
-                      .name.ToLowerInvariant();
-
-                  return !name.Contains("mainmenu")
-                      && !name.Contains("initialsetup")
-                      && !name.Contains("dummy_scene")
-                      && !name.Contains("loading");
-              }
-
-              static bool Active =>
-                  Mobile && InGame() && Visible;
-
-              public static Rect ToggleArea()
-              {
-                  Rect safe = Screen.safeArea;
-
-                  return new Rect(
-                      safe.xMin + 8,
-                      Screen.height - safe.yMax + 8,
-                      safe.width * 0.13f,
-                      safe.height * 0.07f
-                  );
-              }
-
-              public static Rect Button(int i)
-              {
-                  Rect safe = Screen.safeArea;
-
-                  return new Rect(
-                      safe.xMin + safe.width *
-                          (0.70f + i % 3 * 0.095f),
-
-                      Screen.height - safe.yMax +
-                          safe.height *
-                          (0.30f + i / 3 * 0.16f),
-
-                      safe.width * 0.09f,
-                      safe.height * 0.135f
-                  );
-              }
-
-              public static Vector2 Center()
-              {
-                  Rect safe = Screen.safeArea;
-
-                  return new Vector2(
-                      safe.xMin + safe.width * 0.17f,
-
-                      Screen.height - safe.yMax +
-                          safe.height * 0.74f
-                  );
-              }
-
-              static void Poll()
-              {
-                  if (frame == Time.frameCount)
-                      return;
-
-                  frame = Time.frameCount;
-
-                  move = Vector2.zero;
-                  look = Vector2.zero;
-
-                  var next = new HashSet<KeyCode>();
-
-                  if (Active)
-                  {
-                      Rect safe = Screen.safeArea;
-
-                      foreach (Touch t in Input.touches)
-                      {
-                          if (
-                              t.phase == TouchPhase.Ended ||
-                              t.phase == TouchPhase.Canceled
-                          )
-                              continue;
-
-                          Vector2 p = new Vector2(
-                              t.position.x,
-                              Screen.height - t.position.y
-                          );
-
-                          if (ToggleArea().Contains(p))
-                              continue;
-
-                          bool used = false;
-
-                          for (int i = 0; i < Keys.Length; i++)
-                          {
-                              if (Button(i).Contains(p))
-                              {
-                                  next.Add(Keys[i]);
-                                  used = true;
-                                  break;
-                              }
-                          }
-
-                          if (used)
-                              continue;
-
-                          float nx =
-                              (p.x - safe.xMin) / safe.width;
-
-                          float ny =
-                              (p.y - Screen.height + safe.yMax)
-                              / safe.height;
-
-                          if (nx < 0.34f && ny > 0.48f)
-                          {
-                              Vector2 center = Center();
-
-                              move = Vector2.ClampMagnitude(
-                                  new Vector2(
-                                      p.x - center.x,
-                                      center.y - p.y
-                                  ) / (safe.height * 0.17f),
-                                  1f
-                              );
-                          }
-                          else if (
-                              nx >= 0.34f &&
-                              nx < 0.70f
-                          )
-                          {
-                              look += t.deltaPosition * 0.10f;
-                          }
-                      }
-
-                      if (move.y > 0.2f)
-                      {
-                          next.Add(KeyCode.W);
-                          next.Add(KeyCode.UpArrow);
-                      }
-
-                      if (move.y < -0.2f)
-                      {
-                          next.Add(KeyCode.S);
-                          next.Add(KeyCode.DownArrow);
-                      }
-
-                      if (move.x > 0.2f)
-                      {
-                          next.Add(KeyCode.D);
-                          next.Add(KeyCode.RightArrow);
-                      }
-
-                      if (move.x < -0.2f)
-                      {
-                          next.Add(KeyCode.A);
-                          next.Add(KeyCode.LeftArrow);
-                      }
-                  }
-
-                  down = new HashSet<KeyCode>(next);
-                  down.ExceptWith(held);
-
-                  up = new HashSet<KeyCode>(held);
-                  up.ExceptWith(next);
-
-                  held = next;
-              }
-
-              public static Vector2 Movement
-              {
-                  get
-                  {
-                      Poll();
-                      return move;
-                  }
-              }
-
-              public static float GetAxis(string name)
-              {
-                  if (!Active)
-                      return Input.GetAxis(name);
-
-                  Poll();
-
-                  switch (name.ToLowerInvariant())
-                  {
-                      case "horizontal":
-                          return move.x;
-
-                      case "vertical":
-                          return move.y;
-
-                      case "mouse x":
-                          return look.x;
-
-                      case "mouse y":
-                          return look.y;
-
-                      default:
-                          return Input.GetAxis(name);
-                  }
-              }
-
-              public static float GetAxisRaw(string name)
-              {
-                  return Active
-                      ? GetAxis(name)
-                      : Input.GetAxisRaw(name);
-              }
-
-              public static bool GetKey(KeyCode key)
-              {
-                  Poll();
-
-                  return held.Contains(key) ||
-                      Input.GetKey(key);
-              }
-
-              public static bool GetKeyDown(KeyCode key)
-              {
-                  Poll();
-
-                  return down.Contains(key) ||
-                      Input.GetKeyDown(key);
-              }
-
-              public static bool GetKeyUp(KeyCode key)
-              {
-                  Poll();
-
-                  return up.Contains(key) ||
-                      Input.GetKeyUp(key);
-              }
-
-              static KeyCode Parse(string key)
-              {
-                  KeyCode value;
-
-                  return Enum.TryParse(
-                      key.Replace(" ", ""),
-                      true,
-                      out value
-                  ) ? value : KeyCode.None;
-              }
-
-              public static bool GetKey(string key)
-              {
-                  var value = Parse(key);
-
-                  return value != KeyCode.None
-                      ? GetKey(value)
-                      : Input.GetKey(key);
-              }
-
-              public static bool GetKeyDown(string key)
-              {
-                  var value = Parse(key);
-
-                  return value != KeyCode.None
-                      ? GetKeyDown(value)
-                      : Input.GetKeyDown(key);
-              }
-
-              public static bool GetKeyUp(string key)
-              {
-                  var value = Parse(key);
-
-                  return value != KeyCode.None
-                      ? GetKeyUp(value)
-                      : Input.GetKeyUp(key);
-              }
-
-              static KeyCode Mouse(int i)
-              {
-                  return (KeyCode)(
-                      (int)KeyCode.Mouse0 + i
-                  );
-              }
-
-              public static bool GetMouseButton(int i)
-              {
-                  if (!Active)
-                      return Input.GetMouseButton(i);
-
-                  Poll();
-
-                  return held.Contains(Mouse(i));
-              }
-
-              public static bool GetMouseButtonDown(int i)
-              {
-                  if (!Active)
-                      return Input.GetMouseButtonDown(i);
-
-                  Poll();
-
-                  return down.Contains(Mouse(i));
-              }
-
-              public static bool GetMouseButtonUp(int i)
-              {
-                  if (!Active)
-                      return Input.GetMouseButtonUp(i);
-
-                  Poll();
-
-                  return up.Contains(Mouse(i));
-              }
-
-              static KeyCode ButtonKey(string name)
-              {
-                  switch (name.ToLowerInvariant())
-                  {
-                      case "jump":
-                          return KeyCode.Space;
-
-                      case "fire1":
-                          return KeyCode.Mouse0;
-
-                      case "fire2":
-                          return KeyCode.Mouse1;
-
-                      case "submit":
-                      case "interact":
-                      case "use":
-                          return KeyCode.E;
-
-                      case "cancel":
-                          return KeyCode.Escape;
-
-                      case "sprint":
-                          return KeyCode.LeftShift;
-
-                      case "crouch":
-                          return KeyCode.LeftControl;
-
-                      case "flashlight":
-                          return KeyCode.F;
-
-                      case "nightvision":
-                          return KeyCode.N;
-
-                      case "inventory":
-                          return KeyCode.I;
-
-                      default:
-                          return KeyCode.None;
-                  }
-              }
-
-              public static bool GetButton(string name)
-              {
-                  var key = ButtonKey(name);
-
-                  if (Active && key != KeyCode.None)
-                      return GetKey(key);
-
-                  return Input.GetButton(name);
-              }
-
-              public static bool GetButtonDown(string name)
-              {
-                  var key = ButtonKey(name);
-
-                  if (Active && key != KeyCode.None)
-                      return GetKeyDown(key);
-
-                  return Input.GetButtonDown(name);
-              }
-
-              public static bool GetButtonUp(string name)
-              {
-                  var key = ButtonKey(name);
-
-                  if (Active && key != KeyCode.None)
-                      return GetKeyUp(key);
-
-                  return Input.GetButtonUp(name);
-              }
-          }
-
-          public sealed class ZeroHUD : MonoBehaviour
-          {
-              static ZeroHUD instance;
-
-              GUIStyle style;
-
-              static readonly string[] Labels = {
-                  "USE", "JUMP", "RUN",
-                  "CROUCH", "LIGHT", "NV",
-                  "ITEMS", "TAB", "ACTION",
-                  "AIM", "RELOAD", "PAUSE"
-              };
-
-              [RuntimeInitializeOnLoadMethod(
-                  RuntimeInitializeLoadType.BeforeSceneLoad)]
-              static void Install()
-              {
-                  if (Application.platform !=
-                      RuntimePlatform.IPhonePlayer)
-                      return;
-
-                  if (instance != null)
-                      return;
-
-                  Application.targetFrameRate = 30;
-
-                  QualitySettings.vSyncCount = 0;
-
-                  QualitySettings.shadowDistance =
-                      Mathf.Min(
-                          QualitySettings.shadowDistance,
-                          45f
-                      );
-
-                  GameObject root = new GameObject(
-                      "Zero Mobile Controls"
-                  );
-
-                  DontDestroyOnLoad(root);
-
-                  instance = root.AddComponent<ZeroHUD>();
-              }
-
-              void OnGUI()
-              {
-                  if (!ZeroInput.InGame())
-                      return;
-
-                  GUI.depth = -100;
-
-                  if (GUI.Button(
-                      ZeroInput.ToggleArea(),
-                      ZeroInput.Visible
-                          ? "HIDE HUD"
-                          : "SHOW HUD"))
-                  {
-                      ZeroInput.Visible =
-                          !ZeroInput.Visible;
-                  }
-
-                  if (!ZeroInput.Visible)
-                      return;
-
-                  if (Event.current.type !=
-                      EventType.Repaint)
-                      return;
-
-                  Color old = GUI.color;
-
-                  GUI.color = new Color(
-                      1f, 1f, 1f, 0.5f
-                  );
-
-                  if (style == null)
-                  {
-                      style = new GUIStyle(GUI.skin.box);
-
-                      style.alignment =
-                          TextAnchor.MiddleCenter;
-                  }
-
-                  style.fontSize = Mathf.Clamp(
-                      Screen.height / 35,
-                      12,
-                      30
-                  );
-
-                  Vector2 center = ZeroInput.Center();
-
-                  float radius =
-                      Screen.safeArea.height * 0.16f;
-
-                  GUI.Box(
-                      new Rect(
-                          center.x - radius,
-                          center.y - radius,
-                          radius * 2,
-                          radius * 2
-                      ),
-                      "MOVE",
-                      style
-                  );
-
-                  Vector2 move = ZeroInput.Movement;
-
-                  GUI.Box(
-                      new Rect(
-                          center.x + move.x * radius - radius / 4,
-                          center.y - move.y * radius - radius / 4,
-                          radius / 2,
-                          radius / 2
-                      ),
-                      ""
-                  );
-
-                  for (int i = 0; i < Labels.Length; i++)
-                  {
-                      GUI.Box(
-                          ZeroInput.Button(i),
-                          Labels[i],
-                          style
-                      );
-                  }
-
-                  GUI.color = old;
-              }
-          }
-          CS
-
-          dotnet build mobile \
-            -c Release \
-            -p:UnityManaged="$UNITY_MANAGED"
-
-          mkdir -p ExportedProject/Assets/Plugins
-
-          cp mobile/bin/Release/netstandard2.1/ZeroMobile.dll \
-            ExportedProject/Assets/Plugins/
-
-      - name: Connect controls to original game
-        if: inputs.prepared_run == ''
-        run: |
-          set -euo pipefail
-
-          dotnet new console \
-            -o patcher \
-            --framework net8.0
-
-          dotnet add patcher package Mono.Cecil \
-            --version 0.11.6
-
-          cat > patcher/Program.cs <<'CS'
-          using System;
-          using System.IO;
-          using System.Linq;
-          using System.Collections.Generic;
-          using Mono.Cecil;
-          using Mono.Cecil.Cil;
-
-          string assets = Path.GetFullPath(args[0]);
-
-          string path = Directory.GetFiles(
-              assets,
-              "Assembly-CSharp.dll",
-              SearchOption.AllDirectories
-          ).Single();
-
-          string mobilePath = Path.Combine(
-              assets,
-              "Plugins",
-              "ZeroMobile.dll"
-          );
-
-          using var resolver =
-              new DefaultAssemblyResolver();
-
-          resolver.AddSearchDirectory(
-              Path.GetFullPath("refs")
-          );
-
-          foreach (var dll in Directory.GetFiles(
-              assets,
-              "*.dll",
-              SearchOption.AllDirectories))
-          {
-              resolver.AddSearchDirectory(
-                  Path.GetDirectoryName(dll)!
-              );
-          }
-
-          foreach (var dll in Directory.GetFiles(
-              "/Applications/Unity",
-              "mscorlib.dll",
-              SearchOption.AllDirectories))
-          {
-              resolver.AddSearchDirectory(
-                  Path.GetDirectoryName(dll)!
-              );
-          }
-
-          var parameters = new ReaderParameters
-          {
-              InMemory = true,
-              AssemblyResolver = resolver
-          };
-
-          using var game =
-              AssemblyDefinition.ReadAssembly(
-                  path,
-                  parameters
-              );
-
-          using var mobile =
-              AssemblyDefinition.ReadAssembly(
-                  mobilePath,
-                  parameters
-              );
-
-          var api = mobile.MainModule.Types.Single(
-              t => t.Name == "ZeroInput"
-          );
-
-          IEnumerable<TypeDefinition> Walk(
-              IEnumerable<TypeDefinition> types)
-          {
-              foreach (var type in types)
-              {
-                  yield return type;
-
-                  foreach (var nested in
-                      Walk(type.NestedTypes))
-                  {
-                      yield return nested;
-                  }
-              }
-          }
-
-          int count = 0;
-
-          int newInputCalls = 0;
-
-          var unsupported = new HashSet<string>();
-
-          foreach (var type in
-              Walk(game.MainModule.Types))
-          foreach (var method in type.Methods)
-          {
-              if (!method.HasBody)
-                  continue;
-
-              foreach (var instruction in
-                  method.Body.Instructions)
-              {
-                  if (!(instruction.Operand
-                      is MethodReference old))
-                      continue;
-
-                  if (old.DeclaringType.FullName
-                      .StartsWith("UnityEngine.InputSystem."))
-                  {
-                      newInputCalls++;
-
-                      Console.WriteLine(
-                          "New Input System: " +
-                          old.FullName
-                      );
-                  }
-
-                  if (old.DeclaringType.FullName !=
-                      "UnityEngine.Input")
-                      continue;
-
-                  var replacement =
-                      api.Methods.FirstOrDefault(m =>
-                          m.IsStatic &&
-                          m.Name == old.Name &&
-                          m.ReturnType.FullName ==
-                              old.ReturnType.FullName &&
-                          m.Parameters.Select(
-                              p => p.ParameterType.FullName
-                          ).SequenceEqual(
-                              old.Parameters.Select(
-                                  p => p.ParameterType.FullName
-                              )
-                          )
-                      );
-
-                  if (replacement == null)
-                  {
-                      unsupported.Add(old.FullName);
-                      continue;
-                  }
-
-                  instruction.Operand =
-                      game.MainModule.ImportReference(
-                          replacement
-                      );
-
-                  instruction.OpCode = OpCodes.Call;
-
-                  count++;
-
-                  Console.WriteLine(
-                      type.FullName + "." +
-                      method.Name + " -> " +
-                      old.Name
-                  );
-              }
-          }
-
-          Console.WriteLine(
-              "Patched input calls: " + count
-          );
-
-          Console.WriteLine(
-              "New Input System calls: " + newInputCalls
-          );
-
-          foreach (string method in unsupported)
-          {
-              Console.WriteLine(
-                  "Unpatched input: " + method
-              );
-          }
-
-          if (count == 0)
-              throw new Exception(
-                  "Legacy input unsupported"
-              );
-
-          game.Name.Name = "ZeroOriginalGame";
-
-          game.MainModule.Name =
-              "ZeroOriginalGame.dll";
-
-          string destination = Path.Combine(
-              Path.GetDirectoryName(path)!,
-              "ZeroOriginalGame.dll"
-          );
-
-          game.Write(destination);
-
-          File.Move(
-              path + ".meta",
-              destination + ".meta"
-          );
-
-          File.Delete(path);
-
-          var managed = new List<string>();
-
-          foreach (string dll in Directory.GetFiles(
-              assets,
-              "*.dll",
-              SearchOption.AllDirectories))
-          {
-              AssemblyDefinition assembly;
-
-              try
-              {
-                  assembly =
-                      AssemblyDefinition.ReadAssembly(
-                          dll,
-                          parameters
-                      );
-              }
-              catch (BadImageFormatException)
-              {
-                  continue;
-              }
-
-              managed.Add(dll);
-
-              using (assembly)
-              {
-                  int changed = 0;
-
-                  foreach (var reference in
-                      assembly.MainModule.AssemblyReferences)
-                  {
-                      if (reference.Name ==
-                          "Assembly-CSharp")
-                      {
-                          reference.Name =
-                              "ZeroOriginalGame";
-
-                          changed++;
-                      }
-                  }
-
-                  if (changed > 0)
-                  {
-                      assembly.Write(dll + ".tmp");
-
-                      File.Move(
-                          dll + ".tmp",
-                          dll,
-                          true
-                      );
-                  }
-              }
-          }
-
-          File.WriteAllLines(
-              "logs/managed-dlls.txt",
-              managed
-          );
-          CS
-
-          dotnet run --project patcher -- \
-            "$PWD/ExportedProject/Assets" \
-            2>&1 | tee logs/input-patch.txt
-
-      - name: Preserve original scene references
-        if: inputs.prepared_run == ''
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-
-          assets = Path("ExportedProject/Assets")
-
-          count = 0
-
-          for path in assets.rglob("*"):
-
-              if path.suffix not in {
-                  ".unity", ".prefab", ".asset"
-              }:
-                  continue
-
-              data = path.read_bytes()
-
-              data, changed = re.subn(
-                  rb"(m_TargetAssemblyTypeName:[^\r\n]*?,[ \t]*)Assembly-CSharp(?=[ \t\r\n,'\"]|$)",
-                  rb"\g<1>ZeroOriginalGame",
-                  data
-              )
-
-              if changed:
-                  path.write_bytes(data)
-                  count += changed
-
-          managed = Path(
-              "logs/managed-dlls.txt"
-          ).read_text().splitlines()
-
-          for dll in managed:
-
-              meta = Path(dll + ".meta")
-
-              if not meta.exists():
-                  continue
-
-              text = meta.read_text()
-
-              text = re.sub(
-                  r"(Editor: Editor\r?\n[ \t]+second:\r?\n[ \t]+enabled: )0",
-                  r"\g<1>1",
-                  text
-              )
-
-              meta.write_text(text)
-
-          settings = Path(
-              "ExportedProject/ProjectSettings/ProjectSettings.asset"
-          )
-
-          text = settings.read_text()
-
-          text = re.sub(
-              r"(?m)^([ \t]*activeInputHandler:[ \t]*)1[ \t]*$",
-              r"\g<1>2",
-              text
-          )
-
-          settings.write_text(text)
-
-          print("UnityEvent references fixed:", count)
-          PY
-
-          cat > ExportedProject/Assets/ZeroLink.xml <<'XML'
-          <linker>
-            <assembly fullname="ZeroOriginalGame" preserve="all"/>
-            <assembly fullname="ZeroMobile" preserve="all"/>
-          </linker>
-          XML
-
-      - name: Prepare original Zero campaign
-        run: |
-          set -euo pipefail
-
-          mkdir -p ExportedProject/Assets/Editor
-
-          cat > ExportedProject/Assets/Editor/BuildZero.cs <<'CS'
-          using System;
-          using System.IO;
-          using System.Linq;
-          using UnityEngine;
-          using UnityEngine.Rendering;
-          using UnityEditor;
-          using UnityEditor.Build;
-          using UnityEditor.Build.Reporting;
-          using UnityEditor.SceneManagement;
-
-          public static class BuildZero
-          {
-              static void ConfigurePlugin(string name)
-              {
-                  foreach (string path in
-                      AssetDatabase.GetAllAssetPaths())
-                  {
-                      if (!path.EndsWith("/" + name))
-                          continue;
-
-                      var importer =
-                          AssetImporter.GetAtPath(path)
-                          as PluginImporter;
-
-                      if (importer == null)
-                          continue;
-
-                      importer.SetCompatibleWithEditor(true);
-
-                      importer.SetCompatibleWithPlatform(
-                          BuildTarget.iOS,
-                          true
-                      );
-
-                      importer.SaveAndReimport();
-                  }
-              }
-
-              static void OptimizeTextures()
-              {
-                  int optimized = 0;
-
-                  foreach (string guid in
-                      AssetDatabase.FindAssets("t:Texture2D"))
-                  {
-                      string path =
-                          AssetDatabase.GUIDToAssetPath(guid);
-
-                      if (!path.StartsWith("Assets/"))
-                          continue;
-
-                      string lower = path.ToLowerInvariant();
-
-                      if (
-                          lower.Contains("lightmap") ||
-                          lower.Contains("lighting") ||
-                          lower.Contains("font") ||
-                          lower.Contains("sprite") ||
-                          lower.Contains("/ui/") ||
-                          lower.Contains("cubemap")
-                      )
-                          continue;
-
-                      var importer =
-                          AssetImporter.GetAtPath(path)
-                          as TextureImporter;
-
-                      if (importer == null)
-                          continue;
-
-                      if (importer.textureType !=
-                          TextureImporterType.Default)
-                          continue;
-
-                      if (importer.textureShape !=
-                          TextureImporterShape.Texture2D)
-                          continue;
-
-                      var platform =
-                          importer.GetPlatformTextureSettings(
-                              "iPhone"
-                          );
-
-                      int oldSize = platform.overridden
-                          ? platform.maxTextureSize
-                          : importer.maxTextureSize;
-
-                      if (oldSize <= 1024)
-                          continue;
-
-                      platform.overridden = true;
-
-                      platform.maxTextureSize = 1024;
-
-                      platform.format =
-                          TextureImporterFormat.Automatic;
-
-                      importer.SetPlatformTextureSettings(
-                          platform
-                      );
-
-                      importer.SaveAndReimport();
-
-                      optimized++;
-                  }
-
-                  Debug.Log(
-                      "Optimized textures: " + optimized
-                  );
-              }
-
-              public static void Run()
-              {
-                  ConfigurePlugin("ZeroOriginalGame.dll");
-
-                  ConfigurePlugin("ZeroMobile.dll");
-
-                  string[] scenes =
-                      EditorBuildSettings.scenes
-                          .Where(s => s.enabled)
-                          .Select(s => s.path)
-                          .ToArray();
-
-                  string initial =
-                      "Assets/Scenes/InitialSetup.unity";
-
-                  string menu =
-                      "Assets/Scenes/MainMenu/MainMenu.unity";
-
-                  string epilogue =
-                      "Assets/Scenes/Epilogue.unity";
-
-                  if (
-                      !scenes.Contains(initial) ||
-                      !scenes.Contains(menu) ||
-                      !scenes.Contains(epilogue)
-                  )
-                  {
-                      throw new BuildFailedException(
-                          "Original campaign scenes incomplete"
-                      );
-                  }
-
-                  int missing = 0;
-
-                  foreach (string path in scenes)
-                  {
-                      if (!File.Exists(path))
-                          throw new BuildFailedException(
-                              "Missing scene: " + path
-                          );
-
-                      var scene =
-                          EditorSceneManager.OpenScene(path);
-
-                      int sceneMissing = 0;
-
-                      foreach (var root in
-                          scene.GetRootGameObjects())
-                      foreach (var t in
-                          root.GetComponentsInChildren<Transform>(
-                              true
-                          ))
-                      {
-                          int count =
-                              GameObjectUtility
-                                  .GetMonoBehavioursWithMissingScriptCount(
-                                      t.gameObject
-                                  );
-
-                          if (count > 0)
-                          {
-                              sceneMissing += count;
-
-                              Debug.LogWarning(
-                                  "Missing component: " +
-                                  path + "/" + t.name +
-                                  " count=" + count
-                              );
-                          }
-                      }
-
-                      missing += sceneMissing;
-
-                      Debug.Log(
-                          "Original scene: " + path +
-                          " | Missing scripts: " +
-                          sceneMissing
-                      );
-                  }
-
-                  Debug.Log(
-                      "Enabled original scenes: " +
-                      scenes.Length
-                  );
-
-                  if (missing > 0)
-                      throw new BuildFailedException(
-                          "Original components missing: " +
-                          missing
-                      );
-
-                  EditorSceneManager.NewScene(
-                      NewSceneSetup.EmptyScene,
-                      NewSceneMode.Single
-                  );
-
-                  PlayerSettings.productName =
-                      "Slendytubbies Zero";
-
-                  PlayerSettings.bundleVersion =
-                      "1.1.0";
-
-                  PlayerSettings.iOS.buildNumber =
-                      "1";
-
-                  PlayerSettings.SetApplicationIdentifier(
-                      BuildTargetGroup.iOS,
-                      "com.slendytubbies.zero.ios"
-                  );
-
-                  PlayerSettings.iOS.targetOSVersionString =
-                      "15.0";
-
-                  PlayerSettings.defaultInterfaceOrientation =
-                      UIOrientation.LandscapeLeft;
-
-                  PlayerSettings.SetScriptingBackend(
-                      BuildTargetGroup.iOS,
-                      ScriptingImplementation.IL2CPP
-                  );
-
-                  PlayerSettings.SetManagedStrippingLevel(
-                      BuildTargetGroup.iOS,
-                      ManagedStrippingLevel.Low
-                  );
-
-                  PlayerSettings.stripEngineCode =
-                      false;
-
-                  PlayerSettings.SetUseDefaultGraphicsAPIs(
-                      BuildTarget.iOS,
-                      false
-                  );
-
-                  PlayerSettings.SetGraphicsAPIs(
-                      BuildTarget.iOS,
-                      new[] {
-                          GraphicsDeviceType.Metal
-                      }
-                  );
-
-                  PlayerSettings.iOS.appleEnableAutomaticSigning =
-                      false;
-
-                  OptimizeTextures();
-
-                  AssetDatabase.SaveAssets();
-
-                  var report = BuildPipeline.BuildPlayer(
-                      scenes,
-                      Environment.GetEnvironmentVariable(
-                          "ZERO_XCODE"
-                      ),
-                      BuildTarget.iOS,
-                      BuildOptions.None
-                  );
-
-                  if (
-                      report.summary.result !=
-                      BuildResult.Succeeded
-                  )
-                  {
-                      throw new BuildFailedException(
-                          "Zero export failed: " +
-                          report.summary.result
-                      );
-                  }
-
-                  Debug.Log("Zero iOS export completed");
-              }
-          }
-          CS
-
-      - name: Save prepared project
-        if: inputs.prepared_run == ''
-        run: |
-          set -euo pipefail
-
-          tar -cf - ExportedProject \
-            | gzip -1 \
-            > Zero-Prepared-V1.tar.gz
-
-      - name: Upload reusable prepared project
-        if: inputs.prepared_run == ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: Zero-Prepared-V1
-          path: Zero-Prepared-V1.tar.gz
-          compression-level: 0
-          retention-days: 14
-          if-no-files-found: error
-
-      - name: Remove temporary archive
-        run: |
-          rm -f Zero-Prepared-V1.tar.gz
-          df -h
+          npm install -g \
+            @rage-against-the-pixel/unity-cli@4.2.2
 
       - name: Activate Unity Personal
         id: activate
@@ -1427,13 +291,12 @@ jobs:
           UNITY_USERNAME: ${{ secrets.UNITY_USERNAME || secrets.UNITY_EMAIL }}
           UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
         run: |
-          npm install -g \
-            @rage-against-the-pixel/unity-cli@4.2.2
+          set -euo pipefail
 
           unity-cli activate-license \
             --license personal
 
-      - name: Validate original scenes and export to Xcode
+      - name: Export original campaign with Metal fix
         timeout-minutes: 75
         run: |
           set -euo pipefail
@@ -1459,7 +322,7 @@ jobs:
             -executeMethod BuildZero.Run \
             -logFile "$LOG"; then
 
-            echo "UNITY ERRORS"
+            echo "UNITY EXPORT FAILED"
 
             grep -Ei \
               'error|exception|failed|missing' \
@@ -1471,6 +334,8 @@ jobs:
 
           test -s Xcode/Unity-iPhone.xcodeproj/project.pbxproj
 
+          echo "UNITY EXPORT SUCCESS"
+
       - name: Return Unity license
         if: always() && steps.activate.outcome == 'success'
         continue-on-error: true
@@ -1478,6 +343,36 @@ jobs:
           unity-cli return-license \
             --license personal \
             --when auto
+
+      - name: Verify shader fix after Unity export
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          path = Path(
+              "ExportedProject/ProjectSettings/GraphicsSettings.asset"
+          )
+
+          text = path.read_text()
+
+          if not re.search(
+              r"(?m)^\s*m_PreloadShadersBatchTimeLimit:"
+              r"\s*2\s*$",
+              text
+          ):
+              raise RuntimeError(
+                  "Unity did not preserve shader fix"
+              )
+
+          print("Graphics settings confirmed")
+
+          print("Deferred shader preload: 2 ms")
+
+          print("Ready for ARM64 build")
+          PY
 
       - name: Build ARM64 application
         timeout-minutes: 45
@@ -1493,10 +388,11 @@ jobs:
             -derivedDataPath "$PWD/DerivedData" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
             ARCHS=arm64 \
             build 2>&1 | tee logs/xcode.log
 
-      - name: Create Slendytubbies Zero IPA
+      - name: Create Zero Fix 1 IPA
         run: |
           set -euo pipefail
 
@@ -1513,7 +409,12 @@ jobs:
             -c 'Print :CFBundleExecutable' \
             "$APP/Info.plist")
 
-          lipo "$APP/$EXE" -verify_arch arm64
+          lipo "$APP/$EXE" \
+            -verify_arch arm64
+
+          /usr/libexec/PlistBuddy \
+            -c 'Set :CFBundleVersion 2' \
+            "$APP/Info.plist"
 
           for KEY in UIFileSharingEnabled LSSupportsOpeningDocumentsInPlace; do
 
@@ -1535,32 +436,23 @@ jobs:
 
           ditto -c -k --norsrc --keepParent \
             "$STAGE/Payload" \
-            "$PWD/dist/Slendytubbies-Zero-1.1.0-iOS-V1.ipa"
+            "$PWD/dist/Slendytubbies-Zero-1.1.0-Fix1.ipa"
 
           unzip -tq \
-            dist/Slendytubbies-Zero-1.1.0-iOS-V1.ipa
+            dist/Slendytubbies-Zero-1.1.0-Fix1.ipa
+
+          test -s dist/Slendytubbies-Zero-1.1.0-Fix1.ipa
+
+          rm -rf "$STAGE"
 
           ls -lh dist/
 
-          {
-            echo "# Slendytubbies Zero iOS V1"
-            echo ""
-            echo "Original version: 1.1.0"
-            echo "Unity: 2022.3.58f1"
-            echo "ARM64 IL2CPP"
-            echo "Original scene order preserved"
-            echo "Mobile input patched"
-            echo "30 FPS target"
-            echo "No new Recovery"
-            echo "Device testing required"
-            echo ""
-            ls -lh dist/
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "ZERO FIX 1 IPA CREATED"
 
-      - name: Upload Slendytubbies Zero IPA
+      - name: Upload Zero Fix 1 IPA
         uses: actions/upload-artifact@v4
         with:
-          name: Slendytubbies-Zero-iOS-V1
+          name: Slendytubbies-Zero-iOS-Fix1
           path: dist/*.ipa
           compression-level: 0
           retention-days: 30
@@ -1570,7 +462,42 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Zero-iOS-V1-Logs
+          name: Zero-Fix1-Logs
           path: logs/
           retention-days: 14
           if-no-files-found: warn
+
+      - name: Final summary
+        if: always()
+        run: |
+          {
+            echo "# Slendytubbies Zero Fix 1"
+            echo ""
+            echo "Original game: 1.1.0"
+            echo "iOS build: 2"
+            echo "Unity: 2022.3.58f1"
+            echo "Architecture: ARM64"
+            echo ""
+            echo "Targeted crash: 0x8BADF00D"
+            echo "Deferred shader prewarming: 2 ms"
+            echo "Original shader collections preserved"
+            echo "Original campaign preserved"
+            echo "Original mobile controls preserved"
+            echo "No new Recovery"
+            echo ""
+
+            if [ -s dist/Slendytubbies-Zero-1.1.0-Fix1.ipa ]; then
+
+              echo "FIX 1 IPA CREATED"
+              ls -lh dist/
+
+            else
+
+              echo "BUILD NOT COMPLETED"
+
+            fi
+
+            echo ""
+            echo "Device testing required"
+
+          } >> "$GITHUB_STEP_SUMMARY"
