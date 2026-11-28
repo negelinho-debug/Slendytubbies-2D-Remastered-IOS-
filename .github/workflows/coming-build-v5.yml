@@ -1,7 +1,13 @@
-name: Coming - Create IPA V6 Mega Fix
+
+name: Coming - V7 Original DLL iOS
 
 on:
   workflow_dispatch:
+    inputs:
+      source_url:
+        description: "Alternative original ZIP URL"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -9,663 +15,1344 @@ permissions:
 
 jobs:
   recovery:
-    uses: ./.github/workflows/coming-create-ipa.yml
-    secrets:
-      COMING_ARCHIVE_PASSWORD: ${{ secrets.COMING_ARCHIVE_PASSWORD }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      SOURCE_URL: ${{ inputs.source_url }}
+      PASSWORD: ${{ secrets.COMING_ARCHIVE_PASSWORD }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Prepare tools
+        run: |
+          mkdir -p original tools export output reports
+
+          sudo apt-get update
+
+          sudo apt-get install -y p7zip-full
+
+          python3 -m pip install \
+            requests beautifulsoup4
+
+      - name: Download original Coming
+        run: |
+          python3 - <<'PY'
+          import os
+          import requests
+          import zipfile
+          from bs4 import BeautifulSoup
+
+          url = os.environ.get(
+              "SOURCE_URL", ""
+          ).strip()
+
+          if not url:
+              url = (
+                  "https://www.mediafire.com/file/"
+                  "dym00pxjpkcc1oz/Coming.zip/file"
+              )
+
+          session = requests.Session()
+
+          session.headers["User-Agent"] = (
+              "Mozilla/5.0"
+          )
+
+          if "www.mediafire.com/file/" in url:
+
+              page = session.get(
+                  url,
+                  timeout=60
+              )
+
+              page.raise_for_status()
+
+              soup = BeautifulSoup(
+                  page.text,
+                  "html.parser"
+              )
+
+              button = soup.select_one(
+                  "#downloadButton"
+              )
+
+              if not button or not button.get("href"):
+                  raise RuntimeError(
+                      "Original download unavailable"
+                  )
+
+              url = button["href"]
+
+          with session.get(
+              url,
+              stream=True,
+              timeout=(30, 120)
+          ) as response:
+
+              response.raise_for_status()
+
+              with open("Coming.zip", "wb") as f:
+
+                  for chunk in response.iter_content(
+                      1024 * 1024
+                  ):
+                      if chunk:
+                          f.write(chunk)
+
+          if not zipfile.is_zipfile("Coming.zip"):
+              raise RuntimeError("Invalid ZIP")
+
+          print("Original Coming downloaded")
+          PY
+
+      - name: Verify original Mono game
+        run: |
+          set -euo pipefail
+
+          7z t Coming.zip
+
+          7z x Coming.zip -ooriginal -y
+
+          rm Coming.zip
+
+          DLL=$(find "$PWD/original" \
+            -name Assembly-CSharp.dll \
+            -print -quit)
+
+          test -s "$DLL"
+
+          DATA=$(dirname "$(dirname "$DLL")")
+
+          ROOT=$(dirname "$DATA")
+
+          echo "GAME_DATA=$DATA" >> "$GITHUB_ENV"
+
+          echo "GAME_ROOT=$ROOT" >> "$GITHUB_ENV"
+
+          find "$DATA/Managed" \
+            -name '*.dll' \
+            | tee reports/original-assemblies.txt
+
+          echo "Original Mono assembly found"
+
+      - name: Download AssetRipper 2
+        run: |
+          set -euo pipefail
+
+          curl -fLsS --retry 3 \
+            https://github.com/AssetRipper/AssetRipper/releases/download/2.0.0/AssetRipper_linux_x64.tar.xz \
+            -o tools/ripper.tar.xz
+
+          mkdir -p tools/ripper
+
+          tar -xJf tools/ripper.tar.xz \
+            -C tools/ripper
+
+      - name: Recover original game with DLLs
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+
+          RIPPER=$(find "$PWD/tools/ripper" \
+            -type f \
+            -name AssetRipper.GUI.Free \
+            -print -quit)
+
+          test -x "$RIPPER"
+
+          "$RIPPER" \
+            --headless \
+            --port 18926 \
+            > reports/assetripper.log 2>&1 &
+
+          PID=$!
+
+          trap 'kill "$PID" 2>/dev/null || true' EXIT
+
+          API=http://127.0.0.1:18926
+
+          curl -fsS \
+            --retry 30 \
+            --retry-connrefused \
+            --retry-delay 2 \
+            "$API/Settings/Edit" \
+            -o /dev/null
+
+          curl -fsS \
+            -d 'ScriptExportMode=DllExportWithRenaming&ScriptContentLevel=Level2' \
+            "$API/Settings/Update" \
+            -o /dev/null
+
+          curl -fsS \
+            --max-time 600 \
+            --data-urlencode "Path=$GAME_ROOT" \
+            "$API/LoadFolder" \
+            -o /dev/null
+
+          curl -fsS \
+            --max-time 1200 \
+            --data-urlencode "Path=$PWD/export" \
+            "$API/Export/UnityProject" \
+            -o /dev/null
+
+          test -d export/ExportedProject/Assets
+
+          test -d export/ExportedProject/ProjectSettings
+
+      - name: Verify recovered project
+        run: |
+          set -euo pipefail
+
+          PROJECT=export/ExportedProject
+
+          find "$PROJECT/Assets" \
+            -name '*.unity' \
+            | sort | tee reports/scenes.txt
+
+          find "$PROJECT/Assets" \
+            -name '*.anim' \
+            | sort > reports/animations.txt
+
+          find "$PROJECT/Assets" \
+            -name '*.dll' \
+            | sort | tee reports/recovered-dlls.txt
+
+          DLL=$(find "$PROJECT/Assets" \
+            -name Assembly-CSharp.dll \
+            -print -quit)
+
+          test -s "$DLL"
+
+          test -s "$DLL.meta"
+
+          test -s "$PROJECT/ProjectSettings/EditorBuildSettings.asset"
+
+          echo "Scenes: $(wc -l < reports/scenes.txt)"
+
+          echo "Animations: $(wc -l < reports/animations.txt)"
+
+          echo "Original game DLL preserved"
+
+      - name: Check serialized scripts
+        run: |
+          python3 - <<'PY' | tee reports/integrity.txt
+          import re
+          from pathlib import Path
+
+          assets = Path(
+              "export/ExportedProject/Assets"
+          )
+
+          total = 0
+
+          for scene in sorted(
+              assets.rglob("*.unity")
+          ):
+              text = scene.read_text(
+                  errors="replace"
+              )
+
+              count = len(re.findall(
+                  r"(?m)^\s*m_Script:\s*\{fileID: 0\}",
+                  text
+              ))
+
+              total += count
+
+              print(
+                  scene.name,
+                  "Empty script references:",
+                  count
+              )
+
+          print("Total:", total)
+
+          print("Unity runtime not tested")
+          PY
+
+      - name: Save reusable DLL project
+        run: |
+          set -euo pipefail
+
+          test -n "$PASSWORD"
+
+          7z a -t7z -mhe=on -mx=1 \
+            -p"$PASSWORD" \
+            output/Coming-V7-Project.7z \
+            export/ExportedProject \
+            > /dev/null
+
+          test -s output/Coming-V7-Project.7z
+
+      - name: Upload reusable project
+        uses: actions/upload-artifact@v4
+        with:
+          name: Coming-V7-Project
+          path: output/Coming-V7-Project.7z
+          retention-days: 14
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Show recovery summary
+        if: always()
+        run: |
+          {
+            echo "# Coming V7 Recovery"
+            echo '```'
+            cat reports/scenes.txt 2>/dev/null || true
+            cat reports/integrity.txt 2>/dev/null || true
+            cat reports/recovered-dlls.txt 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload recovery diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Coming-V7-Recovery-Report
+          path: reports/
+          retention-days: 14
 
   build-ipa:
     needs: recovery
     runs-on: macos-15
-    timeout-minutes: 180
+    timeout-minutes: 150
 
     env:
       UNITY_VERSION: 2022.3.62f3
       UNITY_CHANGESET: 96770f904ca7
-      V5_COMMIT: 8a04934116be64bd441023ed302aef4f16212005
+      PASSWORD: ${{ secrets.COMING_ARCHIVE_PASSWORD }}
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - uses: actions/checkout@v5
 
-      - name: Restore complete V5
+      - name: Prepare folders
         run: |
-          set -euo pipefail
+          mkdir -p incoming restored reports output refs
 
-          mkdir -p .coming-v6 reports
+          if ! command -v 7zz >/dev/null; then
+            brew install sevenzip
+          fi
 
-          python3 -m venv .coming-v6/venv
+          df -h
 
-          .coming-v6/venv/bin/pip install \
-            pyyaml requests beautifulsoup4
-
-          git show \
-            "$V5_COMMIT:.github/workflows/coming-build-v5.yml" \
-            > .coming-v6/v5.yml
-
-          git show \
-            "$V5_COMMIT:.github/workflows/coming-create-ipa.yml" \
-            > .coming-v6/recovery.yml
-
-          .coming-v6/venv/bin/python - <<'PY'
-          import yaml
-          from pathlib import Path
-
-          root = Path(".coming-v6")
-
-          data = yaml.safe_load(
-              (root / "v5.yml").read_text()
-          )
-
-          steps = data["jobs"]["build-ipa"]["steps"]
-
-          mapping = {
-              "Prepare tools": "tools",
-              "Extract recovered project": "extract",
-              "V5 Fix CSharp 10 to CSharp 9": "csharp",
-              "Prepare Unity project": "prepare",
-              "Create Unity iOS builder": "builder",
-              "Enable iPhone Files access": "files",
-              "Install Unity CLI V4": "cli",
-              "Install Unity and iOS module": "install",
-              "Verify Unity installation": "verify",
-              "Activate Unity Personal": "activate",
-              "Unity iOS IL2CPP export": "export",
-              "Return Unity License": "return",
-              "Find Xcode project": "find",
-              "Compile ARM64 iOS application": "xcode",
-              "Create real IPA V5": "ipa",
-              "Protect IPA": "protect",
-              "Final summary": "summary"
-          }
-
-          found = set()
-
-          for step in steps:
-              name = step.get("name")
-
-              if name not in mapping:
-                  continue
-
-              script = step["run"]
-
-              script = script.replace(
-                  "Coming-iOS-V5",
-                  "Coming-iOS-V6"
-              )
-
-              script = script.replace(
-                  "COMING V5 IPA",
-                  "COMING V6 IPA"
-              )
-
-              if name == "Create Unity iOS builder":
-                  script = script.replace(
-                      '"5";',
-                      '"6";'
-                  )
-
-              path = root / (
-                  mapping[name] + ".sh"
-              )
-
-              path.write_text(script)
-              found.add(name)
-
-          missing = set(mapping) - found
-
-          if missing:
-              raise RuntimeError(str(missing))
-
-          recovery = yaml.safe_load(
-              (root / "recovery.yml").read_text()
-          )
-
-          download = next(
-              s["run"]
-              for s in recovery["jobs"]["mega-fix"]["steps"]
-              if s.get("name") == "Download original Coming"
-          )
-
-          (root / "download-original.sh").write_text(
-              download
-          )
-
-          print("V5 restored successfully")
-          PY
-
-      - name: Prepare tools
-        env:
-          PASSWORD: ${{ secrets.COMING_ARCHIVE_PASSWORD }}
-        run: bash .coming-v6/tools.sh
-
-      - name: Download recovered project
+      - name: Download recovered DLL project
         uses: actions/download-artifact@v4
         with:
-          name: Coming-Mega-Fix
+          name: Coming-V7-Project
           path: incoming
 
-      - name: Extract recovered project
-        env:
-          PASSWORD: ${{ secrets.COMING_ARCHIVE_PASSWORD }}
-        run: bash .coming-v6/extract.sh
-
-      - name: V6 Restore original dependencies
+      - name: Extract original project
         run: |
           set -euo pipefail
 
-          python3 - <<'PY'
-          from pathlib import Path
-          import shutil
-          import re
+          test -n "$PASSWORD"
 
-          assets = Path("ComingProject/Assets")
-          plugins = assets / "Plugins"
+          7zz x incoming/Coming-V7-Project.7z \
+            -p"$PASSWORD" \
+            -orestored \
+            -y > /dev/null
 
-          sources = Path("restored/recovered-code")
+          mv restored/export/ExportedProject \
+            ComingProject
 
-          if not sources.is_dir():
-              raise RuntimeError(
-                  "Recovered original code not found"
-              )
+          rm -rf incoming restored
 
-          groups = {
-              "Assembly-CSharp-firstpass": [
-                  "AAMode",
-                  "TweakMode34",
-                  "BloomScreenBlendMode",
-                  "HDRBloomMode",
-                  "LensflareStyle34",
-                  "WaterQuality",
-                  "RenderTextureUtility"
-              ],
+          test -d ComingProject/Assets
 
-              "Assembly-UnityScript-firstpass": [
-                  "CharacterMotorMovement",
-                  "CharacterMotorJumping",
-                  "CharacterMotorMovingPlatform",
-                  "CharacterMotorSliding",
-                  "CharacterState",
-                  "DofBlurriness",
-                  "Dof34QualitySetting",
-                  "DofResolution",
-                  "BokehDestination",
-                  "EdgeDetectMode",
-                  "AAMode",
-                  "TweakMode34",
-                  "BloomScreenBlendMode",
-                  "HDRBloomMode",
-                  "LensflareStyle34",
-                  "PostEffectsBase"
-              ]
-          }
-
-          restored = 0
-          added = 0
-          unresolved = []
-
-          def read(path):
-              return path.read_text(
-                  encoding="utf-8-sig"
-              )
-
-          def is_dummy(text):
-              return (
-                  "Dummy class. This could have happened"
-                  in text
-              )
-
-          for assembly in groups:
-              source = sources / assembly
-              target = plugins / assembly
-
-              if not source.is_dir():
-                  unresolved.append(assembly)
-                  continue
-
-              target.mkdir(
-                  parents=True,
-                  exist_ok=True
-              )
-
-              index = {}
-
-              for file in source.rglob("*.cs"):
-                  index.setdefault(
-                      file.name.casefold(),
-                      []
-                  ).append(file)
-
-              for file in list(target.rglob("*.cs")):
-                  text = read(file)
-
-                  if not is_dummy(text):
-                      continue
-
-                  candidates = index.get(
-                      file.name.casefold(),
-                      []
-                  )
-
-                  if len(candidates) != 1:
-                      continue
-
-                  original = read(candidates[0])
-
-                  if is_dummy(original):
-                      continue
-
-                  file.write_text(
-                      original,
-                      encoding="utf-8"
-                  )
-
-                  restored += 1
-
-                  print("RESTORED:", file)
-
-              for name in groups[assembly]:
-                  declaration = re.compile(
-                      r'\b(?:class|struct|enum|interface)'
-                      r'\s+' + re.escape(name) +
-                      r'\b'
-                  )
-
-                  existing = []
-
-                  for file in target.rglob("*.cs"):
-                      if declaration.search(read(file)):
-                          existing.append(file)
-
-                  candidates = [
-                      p for p in index.get(
-                          (name + ".cs").casefold(),
-                          []
-                      )
-                      if declaration.search(read(p))
-                  ]
-
-                  if len(candidates) != 1:
-                      if not existing:
-                          unresolved.append(
-                              assembly + ": " + name
-                          )
-                      continue
-
-                  original = candidates[0]
-
-                  if existing:
-
-                      for file in existing:
-                          if (
-                              is_dummy(read(file))
-                              or name == "PostEffectsBase"
-                          ):
-                              if file.stem == name:
-                                  file.write_text(
-                                      read(original),
-                                      encoding="utf-8"
-                                  )
-                                  restored += 1
-
-                                  print(
-                                      "REPAIRED:",
-                                      file
-                                  )
-
-                      continue
-
-                  destination = (
-                      target /
-                      original.relative_to(source)
-                  )
-
-                  if destination.exists():
-                      unresolved.append(
-                          str(destination)
-                      )
-                      continue
-
-                  destination.parent.mkdir(
-                      parents=True,
-                      exist_ok=True
-                  )
-
-                  shutil.copyfile(
-                      original,
-                      destination
-                  )
-
-                  added += 1
-                  print("ADDED:", destination)
-
-          report = [
-              f"Restored scripts: {restored}",
-              f"Added original types: {added}",
-              f"Unresolved types: {len(unresolved)}"
-          ]
-
-          report.extend(unresolved)
-
-          Path("reports/v6-dependencies.txt").write_text(
-              "\n".join(report) + "\n"
-          )
-
-          print("\n".join(report))
-          PY
-
-      - name: Restore Boo and UnityScript libraries
-        run: |
-          set -euo pipefail
-
-          export PATH="$PWD/.coming-v6/venv/bin:$PATH"
-
-          bash .coming-v6/download-original.sh
-
-          python3 - <<'PY'
-          from pathlib import Path
-          import zipfile
-
-          assets = Path("ComingProject/Assets")
-
-          target = assets / "Plugins/ComingLegacy"
-
-          target.mkdir(
-              parents=True,
-              exist_ok=True
-          )
-
-          wanted = {
-              "boo.lang.dll",
-              "unityscript.lang.dll"
-          }
-
-          existing = {
-              p.name.lower()
-              for p in assets.rglob("*.dll")
-          }
-
-          with zipfile.ZipFile("Coming.zip") as archive:
-
-              for member in archive.namelist():
-
-                  name = Path(member).name
-
-                  if name.lower() not in wanted:
-                      continue
-
-                  if name.lower() in existing:
-                      continue
-
-                  if "/managed/" not in (
-                      "/" + member.lower()
-                  ):
-                      continue
-
-                  (target / name).write_bytes(
-                      archive.read(member)
-                  )
-
-                  existing.add(name.lower())
-
-                  print("RESTORED DLL:", name)
-
-          missing = wanted - existing
-
-          print(
-              "Missing legacy libraries:",
-              sorted(missing)
-          )
-
-          Path("reports/v6-libraries.txt").write_text(
-              "Missing: " + str(sorted(missing))
-          )
-          PY
-
-          rm -f Coming.zip
-
-      - name: V6 Fix NavMesh and legacy GUI
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-
-          assets = Path("ComingProject/Assets")
-
-          fixed = 0
-
-          for file in assets.rglob("*.cs"):
-
-              text = file.read_text(
-                  encoding="utf-8-sig"
-              )
-
-              old = text
-
-              if file.name == "AICharacterControl.cs":
-
-                  if "using UnityEngine.AI;" not in text:
-
-                      text = (
-                          "using UnityEngine.AI;\n"
-                          + text
-                      )
-
-              if file.name in [
-                  "FPSCounter.cs",
-                  "SimpleActivatorMenu.cs",
-                  "ForcedReset.cs"
-              ]:
-
-                  if re.search(r'\bGUIText\b', text):
-
-                      text = text.replace(
-                          "UnityEngine.GUIText",
-                          "UnityEngine.UI.Text"
-                      )
-
-                      text = (
-                          "using GUIText = "
-                          "UnityEngine.UI.Text;\n"
-                          + text
-                      )
-
-                  if re.search(r'\bGUITexture\b', text):
-
-                      text = text.replace(
-                          "UnityEngine.GUITexture",
-                          "UnityEngine.UI.RawImage"
-                      )
-
-                      text = (
-                          "using GUITexture = "
-                          "UnityEngine.UI.RawImage;\n"
-                          + text
-                      )
-
-              if old != text:
-
-                  file.write_text(
-                      text,
-                      encoding="utf-8"
-                  )
-
-                  fixed += 1
-
-                  print("COMPATIBILITY FIX:", file)
-
-          print("Compatibility files fixed:", fixed)
-          PY
-
-      - name: Preserve V5 CSharp fix
-        run: bash .coming-v6/csharp.sh
-
-      - name: Reconnect mobile controls
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-
-          assets = Path("ComingProject/Assets")
-
-          pattern = re.compile(
-              r'(?<![\w.])(?:UnityEngine\.)?Input\.'
-              r'(GetAxisRaw|GetAxis|GetKeyDown|GetKeyUp|'
-              r'GetKey|GetButtonDown|GetButtonUp|'
-              r'GetButton)\s*\('
-          )
-
-          fixed = 0
-
-          for file in assets.rglob("*.cs"):
-
-              if "ComingMobile" in file.parts:
-                  continue
-
-              text = file.read_text(
-                  encoding="utf-8-sig"
-              )
-
-              if "Dummy class. This could have happened" in text:
-                  continue
-
-              if "using UnityEngine;" not in text:
-                  continue
-
-              if re.search(
-                  r'using\s+Input\s*=',
-                  text
-              ):
-                  continue
-
-              updated, count = pattern.subn(
-                  lambda m: (
-                      "ComingTouch."
-                      + m.group(1)
-                      + "("
-                  ),
-                  text
-              )
-
-              if count:
-
-                  file.write_text(
-                      updated,
-                      encoding="utf-8"
-                  )
-
-                  fixed += count
-
-          print("Mobile input calls patched:", fixed)
-          PY
-
-      - name: Prepare Unity project
-        run: bash .coming-v6/prepare.sh
-
-      - name: Create Unity iOS builder
-        run: bash .coming-v6/builder.sh
-
-      - name: Enable iPhone Files access
-        run: bash .coming-v6/files.sh
-
-      - name: Check original scenes
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          assets = Path("ComingProject/Assets")
-
-          scenes = list(assets.rglob("*.unity"))
-          animations = list(assets.rglob("*.anim"))
-
-          if not scenes:
-              raise RuntimeError(
-                  "Original scenes missing"
-              )
-
-          print("Original scenes:", len(scenes))
-          print("Animations:", len(animations))
-
-          for scene in scenes:
-              print("SCENE:", scene)
-
-          Path("reports/v6-scenes.txt").write_text(
-              f"Scenes: {len(scenes)}\n"
-              f"Animations: {len(animations)}\n"
-          )
-          PY
-
-      - name: Install Node.js 24
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '24'
 
-      - name: Install Unity CLI
-        run: bash .coming-v6/cli.sh
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
 
-      - name: Install Unity iOS module
-        run: bash .coming-v6/install.sh
+      - name: Install Unity and iOS module
+        run: |
+          set -euo pipefail
 
-      - name: Verify Unity
-        run: bash .coming-v6/verify.sh
+          npm install -g \
+            @rage-against-the-pixel/unity-cli@4.2.2
+
+          unity-cli setup-unity \
+            --unity-version "$UNITY_VERSION" \
+            --changeset "$UNITY_CHANGESET" \
+            --build-targets iOS
+
+          EDITOR=$(find /Applications \
+            -path '*/Unity.app/Contents/MacOS/Unity' \
+            -type f \
+            -print -quit)
+
+          test -x "$EDITOR"
+
+          echo "UNITY_EDITOR_PATH=$EDITOR" \
+            >> "$GITHUB_ENV"
+
+      - name: Find Unity references
+        run: |
+          set -euo pipefail
+
+          SOURCE=""
+
+          while IFS= read -r DLL; do
+
+            DIR="$(dirname "$DLL")"
+
+            if [ -f "$DIR/UnityEngine.InputLegacyModule.dll" ] &&
+               [ -f "$DIR/UnityEngine.IMGUIModule.dll" ] &&
+               [ -f "$DIR/UnityEngine.TextRenderingModule.dll" ]; then
+
+              SOURCE="$DIR"
+
+              break
+
+            fi
+
+          done < <(
+            find -L /Applications/Unity \
+              -name UnityEngine.CoreModule.dll \
+              -type f 2>/dev/null
+          )
+
+          test -n "$SOURCE"
+
+          cp "$SOURCE"/UnityEngine*.dll refs/
+
+          echo "UNITY_MANAGED=$SOURCE" \
+            >> "$GITHUB_ENV"
+
+      - name: Restore mobile controls
+        run: |
+          set -euo pipefail
+
+          mkdir -p mobile
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          old = Path(
+              ".github/workflows/coming-create-ipa.yml"
+          ).read_text()
+
+          match = re.search(
+              r"ComingTouch\.cs.*?<<'CS'\n"
+              r"(.*?)^\s*CS\s*$",
+              old,
+              re.S | re.M
+          )
+
+          if not match:
+              raise RuntimeError(
+                  "Original ComingTouch source missing"
+              )
+
+          import textwrap
+
+          code = textwrap.dedent(
+              match.group(1)
+          )
+
+          code = code.replace(
+              "private static bool enabledTouch;",
+              "private static bool enabledTouch = true;"
+          )
+
+          code = code.replace(
+              'GameObject obj =',
+              'Application.targetFrameRate = 30;\n'
+              'QualitySettings.vSyncCount = 0;\n'
+              'GameObject obj ='
+          )
+
+          Path(
+              "mobile/ComingTouch.cs"
+          ).write_text(code)
+
+          print("Original mobile bridge restored")
+          PY
+
+          cat > mobile/ComingMobile.csproj <<'XML'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <TargetFramework>netstandard2.1</TargetFramework>
+              <AssemblyName>ComingMobile</AssemblyName>
+            </PropertyGroup>
+            <ItemGroup>
+              <Reference Include="UnityEngine.CoreModule">
+                <HintPath>$(UnityManaged)/UnityEngine.CoreModule.dll</HintPath>
+              </Reference>
+              <Reference Include="UnityEngine.InputLegacyModule">
+                <HintPath>$(UnityManaged)/UnityEngine.InputLegacyModule.dll</HintPath>
+              </Reference>
+              <Reference Include="UnityEngine.IMGUIModule">
+                <HintPath>$(UnityManaged)/UnityEngine.IMGUIModule.dll</HintPath>
+              </Reference>
+              <Reference Include="UnityEngine.TextRenderingModule">
+                <HintPath>$(UnityManaged)/UnityEngine.TextRenderingModule.dll</HintPath>
+              </Reference>
+            </ItemGroup>
+          </Project>
+          XML
+
+          dotnet build mobile \
+            -c Release \
+            -p:UnityManaged="$UNITY_MANAGED"
+
+          mkdir -p ComingProject/Assets/Plugins
+
+          cp mobile/bin/Release/netstandard2.1/ComingMobile.dll \
+            ComingProject/Assets/Plugins/
+
+      - name: Patch original DLL input
+        run: |
+          set -euo pipefail
+
+          dotnet new console \
+            -o patcher \
+            --framework net8.0
+
+          dotnet add patcher package Mono.Cecil \
+            --version 0.11.6
+
+          cat > patcher/Program.cs <<'CS'
+          using System;
+          using System.IO;
+          using System.Linq;
+          using System.Collections.Generic;
+          using Mono.Cecil;
+          using Mono.Cecil.Cil;
+
+          string assets = Path.GetFullPath(args[0]);
+
+          string mobilePath = Path.Combine(
+              assets,
+              "Plugins",
+              "ComingMobile.dll"
+          );
+
+          using var mobile =
+              AssemblyDefinition.ReadAssembly(
+                  mobilePath
+              );
+
+          var api = mobile.MainModule.Types.Single(
+              t => t.Name == "ComingTouch"
+          );
+
+          var renamed =
+              new Dictionary<string, string>
+              {
+                  {
+                      "Assembly-CSharp",
+                      "ComingOriginalGame"
+                  },
+                  {
+                      "Assembly-CSharp-firstpass",
+                      "ComingOriginalFirstpass"
+                  },
+                  {
+                      "Assembly-UnityScript",
+                      "ComingOriginalUnityScript"
+                  },
+                  {
+                      "Assembly-UnityScript-firstpass",
+                      "ComingOriginalUnityScriptFirstpass"
+                  },
+                  {
+                      "Assembly-Boo",
+                      "ComingOriginalBoo"
+                  },
+                  {
+                      "Assembly-Boo-firstpass",
+                      "ComingOriginalBooFirstpass"
+                  }
+              };
+
+          IEnumerable<TypeDefinition> Walk(
+              IEnumerable<TypeDefinition> types)
+          {
+              foreach (var type in types)
+              {
+                  yield return type;
+
+                  foreach (var nested in
+                      Walk(type.NestedTypes))
+                  {
+                      yield return nested;
+                  }
+              }
+          }
+
+          int total = 0;
+
+          var managed = new List<string>();
+
+          var files = Directory.GetFiles(
+              assets,
+              "*.dll",
+              SearchOption.AllDirectories
+          );
+
+          foreach (string path in files)
+          {
+              if (path == mobilePath)
+                  continue;
+
+              AssemblyDefinition game;
+
+              try
+              {
+                  game =
+                      AssemblyDefinition.ReadAssembly(
+                          path,
+                          new ReaderParameters
+                          {
+                              InMemory = true
+                          }
+                      );
+              }
+              catch (BadImageFormatException)
+              {
+                  Console.WriteLine(
+                      "Native plugin: " + path
+                  );
+
+                  continue;
+              }
+
+              using (game)
+              {
+                  string original = game.Name.Name;
+
+                  bool gameplay =
+                      renamed.ContainsKey(original);
+
+                  int count = 0;
+
+                  if (gameplay)
+                  {
+                      foreach (var type in
+                          Walk(game.MainModule.Types))
+                      foreach (var method in type.Methods)
+                      {
+                          if (!method.HasBody)
+                              continue;
+
+                          foreach (var ins in
+                              method.Body.Instructions)
+                          {
+                              if (!(ins.Operand
+                                  is MethodReference old))
+                                  continue;
+
+                              if (old.DeclaringType.FullName !=
+                                  "UnityEngine.Input")
+                                  continue;
+
+                              var replacement =
+                                  api.Methods.FirstOrDefault(
+                                      m => m.IsStatic &&
+                                      m.IsPublic &&
+                                      m.Name == old.Name &&
+                                      m.ReturnType.FullName ==
+                                          old.ReturnType.FullName &&
+                                      m.Parameters.Select(
+                                          p => p.ParameterType.FullName
+                                      ).SequenceEqual(
+                                          old.Parameters.Select(
+                                              p => p.ParameterType.FullName
+                                          )
+                                      )
+                                  );
+
+                              if (replacement == null)
+                                  continue;
+
+                              ins.OpCode = OpCodes.Call;
+
+                              ins.Operand =
+                                  game.MainModule.ImportReference(
+                                      replacement
+                                  );
+
+                              count++;
+                          }
+                      }
+                  }
+
+                  total += count;
+
+                  string destination = path;
+
+                  bool changed = count > 0;
+
+                  if (renamed.TryGetValue(
+                      original,
+                      out string? newName))
+                  {
+                      game.Name.Name = newName;
+
+                      game.MainModule.Name =
+                          newName + ".dll";
+
+                      destination = Path.Combine(
+                          Path.GetDirectoryName(path)!,
+                          newName + ".dll"
+                      );
+
+                      changed = true;
+                  }
+
+                  foreach (var reference in
+                      game.MainModule.AssemblyReferences)
+                  {
+                      if (renamed.TryGetValue(
+                          reference.Name,
+                          out string? replacement))
+                      {
+                          reference.Name = replacement;
+
+                          changed = true;
+                      }
+                  }
+
+                  foreach (var type in
+                      Walk(game.MainModule.Types))
+                  foreach (var method in type.Methods)
+                  {
+                      if (method.IsPInvokeImpl)
+                      {
+                          Console.WriteLine(
+                              "NATIVE CALL: " +
+                              type.FullName + "." +
+                              method.Name
+                          );
+                      }
+                  }
+
+                  if (changed)
+                  {
+                      game.Write(destination + ".tmp");
+
+                      File.Move(
+                          destination + ".tmp",
+                          destination,
+                          true
+                      );
+
+                      if (destination != path)
+                      {
+                          if (!File.Exists(path + ".meta"))
+                              throw new Exception(
+                                  "Missing DLL GUID: " + path
+                              );
+
+                          File.Move(
+                              path + ".meta",
+                              destination + ".meta"
+                          );
+
+                          File.Delete(path);
+                      }
+                  }
+
+                  managed.Add(destination);
+
+                  Console.WriteLine(
+                      original +
+                      " | Input patches: " +
+                      count
+                  );
+              }
+          }
+
+          managed.Add(mobilePath);
+
+          File.WriteAllLines(
+              "reports/managed-dlls.txt",
+              managed
+          );
+
+          Console.WriteLine(
+              "Total input patches: " + total
+          );
+
+          if (total == 0)
+              throw new Exception(
+                  "Original input not connected"
+              );
+          CS
+
+          dotnet run --project patcher -- \
+            "$PWD/ComingProject/Assets" \
+            2>&1 | tee reports/input-patch.txt
+
+      - name: Prepare Unity project
+        run: |
+          set -euo pipefail
+
+          mkdir -p ComingProject/Assets/Editor
+
+          mkdir -p ComingProject/Packages
+
+          printf 'm_EditorVersion: %s\n' \
+            "$UNITY_VERSION" \
+            > ComingProject/ProjectSettings/ProjectVersion.txt
+
+          python3 - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+
+          project = Path("ComingProject")
+
+          assets = project / "Assets"
+
+          manifest = project / "Packages/manifest.json"
+
+          data = (
+              json.loads(manifest.read_text())
+              if manifest.exists()
+              else {}
+          )
+
+          deps = data.setdefault(
+              "dependencies", {}
+          )
+
+          deps.setdefault(
+              "com.unity.ugui", "1.0.0"
+          )
+
+          modules = [
+              "ai", "animation", "audio",
+              "physics", "physics2d",
+              "particlesystem", "imgui",
+              "ui", "uielements",
+              "terrain", "terrainphysics",
+              "imageconversion", "jsonserialize",
+              "unitywebrequest",
+              "unitywebrequestaudio",
+              "unitywebrequesttexture",
+              "video"
+          ]
+
+          for module in modules:
+
+              deps.setdefault(
+                  "com.unity.modules." + module,
+                  "1.0.0"
+              )
+
+          manifest.write_text(
+              json.dumps(data, indent=2)
+          )
+
+          names = {
+              "Assembly-CSharp": "ComingOriginalGame",
+              "Assembly-CSharp-firstpass": "ComingOriginalFirstpass",
+              "Assembly-UnityScript": "ComingOriginalUnityScript",
+              "Assembly-UnityScript-firstpass": "ComingOriginalUnityScriptFirstpass",
+              "Assembly-Boo": "ComingOriginalBoo",
+              "Assembly-Boo-firstpass": "ComingOriginalBooFirstpass"
+          }
+
+          for file in assets.rglob("*"):
+
+              if file.suffix not in {
+                  ".unity", ".prefab", ".asset"
+              }:
+                  continue
+
+              original = file.read_bytes()
+
+              updated = original
+
+              for old, new in sorted(
+                  names.items(),
+                  key=lambda p: -len(p[0])
+              ):
+
+                  pattern = (
+                      rb"(m_TargetAssemblyTypeName:"
+                      rb"[^\r\n]*?,[ \t]*)" +
+                      re.escape(old.encode()) +
+                      rb"(?=[ \t\r\n,'\"]|$)"
+                  )
+
+                  updated = re.sub(
+                      pattern,
+                      lambda m: m.group(1) +
+                          new.encode(),
+                      updated
+                  )
+
+              if updated != original:
+
+                  file.write_bytes(updated)
+
+          settings = project / (
+              "ProjectSettings/ProjectSettings.asset"
+          )
+
+          text = settings.read_text()
+
+          text = re.sub(
+              r"(?m)^([ \t]*activeInputHandler:[ \t]*)1[ \t]*$",
+              r"\g<1>2",
+              text
+          )
+
+          settings.write_text(text)
+
+          print("Original scene references preserved")
+          PY
+
+          cat > ComingProject/Assets/link.xml <<'XML'
+          <linker>
+            <assembly fullname="ComingOriginalGame" preserve="all"/>
+            <assembly fullname="ComingMobile" preserve="all"/>
+          </linker>
+          XML
+
+      - name: Add startup diagnostics
+        run: |
+          cat > ComingProject/Assets/ComingStartup.cs <<'CS'
+          using System;
+          using System.IO;
+          using UnityEngine;
+
+          public static class ComingStartup
+          {
+              private static string path;
+
+              [RuntimeInitializeOnLoadMethod(
+                  RuntimeInitializeLoadType.BeforeSceneLoad)]
+              private static void Start()
+              {
+                  Application.targetFrameRate = 30;
+
+                  QualitySettings.vSyncCount = 0;
+
+                  path = Path.Combine(
+                      Application.persistentDataPath,
+                      "ComingV7.txt"
+                  );
+
+                  try
+                  {
+                      File.WriteAllText(
+                          path,
+                          "COMING V7 START\n"
+                      );
+                  }
+                  catch {}
+
+                  Application.logMessageReceived += Save;
+              }
+
+              private static void Save(
+                  string message,
+                  string stack,
+                  LogType type)
+              {
+                  try
+                  {
+                      if (File.Exists(path) &&
+                          new FileInfo(path).Length > 2097152)
+                          return;
+
+                      File.AppendAllText(
+                          path,
+                          type + ": " + message +
+                          "\n" + stack + "\n"
+                      );
+                  }
+                  catch {}
+              }
+          }
+          CS
+
+      - name: Create original iOS builder
+        run: |
+          cat > ComingProject/Assets/Editor/ComingV7.cs <<'CS'
+          using System;
+          using System.IO;
+          using System.Linq;
+          using UnityEngine;
+          using UnityEditor;
+          using UnityEditor.Build.Reporting;
+          using UnityEditor.SceneManagement;
+
+          public static class ComingV7
+          {
+              public static void Validate()
+              {
+                  foreach (string path in
+                      AssetDatabase.GetAllAssetPaths())
+                  {
+                      string name =
+                          Path.GetFileName(path);
+
+                      if (
+                          !name.StartsWith("ComingOriginal") &&
+                          name != "ComingMobile.dll"
+                      )
+                          continue;
+
+                      var importer =
+                          AssetImporter.GetAtPath(path)
+                          as PluginImporter;
+
+                      if (importer == null)
+                          continue;
+
+                      importer.SetCompatibleWithEditor(
+                          true
+                      );
+
+                      importer.SetCompatibleWithPlatform(
+                          BuildTarget.iOS,
+                          true
+                      );
+
+                      importer.SaveAndReimport();
+                  }
+
+                  var scenes =
+                      EditorBuildSettings.scenes
+                      .Where(s => s.enabled)
+                      .Select(s => s.path)
+                      .ToArray();
+
+                  if (scenes.Length == 0)
+                      throw new Exception(
+                          "Original scene order missing"
+                      );
+
+                  int missing = 0;
+
+                  foreach (string path in scenes)
+                  {
+                      if (!File.Exists(path))
+                          throw new Exception(
+                              "Missing scene: " + path
+                          );
+
+                      var scene =
+                          EditorSceneManager.OpenScene(
+                              path
+                          );
+
+                      foreach (var root in
+                          scene.GetRootGameObjects())
+                      foreach (var item in
+                          root.GetComponentsInChildren<Transform>(
+                              true
+                          ))
+                      {
+                          missing +=
+                              GameObjectUtility
+                                  .GetMonoBehavioursWithMissingScriptCount(
+                                      item.gameObject
+                                  );
+                      }
+
+                      Debug.Log(
+                          "VALIDATED SCENE: " + path
+                      );
+                  }
+
+                  Debug.Log(
+                      "Total missing components: " +
+                      missing
+                  );
+
+                  if (missing > 0)
+                      throw new Exception(
+                          "Missing original components"
+                      );
+
+                  EditorSceneManager.NewScene(
+                      NewSceneSetup.EmptyScene,
+                      NewSceneMode.Single
+                  );
+
+                  AssetDatabase.SaveAssets();
+
+                  Debug.Log(
+                      "COMING V7 VALIDATION SUCCESS"
+                  );
+              }
+
+              public static void Build()
+              {
+                  PlayerSettings.productName =
+                      "Slendytubbies Coming";
+
+                  PlayerSettings.SetApplicationIdentifier(
+                      BuildTargetGroup.iOS,
+                      "com.coming.mobile"
+                  );
+
+                  PlayerSettings.bundleVersion =
+                      "1.0.7";
+
+                  PlayerSettings.iOS.buildNumber =
+                      "7";
+
+                  PlayerSettings.iOS.targetOSVersionString =
+                      "15.0";
+
+                  PlayerSettings.defaultInterfaceOrientation =
+                      UIOrientation.LandscapeLeft;
+
+                  PlayerSettings.SetScriptingBackend(
+                      BuildTargetGroup.iOS,
+                      ScriptingImplementation.IL2CPP
+                  );
+
+                  PlayerSettings.SetManagedStrippingLevel(
+                      BuildTargetGroup.iOS,
+                      ManagedStrippingLevel.Low
+                  );
+
+                  PlayerSettings.stripEngineCode =
+                      false;
+
+                  PlayerSettings.iOS.appleEnableAutomaticSigning =
+                      false;
+
+                  PlayerSettings.SetUseDefaultGraphicsAPIs(
+                      BuildTarget.iOS,
+                      false
+                  );
+
+                  PlayerSettings.SetGraphicsAPIs(
+                      BuildTarget.iOS,
+                      new[] {
+                          UnityEngine.Rendering.GraphicsDeviceType.Metal
+                      }
+                  );
+
+                  string[] scenes =
+                      EditorBuildSettings.scenes
+                      .Where(s => s.enabled)
+                      .Select(s => s.path)
+                      .ToArray();
+
+                  if (scenes.Length == 0)
+                      throw new Exception(
+                          "No original scenes"
+                      );
+
+                  string output = Path.Combine(
+                      Directory.GetParent(
+                          Application.dataPath
+                      ).FullName,
+                      "ComingXcode"
+                  );
+
+                  var report =
+                      BuildPipeline.BuildPlayer(
+                          scenes,
+                          output,
+                          BuildTarget.iOS,
+                          BuildOptions.None
+                      );
+
+                  if (report.summary.result !=
+                      BuildResult.Succeeded)
+                  {
+                      throw new Exception(
+                          "iOS export failed"
+                      );
+                  }
+
+                  Debug.Log(
+                      "COMING V7 EXPORT SUCCESS"
+                  );
+              }
+          }
+          CS
 
       - name: Activate Unity Personal
         id: activate
         env:
           UNITY_USERNAME: ${{ secrets.UNITY_USERNAME || secrets.UNITY_EMAIL }}
           UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
-        run: bash .coming-v6/activate.sh
+        run: |
+          set -euo pipefail
 
-      - name: Unity iOS IL2CPP export
-        run: bash .coming-v6/export.sh
+          unity-cli activate-license \
+            --license personal
 
-      - name: Return Unity License
+      - name: Validate DLLs and original scenes
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+
+          LOG="$PWD/reports/validation.log"
+
+          "$UNITY_EDITOR_PATH" \
+            -batchmode \
+            -nographics \
+            -quit \
+            -projectPath "$PWD/ComingProject" \
+            -buildTarget iOS \
+            -executeMethod ComingV7.Validate \
+            -logFile "$LOG" || {
+
+              grep -Ei \
+                'error|exception|missing|failed' \
+                "$LOG" | tail -100 || true
+
+              exit 1
+            }
+
+          grep -F \
+            "COMING V7 VALIDATION SUCCESS" \
+            "$LOG"
+
+      - name: Unity iOS export
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+
+          LOG="$PWD/reports/unity.log"
+
+          "$UNITY_EDITOR_PATH" \
+            -batchmode \
+            -nographics \
+            -quit \
+            -projectPath "$PWD/ComingProject" \
+            -buildTarget iOS \
+            -executeMethod ComingV7.Build \
+            -logFile "$LOG" || {
+
+              tail -100 "$LOG"
+
+              exit 1
+            }
+
+          test -d \
+            ComingProject/ComingXcode/Unity-iPhone.xcodeproj
+
+      - name: Return Unity license
         if: always() && steps.activate.outcome == 'success'
         continue-on-error: true
-        run: bash .coming-v6/return.sh
+        run: |
+          unity-cli return-license \
+            --license personal \
+            --when auto
 
-      - name: Find Xcode project
-        run: bash .coming-v6/find.sh
+      - name: Build ARM64 application
+        timeout-minutes: 45
+        run: |
+          set -euo pipefail
 
-      - name: Compile ARM64 iOS
-        run: bash .coming-v6/xcode.sh
+          xcodebuild \
+            -project ComingProject/ComingXcode/Unity-iPhone.xcodeproj \
+            -scheme Unity-iPhone \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$PWD/derived" \
+            ARCHS=arm64 \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee reports/xcode.log
 
-      - name: Create real IPA V6
-        run: bash .coming-v6/ipa.sh
+      - name: Create Coming V7 IPA
+        run: |
+          set -euo pipefail
 
-      - name: Protect IPA
-        env:
-          PASSWORD: ${{ secrets.COMING_ARCHIVE_PASSWORD }}
-        run: bash .coming-v6/protect.sh
+          APP=$(find derived/Build/Products/Release-iphoneos \
+            -maxdepth 1 \
+            -name '*.app' \
+            -type d \
+            -print -quit)
+
+          test -d "$APP"
+
+          EXE=$(/usr/libexec/PlistBuddy \
+            -c 'Print :CFBundleExecutable' \
+            "$APP/Info.plist")
+
+          lipo -verify_arch arm64 "$APP/$EXE"
+
+          for KEY in UIFileSharingEnabled LSSupportsOpeningDocumentsInPlace; do
+
+            /usr/libexec/PlistBuddy \
+              -c "Set :$KEY true" \
+              "$APP/Info.plist" 2>/dev/null || \
+            /usr/libexec/PlistBuddy \
+              -c "Add :$KEY bool true" \
+              "$APP/Info.plist"
+
+          done
+
+          mkdir -p Payload
+
+          ditto "$APP" Payload/Coming.app
+
+          ditto -c -k --keepParent \
+            Payload \
+            output/Coming-iOS-V7.ipa
+
+          unzip -tq output/Coming-iOS-V7.ipa
+
+          test -s output/Coming-iOS-V7.ipa
+
+          ls -lh output/
+
+          echo "COMING V7 IPA CREATED"
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: Coming-iOS-V6
-          path: output/Coming-iOS-V6.7z
-          retention-days: 7
+          name: Coming-iOS-V7
+          path: output/Coming-iOS-V7.ipa
+          retention-days: 14
+          compression-level: 0
           if-no-files-found: error
 
-      - name: Upload V6 diagnostic logs
+      - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Coming-V6-Diagnostics
+          name: Coming-V7-Diagnostics
           path: reports/
-          retention-days: 7
-          if-no-files-found: warn
+          retention-days: 14
 
       - name: Final summary
         if: always()
         run: |
-          for file in reports/v6-*.txt; do
-            if [ -f "$file" ]; then
-              cat "$file" >> "$GITHUB_STEP_SUMMARY"
-              echo "" >> "$GITHUB_STEP_SUMMARY"
-            fi
-          done
+          {
+            echo "# Coming V7"
+            echo ""
+            echo "Original DLL method"
+            echo "Unity 2022.3.62f3"
+            echo "ARM64 IL2CPP"
+            echo "30 FPS target"
+            echo "Mobile input bridge"
+            echo "EN / UA / RU control labels"
+            echo ""
 
-          if [ -f .coming-v6/summary.sh ]; then
-            bash .coming-v6/summary.sh
-          fi
+            if [ -s output/Coming-iOS-V7.ipa ]; then
+              echo "IPA CREATED SUCCESSFULLY"
+              ls -lh output/
+            else
+              echo "BUILD NOT COMPLETED"
+            fi
+
+            echo ""
+            echo "Device testing required"
+          } >> "$GITHUB_STEP_SUMMARY"
